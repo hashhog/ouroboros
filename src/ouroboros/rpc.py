@@ -648,6 +648,40 @@ def _accept_under_chain_lock(fn):
     return wrapper
 
 
+# Core net_processing.cpp MAX_BLOCKS_TO_ANNOUNCE: a tip change announces at
+# most this many blocks (the newest, back toward the fork point); a longer
+# reorg relies on the peer's own header sync for the rest.
+MAX_BLOCKS_TO_ANNOUNCE = 8
+
+
+def announce_tip_change(node, blocks: list) -> None:
+    """Announce a tip change to peers, once per change (Core UpdatedBlockTip).
+
+    *blocks* are ``(Block, hash)`` pairs of the blocks that became active,
+    oldest first, ending at the new tip: one block for a plain extension,
+    fork-point child .. new tip for a reorg.  Only the newest
+    MAX_BLOCKS_TO_ANNOUNCE are announced.  Nothing is sent while the node is
+    in initial block download (Core returns early on fInitialDownload).  The
+    send runs in the background through ``BlockSync``, the same per-peer
+    announcer the P2P drain uses, so a peer whose socket is not draining
+    cannot hold up the RPC that connected the block.  Best-effort: an
+    announce fault never fails block acceptance.
+    """
+    if not blocks:
+        return
+    try:
+        bs = getattr(node, "block_sync", None)
+        schedule = getattr(bs, "schedule_tip_announce", None)
+        if schedule is None:
+            return
+        ibd = getattr(node, "is_initial_block_download", None)
+        if callable(ibd) and ibd():
+            return
+        schedule(list(blocks)[-MAX_BLOCKS_TO_ANNOUNCE:])
+    except Exception as e:  # noqa: BLE001 - relay is best-effort
+        logger.debug("tip announce failed: %s", e)
+
+
 @_accept_under_chain_lock
 async def accept_block(
     db,
@@ -657,6 +691,7 @@ async def accept_block(
     *,
     skip_scripts: bool = False,
     decoded_block=None,
+    announce: bool = True,
 ) -> bytes:
     """Unified block-acceptance helper — Core's ProcessNewBlock pipeline.
 
@@ -697,6 +732,10 @@ async def accept_block(
                       decode free instead of costing a second full Python
                       parse of every submitted block.  Purely an optimisation —
                       when omitted the block is parsed here exactly as before.
+        announce:     When True (default) the connected block is announced to
+                      peers as the new tip (``announce_tip_change``).  The
+                      reorg engine passes False and announces the whole
+                      switch once, after its last block.
 
     Returns:
         The 32-byte block hash (internal byte order, as returned by
@@ -1054,6 +1093,14 @@ async def accept_block(
             _tip_notifier.notify()
         except Exception:
             pass
+
+    # Step 8 — Relay the new tip (Core PeerManagerImpl::UpdatedBlockTip, a
+    # validation-interface callback that fires for every tip change whatever
+    # delivered the block).  Before this only the P2P drain announced, so a
+    # block mined on this node (submitblock / generatetoaddress) or accepted
+    # through submitblockbatch was never relayed by it.
+    if announce and _connected_block is not None:
+        announce_tip_change(node, [(_connected_block, bytes(block_hash))])
 
     return bytes(block_hash)
 
@@ -10310,6 +10357,10 @@ class RPCServer:
                         raw_bytes,
                         blk_height,
                         skip_scripts=False,
+                        # The switch is announced once, below, after the
+                        # last block (Core: one UpdatedBlockTip per
+                        # ActivateBestChain step, fork point to new tip).
+                        announce=False,
                     )
                     connected_hashes.append(blk_hash)
                 except Exception as e:
@@ -10404,6 +10455,21 @@ class RPCServer:
         # CORE-PARITY-AUDIT/_mempool-refill-on-reorg-fleet-result-2026-05-05.md.
         # ----------------------------------------------------------
         self._reorg_mempool_refill(db, disconnected_txs, "submitblock reorg")
+
+        # Relay the new tip: ONE announcement for the whole switch, carrying
+        # the newest MAX_BLOCKS_TO_ANNOUNCE blocks of the new branch, oldest
+        # first (Core UpdatedBlockTip walks pindexNew back to pindexFork).
+        # Neither connect path announces per block: the atomic batch never
+        # reaches accept_block, and the per-block path passes announce=False.
+        _announce: list = []
+        try:
+            from ouroboros.database import Block as _ABlk
+            for _ah, _, _araw in chain_to_connect[-MAX_BLOCKS_TO_ANNOUNCE:]:
+                _announce.append((_ABlk.deserialize(bytes(_araw)), bytes(_ah)))
+        except Exception as e:  # noqa: BLE001 - relay is best-effort
+            logger.debug("reorg announce: undecodable block: %s", e)
+            _announce = []
+        announce_tip_change(self.node, _announce)
 
         return None
 
@@ -17189,18 +17255,10 @@ class RPCServer:
             block_hashes.append(block_hash_hex)
             logger.info(f"Generated block {next_height}: {block_hash_hex[:16]}...")
 
-            # Announce new block to all connected peers
-            try:
-                from ouroboros.p2p_messages import INV_TYPE_BLOCK, InvMessage
-
-                inv = InvMessage(
-                    inventory=[(INV_TYPE_BLOCK, block_hash)]
-                )
-                inv_msg = inv.to_network_message(network)
-                if hasattr(self.node, "peer_manager") and self.node.peer_manager:
-                    await self.node.peer_manager.broadcast(inv_msg)
-            except Exception:
-                pass  # best-effort broadcast
+            # Relay: accept_block announced this block to peers through the
+            # shared tip announcer (headers / cmpctblock / inv per peer
+            # preference).  The bare inv this loop used to broadcast on top
+            # of that would announce every mined block twice.
 
         return block_hashes
 

@@ -7624,6 +7624,67 @@ class BlockSync:
         task.add_done_callback(tasks.discard)
         return task
 
+    def schedule_tip_announce(self, blocks: list) -> asyncio.Task | None:
+        """Announce a tip change made outside the P2P drain, in the background.
+
+        *blocks* are ``(Block, hash)`` pairs, oldest first, ending at the new
+        tip (already capped by the caller, rpc.announce_tip_change).  One
+        block is announced exactly as the drain announces it; several (a
+        reorg) go as one ``headers`` message to a header-preferring peer and
+        as an ``inv`` of the new tip to every other peer — Core SendMessages
+        sends a cmpctblock only for a single-block change and otherwise
+        reverts to an inv of the tip (fRevertToInv).
+        """
+        if not blocks:
+            return None
+        if len(blocks) == 1:
+            block, block_hash = blocks[0]
+            return self._schedule_announce(block, block_hash, -1)
+        tasks = getattr(self, "_announce_tasks", None)
+        if tasks is None:
+            tasks = self._announce_tasks = set()
+
+        async def _run() -> None:
+            try:
+                await self._announce_blocks(blocks)
+            except Exception as e:
+                logger.debug(f"announce of {len(blocks)}-block tip change failed: {e}")
+
+        task = asyncio.get_running_loop().create_task(_run())
+        tasks.add(task)
+        task.add_done_callback(tasks.discard)
+        return task
+
+    async def _announce_blocks(self, blocks: list) -> None:
+        """Announce a multi-block tip change (see ``schedule_tip_announce``)."""
+        if not hasattr(self.peer_manager, 'get_all_ready_peers'):
+            return
+        network = getattr(self.peer_manager, 'network', 'mainnet')
+        headers_msg = HeadersMessage(headers=[
+            BlockHeader(
+                version=b.version,
+                prev_blockhash=b.prev_blockhash,
+                merkle_root=b.merkle_root,
+                timestamp=b.timestamp,
+                bits=b.bits,
+                nonce=b.nonce,
+            )
+            for b, _ in blocks
+        ]).to_network_message(network)
+        inv_msg = InvMessage(
+            inventory=[(INV_TYPE_BLOCK, blocks[-1][1])]
+        ).to_network_message(network)
+
+        async def _announce_to(p) -> None:
+            try:
+                await p.send_message(headers_msg if p.wants_headers else inv_msg)
+            except Exception as e:
+                logger.debug(f"Failed to announce tip to {p.host}:{p.port}: {e}")
+
+        targets = list(self.peer_manager.get_all_ready_peers())
+        if targets:
+            await asyncio.gather(*(_announce_to(p) for p in targets))
+
     async def _announce_block(
         self, block: Block, block_hash: bytes, exclude_peer: Peer | None = None,
     ) -> None:
