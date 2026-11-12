@@ -928,6 +928,8 @@ class BlockSync:
         # re-requests the full witness block instead of perm-rejecting.
         self._compact_origin_hashes: set[bytes] = set()
         self._blk_perm_rejected_dropped: int = 0
+        # Unrequested bodies whose header was not queued (never buffered).
+        self._blk_unrequested_unknown_header: int = 0
         # Track which peer (as "host:port" string) delivered each buffered block
         # so the drain loop can score Misbehaving(100) against the right peer when
         # it finds BLOCK_MUTATED or BLOCK_INVALID_HEADER.  Entry cleared on
@@ -2642,6 +2644,27 @@ class BlockSync:
                         f"from {peer.host}:{peer.port}"
                     )
                     return
+                if claimed_height is None:
+                    # Unrequested body whose header is not on the queued
+                    # header chain.  Core runs AcceptBlockHeader before it
+                    # stores any body (validation.cpp AcceptBlock): an
+                    # unknown prev is "prev-blk-not-found" (BLOCK_MISSING_PREV
+                    # -> Misbehaving in MaybePunishNodeForBlock), and a
+                    # known-prev header must still pass PoW, fHasMoreOrSameWork
+                    # and fTooFarAhead before an UNREQUESTED body is kept.
+                    # The fTooFarAhead gate above cannot fire here (it needs
+                    # a height), and our drain only ever connects bodies whose
+                    # header sits in ``_validated_headers`` — so buffering
+                    # this body bought nothing but up to ~1016 x 4 MB of RAM
+                    # held until the IBD_BUFFER_ORPHAN_TTL sweep, with the
+                    # buffer cap squeezing out real IBD bodies meanwhile.
+                    # Never buffer it.  A genuine new block reaches us again
+                    # through the headers-first path once its header is
+                    # queued.
+                    self._drop_unrequested_unknown_header_block(
+                        block_hash, payload, peer
+                    )
+                    return
 
             if claimed_height is not None:
                 # Core pindexLastCommonBlock on a delivered body whose
@@ -2778,6 +2801,66 @@ class BlockSync:
             # (Core ProcessMessages logs a caught exception, never punishes).
             if not is_system_error(e):
                 peer.adjust_score(-5)
+
+    def _prev_header_known(self, prev_hash: bytes) -> bool:
+        """True if *prev_hash* names a header we already hold anywhere: the
+        active tip, the validated-header queue, the fork store, or the
+        on-disk block index / block store.  A lookup that raises counts as
+        known, so a local fault never turns into a peer penalty."""
+        try:
+            tip_hash, _ = self.db.get_best_block()
+            if prev_hash == tip_hash:
+                return True
+            if any(h == prev_hash for h, _hdr in self._validated_headers):
+                return True
+            if prev_hash in self._fork_headers:
+                return True
+            get_entry = getattr(self.db, "get_block_index_entry", None)
+            if callable(get_entry) and get_entry(prev_hash) is not None:
+                return True
+            return bool(self.db.has_block_hash(prev_hash))
+        except Exception:
+            return True
+
+    def _drop_unrequested_unknown_header_block(
+        self, block_hash: bytes, payload: bytes, peer: Peer
+    ) -> None:
+        """Drop an unrequested ``block`` whose header is not queued, and score
+        the sender when its prev is unknown (Core BLOCK_MISSING_PREV).
+
+        Core discourages on the first missing-prev block.  We score
+        SCORE_UNSOLICITED_BLOCK per body instead, so the discouragement
+        threshold is reached after a short burst: unlike Core's block index,
+        our header queue can be cleared (slot-misalign resync), after which a
+        late reply to an earlier getdata from an honest peer can look exactly
+        like this.  A known-prev body is dropped without a penalty.
+        """
+        self._blk_unrequested_unknown_header += 1
+        prev_hash = bytes(payload[4:36])
+        prev_known = self._prev_header_known(prev_hash)
+        addr = f"{peer.host}:{peer.port}"
+        _now = time.time()
+        if _now - getattr(self, "_last_unknown_hdr_drop_log", 0.0) > 30.0:
+            self._last_unknown_hdr_drop_log = _now
+            logger.info(
+                f"Dropping unrequested block {block_hash.hex()[:16]}... from "
+                f"{addr}: header not in the validated-header queue "
+                f"(prev {prev_hash.hex()[:16]}... "
+                f"{'known' if prev_known else 'unknown: prev-blk-not-found'}; "
+                f"total {self._blk_unrequested_unknown_header})"
+            )
+        if prev_known:
+            return
+        from ouroboros.banman import SCORE_UNSOLICITED_BLOCK
+        peer.adjust_score(-SCORE_UNSOLICITED_BLOCK)
+        if hasattr(self.peer_manager, "misbehaving"):
+            try:
+                self.peer_manager.misbehaving(
+                    addr, SCORE_UNSOLICITED_BLOCK,
+                    "prev-blk-not-found (unrequested block)",
+                )
+            except Exception as e:
+                logger.debug(f"misbehaving({addr}) failed: {e}")
 
     def _buffer_put(self, block_hash: bytes, value) -> None:
         """Insert *value* (a ``(block, raw_payload)`` tuple) into the IBD
