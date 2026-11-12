@@ -774,6 +774,11 @@ class ConditionStack:
     Toggling an entry that is not the first false one is unobservable: the
     stack still has a false at or below it, so execution stays off until that
     first false entry is toggled or popped.
+
+    ``pop_back`` and ``toggle_top`` on an empty stack raise ``ValueError``
+    where Core asserts. Every caller in ``_execute_script`` checks ``empty()``
+    first, so this cannot be reached; a future caller that skipped the check
+    would see a script failure rather than a crash.
     """
 
     __slots__ = ("_size", "_first_false_pos")
