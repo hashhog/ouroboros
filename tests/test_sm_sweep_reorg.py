@@ -135,6 +135,9 @@ def test_sm_sweep_control_broadcast_idiom_reaches_the_peer(tmp_path):
 # Core: index/base.cpp ``BaseIndex::BlockConnected`` rewinds the index to
 # ``pindex->pprev`` when it is not the index tip, and
 # ``BlockFilterIndex::CustomRemove`` restores the previous header.
+#
+# Fixed by sm-fix-ouroboros-filter-header-reorg: PersistentBlockFilterIndex.add
+# chains each header off the block's parent (looked up by prev hash).
 
 
 def _reorg_with_filter_index(tmp_path):
@@ -164,11 +167,6 @@ def _expected_header(bdb, block_hash: bytes, prev_header: bytes) -> bytes:
     return compute_filter_header(build_basic_filter(blk, bdb), prev_header)
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="sm-sweep-ouroboros C1: after a reorg the new branch's filter "
-    "header chains off the old tip, not the fork point",
-)
 def test_sm_sweep_filter_header_after_reorg_chains_from_fork_point(tmp_path):
     bdb, bfi, hashes, tip, s1, s2 = _reorg_with_filter_index(tmp_path)
     fork_header = bfi.get_header(hashes[tip - 1])
