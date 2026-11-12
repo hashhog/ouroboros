@@ -2125,7 +2125,9 @@ class BlockValidator:
         # holds is a missing/spent input that tx validation rejects anyway.
         in_block_spks: dict[tuple[bytes, int], bytes] = {}
 
-        for tx, legacy_sigops in zip(block.transactions, legacy_sigops_per_tx):
+        for tx, legacy_sigops in zip(
+            block.transactions, legacy_sigops_per_tx, strict=True
+        ):
             # --- Legacy sigops (outputs + inputs) × WITNESS_SCALE_FACTOR ---
             # Counted once, in _validate_block_stripped_limits.
             tx_sigops_cost = legacy_sigops * WITNESS_SCALE_FACTOR

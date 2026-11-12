@@ -53,7 +53,14 @@ fn setup() -> (TempDir, Arc<BlockchainDB>, BlockValidator, Block) {
     let p2wsh = ScriptBuf::new_p2wsh(&ScriptBuf::from(vec![0x51]).wscript_hash());
     db.add_utxo(
         &fund,
-        &UTXO::new(OutPointWrapper::new(fund), 1_000_000, p2wsh, Some(0), false),
+        &UTXO::new(OutPointWrapper::new(fund), 1_000_000, p2wsh.clone(), Some(0), false),
+    )
+    .unwrap();
+    // A second coin, so a block can carry two independent valid spends.
+    let fund2 = OutPoint { txid: Txid::from_byte_array([0x5a; 32]), vout: 1 };
+    db.add_utxo(
+        &fund2,
+        &UTXO::new(OutPointWrapper::new(fund2), 1_000_000, p2wsh, Some(0), false),
     )
     .unwrap();
     let validator = BlockValidator::new(Arc::clone(&db), Network::Regtest);
@@ -79,16 +86,29 @@ fn merkle(mut level: Vec<[u8; 32]>) -> [u8; 32] {
 }
 
 fn spend(witness: &[Vec<u8>]) -> Transaction {
+    spend_from(0, witness, None)
+}
+
+/// Spend coin `vout` of the funding tx; `filler` adds an OP_RETURN output of
+/// that many bytes (txid-committed, non-witness: it grows the stripped size).
+fn spend_from(vout: u32, witness: &[Vec<u8>], filler: Option<usize>) -> Transaction {
+    let mut output =
+        vec![TxOut { value: Amount::from_sat(1_000), script_pubkey: ScriptBuf::from(vec![0x51]) }];
+    if let Some(n) = filler {
+        let mut spk = vec![0x6a];
+        spk.extend(std::iter::repeat(0x00u8).take(n));
+        output.push(TxOut { value: Amount::from_sat(0), script_pubkey: ScriptBuf::from(spk) });
+    }
     Transaction {
         version: transaction::Version::TWO,
         lock_time: absolute::LockTime::ZERO,
         input: vec![TxIn {
-            previous_output: OutPoint { txid: Txid::from_byte_array([0x5a; 32]), vout: 0 },
+            previous_output: OutPoint { txid: Txid::from_byte_array([0x5a; 32]), vout },
             script_sig: ScriptBuf::new(),
             sequence: Sequence::MAX,
             witness: Witness::from_slice(witness),
         }],
-        output: vec![TxOut { value: Amount::from_sat(1_000), script_pubkey: ScriptBuf::from(vec![0x51]) }],
+        output,
     }
 }
 
@@ -272,3 +292,37 @@ fn duplicate_input_with_tampered_witness_is_still_a_transaction_verdict() {
         r
     );
 }
+
+#[test]
+fn stripped_size_over_limit_with_tampered_witness_is_still_size_exceeded() {
+    // Core's CheckBlock stripped-size guard (bad-blk-length) reads no witness
+    // and runs before CheckWitnessMalleation.  Two valid spends, each well
+    // under the per-tx limit, whose STRIPPED sizes together exceed
+    // MAX_BLOCK_WEIGHT / 4: invalid whatever the witness says, so a tampered
+    // witness must not turn it into an uncached witness mismatch.
+    let (_d, _db, v, g) = setup();
+    let a = spend_from(0, &honest_witness(), Some(600_000));
+    let b2 = spend_from(1, &honest_witness(), Some(600_000));
+    let cb = coinbase(&[a.clone(), b2.clone()], None);
+    let mut b2_tampered = b2.clone();
+    b2_tampered.input[0].witness = Witness::from_slice(&[vec![0x51], vec![0x00]]);
+    let blk = block(&g, vec![cb, a, b2_tampered], None);
+    assert!(blk.txdata.iter().all(|t| t.base_size() * 4 <= 4_000_000));
+    assert!(blk.txdata.iter().map(|t| t.base_size()).sum::<usize>() * 4 > 4_000_000);
+    let r = validate(&v, &blk);
+    assert!(matches!(r, Err(BlockValidationError::SizeExceeded)), "got {:?}", r);
+}
+
+#[test]
+fn control_two_large_valid_spends_under_the_limit_are_valid() {
+    // CONTROL for the guard above: the same two spends at 450 KB filler each
+    // (total stripped < 1 MB) with an honest witness are a valid block, so
+    // the guard's SizeExceeded comes from the size, not from the shape.
+    let (_d, _db, v, g) = setup();
+    let a = spend_from(0, &honest_witness(), Some(450_000));
+    let b2 = spend_from(1, &honest_witness(), Some(450_000));
+    let cb = coinbase(&[a.clone(), b2.clone()], None);
+    let blk = block(&g, vec![cb, a, b2], None);
+    assert!(validate(&v, &blk).is_ok(), "{:?}", validate(&v, &blk));
+}
+

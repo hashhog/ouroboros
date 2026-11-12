@@ -295,9 +295,12 @@ impl BlockValidator {
         if !self.verify_merkle_root(inner) {
             return Err(BlockValidationError::InvalidMerkleRoot);
         }
-        // (3. The block weight limit reads witness bytes, which the txid
-        //     merkle root does not commit to; it runs right after the witness
-        //     commitment check, step 7d below.)
+        // 3. Witness-independent size guards (Core CheckBlock "size limits",
+        //    bad-blk-length): tx count and stripped (TX_NO_WITNESS) size.  They
+        //    keep their CheckBlock position; the full block weight reads
+        //    witness bytes, which the txid merkle root does not commit to, so
+        //    it runs right after the witness commitment check (step 7d).
+        self.check_stripped_size_limits(inner)?;
 
         // 4. Non-empty block
         if inner.txdata.is_empty() {
@@ -561,6 +564,28 @@ impl BlockValidator {
         self.header_validator
             .validate_header(&header, &prev_header, prev_height)?;
 
+        Ok(())
+    }
+
+    /// Core CheckBlock's witness-independent size guards (validation.cpp,
+    /// "size limits"): `vtx.size() * WITNESS_SCALE_FACTOR > MAX_BLOCK_WEIGHT`
+    /// and `GetSerializeSize(TX_NO_WITNESS(block)) * WITNESS_SCALE_FACTOR >
+    /// MAX_BLOCK_WEIGHT` -> bad-blk-length.  Neither reads the witness, so a
+    /// relaying peer cannot trip them by padding it.
+    fn check_stripped_size_limits(&self, block: &Block) -> Result<()> {
+        const MAX_BLOCK_WEIGHT: u64 = 4_000_000;
+        const WITNESS_SCALE_FACTOR: u64 = 4;
+        if (block.txdata.len() as u64) * WITNESS_SCALE_FACTOR > MAX_BLOCK_WEIGHT {
+            return Err(BlockValidationError::SizeExceeded);
+        }
+        // 80-byte header + CompactSize tx count + each tx's stripped size.
+        let n = block.txdata.len() as u64;
+        let count_len: u64 = if n < 0xfd { 1 } else if n <= 0xffff { 3 } else if n <= 0xffff_ffff { 5 } else { 9 };
+        let stripped: u64 = 80 + count_len
+            + block.txdata.iter().map(|tx| tx.base_size() as u64).sum::<u64>();
+        if stripped * WITNESS_SCALE_FACTOR > MAX_BLOCK_WEIGHT {
+            return Err(BlockValidationError::SizeExceeded);
+        }
         Ok(())
     }
 
