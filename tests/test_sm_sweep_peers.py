@@ -90,11 +90,6 @@ async def _settle():
         await asyncio.sleep(0)
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="sm-sweep-ouroboros D4: _evict_inbound_peer pops before "
-    "disconnect, the netgroup decrement is skipped",
-)
 @pytest.mark.asyncio
 async def test_sm_sweep_inbound_eviction_releases_netgroup(pm, monkeypatch):
     _inbound_peer(pm, "198.51.100.9", 40000)
@@ -107,11 +102,6 @@ async def test_sm_sweep_inbound_eviction_releases_netgroup(pm, monkeypatch):
     )
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="sm-sweep-ouroboros D4: _on_peer_banned pops before disconnect, "
-    "the netgroup decrement is skipped",
-)
 @pytest.mark.asyncio
 async def test_sm_sweep_inbound_ban_releases_netgroup(pm):
     _inbound_peer(pm, "198.51.100.10", 40001)
