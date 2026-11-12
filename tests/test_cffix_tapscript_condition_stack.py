@@ -256,12 +256,14 @@ _ALPHABET = [OP_0, OP_1, OP_1, OP_1, OP_2, OP_NOP, OP_IF, OP_NOTIF, OP_ELSE, OP_
 def test_condition_stack_matches_reference_model(sig_version: SigVersion) -> None:
     rng = random.Random(0xC0DE5 + int(sig_version))
     accepted = rejected = 0
-    for _ in range(40000):
+    for i in range(40000):
         n = rng.randint(1, 14)
         script = bytes(rng.choice(_ALPHABET) for _ in range(n))
-        got = _outcome(script, sig_version, 0)
-        want = _reference(script, sig_version, 0)
-        assert got == want, f"{sig_version.name} {script.hex()}: got {got}, want {want}"
+        # Alternate MINIMALIF so witness v0 is checked with and without it.
+        flags = SCRIPT_VERIFY_MINIMALIF if i % 2 else 0
+        got = _outcome(script, sig_version, flags)
+        want = _reference(script, sig_version, flags)
+        assert got == want, f"{sig_version.name} flags={flags} {script.hex()}: got {got}, want {want}"
         if got[0] == "ok":
             accepted += 1
         else:
