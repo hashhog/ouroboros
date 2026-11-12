@@ -561,6 +561,9 @@ FIXED_SEEDS_MAINNET = [
 
 
 MAX_INBOUND = 117  # Bitcoin Core default max inbound connections
+# Cap on PeerManager.stop()'s wait for the listening servers to finish
+# closing once every peer is disconnected (shutdown must not hang there).
+SERVER_CLOSE_TIMEOUT = 5.0
 # Core net.h: DEFAULT_MAX_PEER_CONNECTIONS=125, MAX_OUTBOUND_FULL_RELAY=8
 # so inbound = 125 - 8 = 117.  Outbound full-relay slots are reserved so an
 # inbound flood cannot starve sync (net.cpp nMaxInbound = nMaxConnections -
@@ -1068,11 +1071,16 @@ class PeerManager:
         logger.info("Stopping PeerManager...")
         self.running = False
 
-        # Stop listening server(s) (IPv4 + IPv6)
-        for server in self._servers:
+        # Stop accepting (IPv4 + IPv6).  Do NOT await wait_closed() here: on
+        # Python >= 3.12.1 it waits for every accepted connection to close,
+        # and the inbound peers are only disconnected further down, so one
+        # live inbound peer would hang stop() before _save_anchors() and
+        # addrman.save() ran.  The servers are waited on after the peers are
+        # gone (see _wait_servers_closed), as Core's CConnman::Stop closes
+        # every socket before Shutdown() dumps peers.dat / anchors.dat.
+        servers = list(self._servers)
+        for server in servers:
             server.close()
-        for server in self._servers:
-            await server.wait_closed()
         self._servers = []
         self._server = None
 
@@ -1171,7 +1179,31 @@ class PeerManager:
         # Persist address manager
         self.addrman.save()
 
+        await self._wait_servers_closed(servers)
+
         logger.info("PeerManager stopped")
+
+    async def _wait_servers_closed(self, servers, timeout: float = SERVER_CLOSE_TIMEOUT) -> None:
+        """Wait, bounded, for closed listening servers to finish closing.
+
+        By now every registered peer has been disconnected.  An accepted
+        connection that never registered (still in its handshake) would
+        still hold ``wait_closed()`` open, so the remaining client transports
+        are force-closed (``Server.close_clients``, Python >= 3.13) and the
+        wait is capped at *timeout* so shutdown can never hang here.
+        """
+        for server in servers:
+            close_clients = getattr(server, "close_clients", None)
+            if close_clients is not None:
+                close_clients()
+        for server in servers:
+            try:
+                await asyncio.wait_for(server.wait_closed(), timeout=timeout)
+            except TimeoutError:
+                logger.warning(
+                    "Listening server did not close within %.1fs; continuing shutdown",
+                    timeout,
+                )
 
     def set_network_active(self, state: bool) -> bool:
         """Enable/disable all NEW P2P network activity (Core CConnman::SetNetworkActive).
