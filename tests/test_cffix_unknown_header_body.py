@@ -18,7 +18,9 @@ These tests pin: (1) 1100 unrequested random-header bodies from one peer leave
 the buffer empty and score that peer; (2) an unrequested body whose prev IS
 known is dropped without a penalty; (3) a requested body with an unqueued
 header is still buffered; (4) an unrequested body whose header IS queued is
-still buffered (the existing path).
+still buffered (the existing path); (5) replies to getdata requests that a
+queue reset dropped are not buffered and do not score the peer; (6) that
+excuse expires after RECENT_REQUEST_TTL.
 """
 
 from __future__ import annotations
@@ -152,3 +154,51 @@ async def test_unrequested_body_with_queued_header_is_still_buffered():
     assert h in bs._ibd_block_buffer
     assert _prev_not_found_calls(bs) == []
     assert peer.synced == [TIP_HEIGHT + 1]
+
+
+@pytest.mark.asyncio
+async def test_late_replies_after_a_queue_reset_are_dropped_without_penalty():
+    """A slot-misalign resync clears ``requested_blocks`` and the header
+    queue together.  The 16 getdata replies still in flight from one peer
+    then arrive unrequested with an unknown header and an unknown prev
+    (tip+2.. whose parents lived only in the cleared queue).  They are not
+    buffered, and the peer, which only answered our getdata, is not scored."""
+    bs = _make_block_sync()
+    peer = _StubPeer()
+    payloads = [_payload(os.urandom(32)) for _ in range(16)]
+    for p in payloads:
+        h = _block_hash(p)
+        bs._validated_headers.append((h, MagicMock()))
+        bs.requested_blocks[h] = 1.0  # the request sites' own assignment
+
+    misaligned = MagicMock()
+    misaligned.transactions = []
+    bs._handle_misaligned_block(b"\xab" * 32, TIP_HEIGHT + 1, misaligned)
+    assert bs.requested_blocks == {} and bs._validated_headers == []
+
+    for p in payloads:
+        await bs.handle_block(_Msg(p), peer)
+
+    assert len(bs._ibd_block_buffer) == 0
+    assert _prev_not_found_calls(bs) == []
+    assert peer.score_deltas == []
+
+
+@pytest.mark.asyncio
+async def test_request_memory_expires(monkeypatch):
+    """The late-reply excuse lasts RECENT_REQUEST_TTL: an unrequested,
+    unknown-prev body for a hash requested longer ago than that is scored."""
+    import ouroboros.block_sync as block_sync_mod
+
+    bs = _make_block_sync()
+    peer = _StubPeer()
+    p = _payload(os.urandom(32))
+    h = _block_hash(p)
+    bs.requested_blocks[h] = 1.0
+    bs.requested_blocks.clear()
+    monkeypatch.setattr(block_sync_mod, "RECENT_REQUEST_TTL", -1.0)
+
+    await bs.handle_block(_Msg(p), peer)
+
+    assert len(bs._ibd_block_buffer) == 0
+    assert len(_prev_not_found_calls(bs)) == 1

@@ -195,6 +195,38 @@ W77_FIRST_REQUEST_MAX_ENTRIES = 20_000
 # legitimately awaited.
 IBD_BUFFER_ORPHAN_TTL = 600.0
 
+# How long, and how many, block hashes ``requested_blocks`` remembers after a
+# request leaves it.  A queue reset (slot-misalign resync, W75 tip-stall
+# recovery) clears ``requested_blocks`` and ``_validated_headers`` together,
+# so the replies still in flight then arrive looking unrequested with an
+# unknown header.  They are dropped like any other such body, but the peer
+# answered a getdata we sent and must not be scored for it.
+RECENT_REQUEST_TTL = IBD_BUFFER_ORPHAN_TTL
+RECENT_REQUEST_MAX = 8192
+
+
+class _InFlightBlockMap(dict):
+    """``requested_blocks`` (hash -> request time) that also remembers, for
+    ``RECENT_REQUEST_TTL`` seconds and at most ``RECENT_REQUEST_MAX`` hashes,
+    every hash ever put into it, whichever path later removes the hash."""
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self._recent: dict[bytes, float] = {}
+
+    def __setitem__(self, key, value) -> None:
+        super().__setitem__(key, value)
+        recent = self._recent
+        recent.pop(key, None)
+        recent[key] = time.monotonic()
+        while len(recent) > RECENT_REQUEST_MAX:
+            del recent[next(iter(recent))]
+
+    def recently_requested(self, key) -> bool:
+        ts = self._recent.get(key)
+        return ts is not None and time.monotonic() - ts <= RECENT_REQUEST_TTL
+
+
 from ouroboros.database import Block, BlockchainDatabase, Transaction
 from ouroboros.p2p_messages import (
     INV_TYPE_BLOCK,
@@ -607,7 +639,7 @@ class BlockSync:
 
         # Track requested blocks (hash -> request_time)
         # FIXME: race condition if called from multiple threads?
-        self.requested_blocks: dict[bytes, float] = {}
+        self.requested_blocks: dict[bytes, float] = _InFlightBlockMap()
 
         # Hashes the drain is currently deserializing / validating / connecting.
         # Those are not in requested_blocks (handle_block already popped them)
@@ -2623,12 +2655,14 @@ class BlockSync:
             # fTooFarAhead gate below.
             claimed_height: int | None = None
             active_height: int = 0
+            height_lookup_ok = False
             try:
                 _, active_height = self.db.get_best_block()
                 for _idx, (_bh, _) in enumerate(self._validated_headers):
                     if _bh == block_hash:
                         claimed_height = active_height + 1 + _idx
                         break
+                height_lookup_ok = True
             except Exception:
                 claimed_height = None
 
@@ -2644,7 +2678,7 @@ class BlockSync:
                         f"from {peer.host}:{peer.port}"
                     )
                     return
-                if claimed_height is None:
+                if claimed_height is None and height_lookup_ok:
                     # Unrequested body whose header is not on the queued
                     # header chain.  Core runs AcceptBlockHeader before it
                     # stores any body (validation.cpp AcceptBlock): an
@@ -2829,15 +2863,25 @@ class BlockSync:
         the sender when its prev is unknown (Core BLOCK_MISSING_PREV).
 
         Core discourages on the first missing-prev block.  We score
-        SCORE_UNSOLICITED_BLOCK per body instead, so the discouragement
-        threshold is reached after a short burst: unlike Core's block index,
-        our header queue can be cleared (slot-misalign resync), after which a
-        late reply to an earlier getdata from an honest peer can look exactly
-        like this.  A known-prev body is dropped without a penalty.
+        SCORE_UNSOLICITED_BLOCK per body instead (on the connection score and
+        in the BanManager, whose cumulative threshold bans), because unlike
+        Core's block index our header queue can be cleared.  A reply to a
+        getdata we sent in the last ``RECENT_REQUEST_TTL`` seconds — e.g. one
+        still in flight when a slot-misalign resync or a W75 recovery cleared
+        ``requested_blocks`` and the queue — is never scored, nor is a
+        known-prev body.  Both are still dropped.
         """
         self._blk_unrequested_unknown_header += 1
         prev_hash = bytes(payload[4:36])
-        prev_known = self._prev_header_known(prev_hash)
+        _recent = getattr(self.requested_blocks, "recently_requested", None)
+        if callable(_recent) and _recent(block_hash):
+            # We asked for it and a reset dropped the request: a late reply,
+            # not the peer's fault.
+            why = "recently requested"
+        elif self._prev_header_known(prev_hash):
+            why = "prev known"
+        else:
+            why = None
         addr = f"{peer.host}:{peer.port}"
         _now = time.time()
         if _now - getattr(self, "_last_unknown_hdr_drop_log", 0.0) > 30.0:
@@ -2845,11 +2889,11 @@ class BlockSync:
             logger.info(
                 f"Dropping unrequested block {block_hash.hex()[:16]}... from "
                 f"{addr}: header not in the validated-header queue "
-                f"(prev {prev_hash.hex()[:16]}... "
-                f"{'known' if prev_known else 'unknown: prev-blk-not-found'}; "
+                f"(prev {prev_hash.hex()[:16]}...; "
+                f"{why or 'prev unknown: prev-blk-not-found'}; "
                 f"total {self._blk_unrequested_unknown_header})"
             )
-        if prev_known:
+        if why is not None:
             return
         from ouroboros.banman import SCORE_UNSOLICITED_BLOCK
         peer.adjust_score(-SCORE_UNSOLICITED_BLOCK)
