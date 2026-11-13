@@ -1297,7 +1297,10 @@ class PeerManager:
         if victim_addr is None:
             return False
 
-        victim = self.inbound_peers.pop(victim_addr, None)
+        # Pop through the accounting helper: the slot must be free before
+        # the caller accepts the new inbound, and disconnect()'s callback
+        # will no longer find the entry to release its netgroup.
+        victim = self._remove_peer_from_bucket(victim_addr)
         if victim is not None:
             logger.info(f"Evicting inbound peer {victim_addr} to make room")
             await victim.disconnect()
@@ -2672,6 +2675,62 @@ class PeerManager:
 
         return elapsed >= backoff_time
 
+    def _remove_peer_from_bucket(self, addr: str) -> "Peer | None":
+        """Pop ``addr`` from its bucket and release its netgroup accounting.
+
+        The single place a live peer leaves ``peers`` / ``block_relay_peers``
+        / ``inbound_peers`` ahead of (or at) its disconnect.  Every pop must
+        come through here: ``_handle_peer_disconnected`` only does the
+        accounting for an entry it still finds, so a caller that popped the
+        bucket itself before ``disconnect()`` (eviction, ban) used to leak one
+        ``_inbound_netgroups`` count per peer and leave a stale entry in
+        ``_outbound_netgroups``.  A leaked inbound count makes the group look
+        already-present forever (``is_new_group`` in the accept path).
+
+        Core keeps no such counter: node/eviction.cpp ``SelectNodeToEvict``
+        recomputes netgroups from the live peer set on every call.  The
+        counter here must therefore track the live ``inbound_peers`` set
+        exactly, which is what doing the decrement at the pop guarantees.
+
+        Returns the popped peer, or None if ``addr`` was in no bucket (so a
+        second call for the same addr, e.g. the disconnect callback after an
+        eviction, is a no-op).
+        """
+        popped_peer = None
+        if addr in self.peers:
+            popped_peer = self.peers.pop(addr)
+            try:
+                self._update_outbound_netgroups()
+            except Exception:
+                logger.debug(
+                    "_update_outbound_netgroups raised on full-relay disconnect of %s",
+                    addr, exc_info=True,
+                )
+        elif addr in self.block_relay_peers:
+            popped_peer = self.block_relay_peers.pop(addr)
+            try:
+                self._update_outbound_netgroups()
+            except Exception:
+                logger.debug(
+                    "_update_outbound_netgroups raised on block-relay disconnect of %s",
+                    addr, exc_info=True,
+                )
+        elif addr in self.inbound_peers:
+            popped_peer = self.inbound_peers.pop(addr)
+            try:
+                host = addr.rsplit(":", 1)[0]
+                group = self._netgroup(host)
+                if group in self._inbound_netgroups:
+                    self._inbound_netgroups[group] -= 1
+                    if self._inbound_netgroups[group] <= 0:
+                        del self._inbound_netgroups[group]
+            except Exception:
+                logger.debug(
+                    "inbound netgroup decrement raised on disconnect of %s",
+                    addr, exc_info=True,
+                )
+        return popped_peer
+
     def _handle_peer_disconnected(self, addr: str) -> None:
         """Event-driven cleanup hook wired into :meth:`Peer.disconnect`.
 
@@ -2715,41 +2774,7 @@ class PeerManager:
         # match in practice — Peer instances are never multi-bucket —
         # but checking all three is cheap and resilient to future
         # bucketing changes.
-        popped_peer = None
-        if addr in self.peers:
-            popped_peer = self.peers.pop(addr)
-            try:
-                self._update_outbound_netgroups()
-            except Exception:
-                logger.debug(
-                    "_update_outbound_netgroups raised on full-relay disconnect of %s",
-                    addr, exc_info=True,
-                )
-        elif addr in self.block_relay_peers:
-            popped_peer = self.block_relay_peers.pop(addr)
-            try:
-                self._update_outbound_netgroups()
-            except Exception:
-                logger.debug(
-                    "_update_outbound_netgroups raised on block-relay disconnect of %s",
-                    addr, exc_info=True,
-                )
-        elif addr in self.inbound_peers:
-            popped_peer = self.inbound_peers.pop(addr)
-            # Mirror the inbound netgroup decrement that
-            # maintain_connections used to do.
-            try:
-                host = addr.rsplit(":", 1)[0]
-                group = self._netgroup(host)
-                if group in self._inbound_netgroups:
-                    self._inbound_netgroups[group] -= 1
-                    if self._inbound_netgroups[group] <= 0:
-                        del self._inbound_netgroups[group]
-            except Exception:
-                logger.debug(
-                    "inbound netgroup decrement raised on disconnect of %s",
-                    addr, exc_info=True,
-                )
+        popped_peer = self._remove_peer_from_bucket(addr)
 
         # Always drop the per-addr caches.  Safe to call even when the
         # peer was not in any bucket (the maps tolerate unknown keys).
@@ -4901,11 +4926,13 @@ class PeerManager:
                     logger.debug(
                         "_on_peer_banned: local peer %s — disconnect-only", addr
                     )
-                    bucket.pop(addr, None)
+                    self._remove_peer_from_bucket(addr)
                     asyncio.ensure_future(peer.disconnect())
                     continue
                 # Default: disconnect the peer (ban is already in ban_manager).
-                bucket.pop(addr, None)
+                # Pop via the helper so the netgroup counters are released;
+                # the disconnect callback will find no entry to do it.
+                self._remove_peer_from_bucket(addr)
                 asyncio.ensure_future(peer.disconnect())
         self.known_addrs.discard(ip)
 
