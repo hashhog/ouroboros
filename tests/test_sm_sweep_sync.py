@@ -15,7 +15,7 @@ A1  ``BlockSync._handle_timeouts`` counts an attempt for every timed-out
     BLOCK_STALLING_TIMEOUT / BLOCK_DOWNLOAD_TIMEOUT_BASE) and the block is
     re-requested from another peer via ``FindNextBlocksToDownload``.
 
-xfail(strict=True) until sm-fix-ouroboros-timeout-perm-reject lands.
+Fixed by sm-fix-ouroboros-timeout-perm-reject (xfail removed).
 """
 
 from __future__ import annotations
@@ -37,11 +37,6 @@ async def _timed_out_queue_slot(slot: int):
     return bs, target
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="sm-sweep-ouroboros A1: download timeouts perm-reject a queued "
-    "header-chain block outside the 8-slot head window",
-)
 @pytest.mark.asyncio
 async def test_sm_sweep_timed_out_queued_chain_block_is_not_perm_rejected():
     bs, target = await _timed_out_queue_slot(20)
