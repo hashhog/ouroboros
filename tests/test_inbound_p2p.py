@@ -162,6 +162,11 @@ class _FakeDB:
             return self._genesis.hash
         return None
 
+    def get_block_height_by_hash(self, block_hash: bytes):
+        if block_hash == self._genesis.hash:
+            return 0
+        return None
+
     def get_best_block(self):
         return self._genesis.hash, 0
 
@@ -428,6 +433,7 @@ async def test_inbound_serves_getheaders_and_getdata(tmp_path):
     node.peer_manager = pm
     node._register_handlers()
 
+    writer = None
     try:
         port = _listen_port(pm)
         reader, writer = await _handshake_as_dialer("127.0.0.1", port)
@@ -441,7 +447,12 @@ async def test_inbound_serves_getheaders_and_getdata(tmp_path):
         assert "getdata" in peers[0].message_handlers
         assert "getheaders" in peers[0].message_handlers
 
-        # Locator of an unknown hash keeps start_height=0 so genesis is served.
+        # The chain is genesis only.  Core serves getheaders from the block
+        # AFTER the fork point (genesis when the locator matches nothing),
+        # so the inbound peer is answered with an empty headers message —
+        # the reply is what proves the handler is wired for inbound peers.
+        # (This used to expect genesis itself: the handler started at
+        # height 0 on an unknown locator, which Core never does.)
         gh = GetHeadersMessage(
             version=70016,
             locator_hashes=[b"\x00" * 32],
@@ -451,7 +462,7 @@ async def test_inbound_serves_getheaders_and_getdata(tmp_path):
         await writer.drain()
         headers_msg = await _drain_until(reader, "headers", timeout=5.0)
         assert headers_msg.command == "headers"
-        assert len(headers_msg.payload) > 1, "expected a served header, got empty headers"
+        assert headers_msg.payload == b"\x00", "expected an empty headers reply"
 
         gd = GetDataMessage(inventory=[(INV_TYPE_BLOCK, genesis.hash)])
         writer.write(gd.to_network_message(NETWORK).serialize())
@@ -459,8 +470,11 @@ async def test_inbound_serves_getheaders_and_getdata(tmp_path):
         block_msg = await _drain_until(reader, "block", timeout=5.0)
         assert block_msg.command == "block"
         assert len(block_msg.payload) >= 80, "served block too short to contain a header"
-
-        writer.close()
-        await writer.wait_closed()
     finally:
+        # Close the dialer even when an assertion fails: pm.stop() waits on
+        # the open inbound connection, so a failing run used to hang here
+        # instead of reporting the failure.
+        if writer is not None:
+            writer.close()
+            await writer.wait_closed()
         await pm.stop()
