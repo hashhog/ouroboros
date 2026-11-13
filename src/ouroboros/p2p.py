@@ -37,6 +37,7 @@ from ouroboros.localaddr import (
 )
 from ouroboros.banman import (
     BanManager,
+    ban_key,
 )
 from ouroboros.minisketch import (
     Minisketch,
@@ -4097,8 +4098,10 @@ class PeerManager:
             f"{peer.host}:{peer.port} (> {MAX_ADDR_TO_SEND}) "
             "— misbehaving"
         )
+        # The connection key, not the bare host: the noban/manual/local
+        # exemptions are decided per connection (_punish).
         self.misbehaving(
-            peer.host, 100,
+            f"{peer.host}:{peer.port}", 100,
             f"{err.command} message size = {err.count}",
         )
 
@@ -4904,7 +4907,15 @@ class PeerManager:
             (self.inbound_peers, True),    # inbound
         ]
         for bucket, _is_inbound in all_buckets:
-            matching = [a for a in list(bucket) if a.startswith(ip)]
+            # Exact address match.  Bans are keyed by address (banman.ban_key),
+            # so every connection from that IP goes, on any port -- and only
+            # that IP: the previous ``a.startswith(ip)`` also hit
+            # 198.51.100.70:* when 198.51.100.7 was banned.
+            matching = [
+                a for a, p in list(bucket.items())
+                if a == ip or ban_key(a) == ip
+                or getattr(p, "host", None) == ip
+            ]
             for addr in matching:
                 peer = bucket.get(addr)
                 if peer is None:
@@ -4953,7 +4964,93 @@ class PeerManager:
 
         Returns True if the peer was banned.
         """
+        return self._punish(addr, score, reason)
+
+    def _connected_peers_for(self, peer_id: str) -> list:
+        """Connected peers *peer_id* names, as ``(bucket, key, peer)``.
+
+        A connection key (``host:port``, also an unbracketed IPv6 one) names
+        one connection.  A bare address names every connection from it.
+        """
+        buckets = (self.peers, self.block_relay_peers, self.inbound_peers)
+        for bucket in buckets:
+            peer = bucket.get(peer_id)
+            if peer is not None:
+                return [(bucket, peer_id, peer)]
+        found = []
+        for bucket in buckets:
+            for key, peer in list(bucket.items()):
+                host = getattr(peer, "host", None)
+                if host and f"{host}:{getattr(peer, 'port', '')}" == peer_id:
+                    return [(bucket, key, peer)]
+                if host and host == peer_id:
+                    found.append((bucket, key, peer))
+        return found
+
+    def _punish(self, peer_id: str, score: int, reason: str) -> bool:
+        """Score a misbehaving peer with Core's exemptions applied first.
+
+        net_processing.cpp MaybeDiscourageAndDisconnect, in order:
+          1. NoBan permission -> "not punishing noban peer", return.
+          2. Manual connection -> "not punishing manually connected peer".
+          3. ``addr.IsLocal()`` -> disconnect THIS node only, no Discourage
+             ("since that would discourage all peers on the same local
+             address").
+          4. Otherwise Discourage(addr) + DisconnectNode(addr) -- here
+             ``BanManager.ban`` and its ``_on_peer_banned`` callback.
+
+        Bans are keyed by address, so cases 1-3 must never reach ``ban()``:
+        a stored ban for the address would make the inbound gate (which
+        checks ``is_banned(host)`` before any noban flag is known) refuse the
+        next connection from it.  For a bare address naming several
+        connections, the exemption holds only if every one is exempt.
+        """
+        conns = self._connected_peers_for(peer_id)
+        if conns and all(
+            getattr(p, "noban", False) or getattr(p, "is_manual", False)
+            for _b, _k, p in conns
+        ):
+            logger.warning(
+                "Not punishing %s peer %s: %s (+%d)",
+                "noban" if all(getattr(p, "noban", False) for _b, _k, p in conns)
+                else "manually connected", peer_id, reason, score,
+            )
+            return False
+        addr = self._ban_address(peer_id)
+        if is_local_addr(addr):
+            if not self.ban_manager.record_misbehavior(
+                    peer_id, score, reason, discourage=False):
+                return False
+            for _bucket, _key, peer in conns:
+                if getattr(peer, "noban", False) or getattr(peer, "is_manual", False):
+                    continue
+                # disconnect() fires _handle_peer_disconnected, which removes
+                # the bucket entry and its accounting.
+                asyncio.ensure_future(peer.disconnect())
+            return True
         return self.ban_manager.record_misbehavior(addr, score, reason)
+
+    def _ban_address(self, peer_id: str) -> str:
+        """Map a peer identifier to the address a ban/score is keyed by.
+
+        Callers pass connection keys -- usually ``f"{peer.host}:{peer.port}"``.
+        Core discourages ``pnode.addr`` (net_processing.cpp
+        MaybeDiscourageAndDisconnect), never an address+port.  For a key that
+        belongs to a connected peer the peer's own host is authoritative;
+        that is the only reliable way to strip the port from an unbracketed
+        IPv6 key like ``2001:db8::1:8333``.  Anything else goes through
+        ``banman.ban_key``.
+        """
+        for bucket in (self.peers, self.block_relay_peers, self.inbound_peers):
+            peer = bucket.get(peer_id)
+            if peer is not None and getattr(peer, "host", None):
+                return peer.host
+        for bucket in (self.peers, self.block_relay_peers, self.inbound_peers):
+            for peer in list(bucket.values()):
+                host = getattr(peer, "host", None)
+                if host and f"{host}:{getattr(peer, 'port', '')}" == peer_id:
+                    return host
+        return ban_key(peer_id)
 
     def misbehaving(self, peer_id: str, score: int, reason: str) -> bool:
         """Record misbehavior for a peer (Bitcoin Core API compatibility).
@@ -4973,10 +5070,14 @@ class PeerManager:
             score: Misbehavior score to add
             reason: Human-readable reason
 
+        NoBan and manual peers are not punished (returns False); a local
+        address is disconnected but never banned.  See ``_punish``.
+
         Returns:
-            True if the peer was banned as a result
+            True if the peer was punished as a result (its address banned,
+            or a local peer disconnected)
         """
-        return self.ban_manager.misbehaving(peer_id, score, reason)
+        return self._punish(peer_id, score, reason)
 
     def unban_peer(self, addr: str):
         """
