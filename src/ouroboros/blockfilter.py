@@ -497,7 +497,14 @@ class BlockFilterIndex:
         filt = build_basic_filter(block, db)
 
         if prev_header is None:
-            prev_header = self._tip_header
+            # Chain off the block's PARENT, not whatever was added last:
+            # after a reorg or invalidateblock the last-added header is the
+            # old tip's.  Fall back to the tip only when the parent was
+            # never indexed (genesis, or an index started mid-chain).
+            parent = getattr(block, "prev_blockhash", None)
+            prev_header = self._headers.get(parent) if parent else None
+            if prev_header is None:
+                prev_header = self._tip_header
 
         fheader = compute_filter_header(filt, prev_header)
 
@@ -953,7 +960,24 @@ class PersistentBlockFilterIndex:
                         self._cache_put(self._filter_cache, block_hash, cached_filter)
                         self._cache_put(self._header_cache, block_hash, existing_header)
                         return cached_filter, existing_header
-                prev_header = self._get_tip_header()
+                # BIP157: a filter header commits to the PARENT block's
+                # filter header.  Look the parent up by hash instead of
+                # taking the last header added: the RPC reorg engine
+                # (rpc.py _reorg_to_side_branch_tip, invalidateblock /
+                # reconsiderblock activation) disconnects without rewinding
+                # the tip header, so after a reorg the last-added header is
+                # the OLD tip's and every new-branch header would chain off
+                # it.  Core gets the same result by rewinding the index to
+                # pindex->pprev before connecting (index/base.cpp
+                # BaseIndex::BlockConnected -> Rewind), whose
+                # BlockFilterIndex::CustomRemove resets m_last_header to the
+                # parent's header before CustomAppend chains off it.
+                # The tip header is only a fallback for a block whose parent
+                # was never indexed (genesis, or an index started mid-chain).
+                parent = getattr(block, "prev_blockhash", None)
+                prev_header = self._read_header(parent) if parent else None
+                if prev_header is None:
+                    prev_header = self._get_tip_header()
 
             fheader = compute_filter_header(filt, prev_header)
 
