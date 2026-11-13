@@ -563,8 +563,10 @@ def test_w136_g24_pre_verack_messages_not_scored() -> None:
 def test_w136_g25_block_announce_precedence() -> None:
     """G25: block-announce precedence cmpctblock > headers > inv."""
     src = _read_py("block_sync.py")
-    # Find _announce_block.
-    idx = src.find("async def _announce_block")
+    # Find the single-block sender _announce_block.  The open paren keeps the
+    # scan off the batch sender ``_announce_blocks``, which is defined first
+    # and only sends headers/inv, never cmpctblock.
+    idx = src.find("async def _announce_block(")
     assert idx != -1
     # The per-peer sender is a nested ``async def _announce_to``; the body
     # ends at the next METHOD, not the next ``async def``.

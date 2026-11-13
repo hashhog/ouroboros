@@ -16,7 +16,8 @@ C5  New tips that arrive through ``accept_block`` (rpc.py) are never
     queues up to MAX_BLOCKS_TO_ANNOUNCE hashes into ``m_blocks_for_headers_relay``
     / inv for every peer; ``NewPoWValidBlock`` sends cmpctblock.
 
-xfail(strict=True) until sm-fix-ouroboros-announce-accepted-tips lands.
+Fixed by sm-fix-ouroboros-announce-accepted-tips (rpc.announce_tip_change);
+the reorg / cap / IBD-gate cases are in test_sm_fix_announce_accepted_tips.py.
 """
 
 from __future__ import annotations
@@ -74,11 +75,6 @@ def _wire_peer(server, bs, peer):
     server.node.peer_manager = pm
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="sm-sweep-ouroboros C5: a tip connected through accept_block "
-    "(submitblock / reorg engine) is never announced to peers",
-)
 def test_sm_sweep_submitblock_tip_is_announced_to_peers(tmp_path):
     bdb, chain, bs, server, hashes = _setup(tmp_path)
     peer = _RelayPeer()
