@@ -21,7 +21,8 @@ D4  ``_evict_inbound_peer`` and ``_on_peer_banned`` pop the peer out of
     Core: CConnman tracks no such counter; eviction (node/eviction.cpp)
     recomputes netgroups from the live peer set on every call.
 
-xfail(strict=True) until the fix items land.
+D2 fixed by sm-fix-ouroboros-ban-address-key (bans keyed by address).
+D4: xfail(strict=True) until its fix item lands.
 """
 
 from __future__ import annotations
@@ -44,11 +45,6 @@ def pm(tmp_path):
 # --------------------------------------------------------------------------- #
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="sm-sweep-ouroboros D2: misbehaving(host:port) bans the port, "
-    "not the address",
-)
 def test_sm_sweep_misbehaving_host_port_bans_the_address(pm):
     banned = pm.misbehaving("198.51.100.7:51234", 100, "invalid block")
     assert banned, "precondition: score 100 triggers a ban"
@@ -90,11 +86,6 @@ async def _settle():
         await asyncio.sleep(0)
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="sm-sweep-ouroboros D4: _evict_inbound_peer pops before "
-    "disconnect, the netgroup decrement is skipped",
-)
 @pytest.mark.asyncio
 async def test_sm_sweep_inbound_eviction_releases_netgroup(pm, monkeypatch):
     _inbound_peer(pm, "198.51.100.9", 40000)
@@ -107,11 +98,6 @@ async def test_sm_sweep_inbound_eviction_releases_netgroup(pm, monkeypatch):
     )
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="sm-sweep-ouroboros D4: _on_peer_banned pops before disconnect, "
-    "the netgroup decrement is skipped",
-)
 @pytest.mark.asyncio
 async def test_sm_sweep_inbound_ban_releases_netgroup(pm):
     _inbound_peer(pm, "198.51.100.10", 40001)

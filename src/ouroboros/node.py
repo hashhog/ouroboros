@@ -177,6 +177,8 @@ class BitcoinNode:
         self._last_mempool_expire: float = 0.0
         self._rpc_task: asyncio.Task | None = None
         self._shutdown_event: asyncio.Event | None = None
+        # The one shared shutdown task; see stop().
+        self._stop_task: asyncio.Task | None = None
         self._rpc_username: str | None = None
         self._rpc_password: str | None = None
 
@@ -1345,10 +1347,36 @@ class BitcoinNode:
             raise
 
     async def stop(self):
-        """Stop the Bitcoin node"""
-        if not self.running:
-            return
+        """Stop the Bitcoin node and return only once the shutdown has finished.
 
+        Idempotent: the first call starts one shared shutdown task and every
+        call (the SIGTERM/AbortNode-scheduled task, the RPC ``stop`` future,
+        ``run()``'s ``finally``) awaits that same task.  A later caller must
+        not return early just because ``running`` is already False: then
+        ``run()`` would return while the signal-scheduled shutdown is still
+        awaiting teardown, and ``asyncio.run`` would cancel it before the
+        fee-estimate and mempool.dat saves (Core: ``Shutdown()`` in init.cpp
+        runs DumpMempool / fee estimates synchronously before exit).
+
+        The shared task is awaited through ``asyncio.shield`` so cancelling
+        one caller does not abort the shutdown for the others.
+        """
+        task = getattr(self, "_stop_task", None)
+        if task is not None and (
+            task.done() or task.get_loop() is not asyncio.get_running_loop()
+        ):
+            # A shutdown already ran (or its loop has gone away): nothing
+            # left to wait for.
+            return
+        if task is None:
+            if not self.running:
+                return
+            task = asyncio.get_running_loop().create_task(self._stop_impl())
+            self._stop_task = task
+        await asyncio.shield(task)
+
+    async def _stop_impl(self):
+        """The shutdown sequence; run once, via :meth:`stop`."""
         logger.info("Stopping Bitcoin node...")
         self.running = False
 

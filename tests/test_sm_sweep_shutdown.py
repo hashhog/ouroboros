@@ -23,8 +23,10 @@ task) and the real ``run()`` / ``stop()``.  A fix that instead makes the
 handler only set the event and lets ``run()``'s finally do the stop must
 update ``fake_start`` to match the new handler.
 
-xfail(strict=True) until sm-fix-ouroboros-pm-stop-inbound-hang (E1a) and
-sm-fix-ouroboros-sigterm-stop-cancelled (E1b) land.
+E1a is fixed (sm-fix-ouroboros-pm-stop-inbound-hang: stop() closes the
+servers, disconnects every peer and saves, then waits, bounded, for the
+servers).  E1b stays xfail(strict=True) until
+sm-fix-ouroboros-sigterm-stop-cancelled lands.
 """
 
 from __future__ import annotations
@@ -42,11 +44,6 @@ from tests.test_inbound_p2p import (
     _start_listening_pm,
 )
 
-_XFAIL_A = pytest.mark.xfail(
-    strict=True,
-    reason="sm-sweep-ouroboros E1a: PeerManager.stop awaits server.wait_closed() "
-    "before disconnecting inbound peers",
-)
 _XFAIL_B = pytest.mark.xfail(
     strict=True,
     reason="sm-sweep-ouroboros E1b: run()'s finally-stop is a no-op and "
@@ -59,7 +56,6 @@ _XFAIL_B = pytest.mark.xfail(
     reason="Server.wait_closed() waits for accepted connections only on "
     "Python >= 3.12.1 (the deployed venv is 3.13)",
 )
-@_XFAIL_A
 @pytest.mark.asyncio
 async def test_sm_sweep_peer_manager_stop_with_live_inbound_peer_saves_peers(tmp_path):
     pm = await _start_listening_pm(tmp_path)
@@ -80,7 +76,6 @@ async def test_sm_sweep_peer_manager_stop_with_live_inbound_peer_saves_peers(tmp
     assert os.path.exists(tmp_path / "peers.json"), "addrman.save() did not run"
 
 
-@_XFAIL_B
 def test_sm_sweep_signal_scheduled_stop_dumps_mempool(tmp_path):
     from ouroboros.node import BitcoinNode
 
