@@ -134,7 +134,8 @@ class BanManager:
 
     # Public API
 
-    def record_misbehavior(self, ip: str, score: int, reason: str) -> bool:
+    def record_misbehavior(self, ip: str, score: int, reason: str,
+                           discourage: bool = True) -> bool:
         """Add *score* points for *ip*.  Ban if single-event or cumulative threshold reached.
 
         Bitcoin Core 2022 (PR #25974) single-event discourage model:
@@ -147,8 +148,17 @@ class BanManager:
 
         *ip* may be a connection key (``host:port``); the score and the ban
         are recorded against the address (``ban_key``), as Core does.
+
+        ``discourage=False`` is Core's local-address branch of
+        MaybeDiscourageAndDisconnect: the caller disconnects that one
+        connection and NO ban is stored, "since that would discourage all
+        peers on the same local address".  The score is then kept under *ip*
+        exactly as given (the connection key), so two local connections do
+        not pool their scores either.  Returns True when the threshold was
+        reached, i.e. when the caller must disconnect.
         """
-        ip = ban_key(ip)
+        if discourage:
+            ip = ban_key(ip)
         rec = self.scores.setdefault(ip, MisbehaviorRecord())
         rec.score += score
         rec.events.append(reason)
@@ -172,6 +182,14 @@ class BanManager:
             # only at DEBUG.
             trigger = ("single-event" if score >= self.DISCOURAGEMENT_THRESHOLD
                        else "cumulative")
+            if not discourage:
+                self.scores.pop(ip, None)
+                logger.warning(
+                    "Disconnecting %s (not discouraged: local address): %s "
+                    "(score +%d -> %d, %s)",
+                    ip, reason, score, rec.score, trigger,
+                )
+                return True
             self.ban(ip, reason=f"{reason} (score +{score} -> {rec.score}, {trigger})")
             return True
         return False
