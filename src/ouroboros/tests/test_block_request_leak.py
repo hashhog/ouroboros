@@ -14,9 +14,10 @@ so a leaked entry also pinned a zombie Peer (transport buffers, BIP-324 state).
 The fix bounds all of these:
   * handle_inv honours the global in-flight cap + skips perm-rejected hashes
   * _w77_first_request_time is FIFO-capped (W77_FIRST_REQUEST_MAX_ENTRIES)
-  * _handle_timeouts counts attempts and permanently abandons (perm-rejects +
-    drops from every in-flight map) off-active-chain blocks past
-    BLOCK_REQUEST_MAX_ATTEMPTS
+  * _handle_timeouts counts attempts and abandons (drops from every in-flight
+    map) off-chain blocks past BLOCK_REQUEST_MAX_ATTEMPTS.  A download timeout
+    is not a validity verdict, so the abandoned hash is NOT perm-rejected
+    (Core's stall / download timeouts only disconnect the peer)
   * _mark_perm_rejected drops the hash from every in-flight map
 """
 
@@ -116,8 +117,9 @@ class TestBlockRequestLeak(unittest.IsolatedAsyncioTestCase):
 
     async def test_timeouts_abandon_never_connecting_blocks(self):
         """Off-active-chain blocks re-requested past BLOCK_REQUEST_MAX_ATTEMPTS
-        are permanently abandoned: dropped from every in-flight map and
-        perm-rejected (so they cannot re-open the slot)."""
+        are abandoned: dropped from every in-flight map.  A download timeout
+        is not a validity verdict, so they are NOT perm-rejected (a later
+        valid body can still be requested)."""
         bs, peers = _fresh_block_sync()
         for i in range(5):
             h = _dsha(b"stuck" + i.to_bytes(8, "little"))
@@ -140,7 +142,9 @@ class TestBlockRequestLeak(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(bs._block_request_peer), 0)
         self.assertEqual(len(bs._w77_first_request_time), 0)
         self.assertEqual(len(bs._block_request_attempts), 0)
-        self.assertEqual(len(bs._perm_rejected_blocks), 5)
+        for i in range(5):
+            h = _dsha(b"stuck" + i.to_bytes(8, "little"))
+            self.assertNotIn(h, bs._perm_rejected_blocks)
 
     async def test_perm_reject_drops_in_flight_request_state(self):
         """_mark_perm_rejected clears the per-hash in-flight bookkeeping that
