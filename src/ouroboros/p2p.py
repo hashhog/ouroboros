@@ -37,6 +37,7 @@ from ouroboros.localaddr import (
 )
 from ouroboros.banman import (
     BanManager,
+    ban_key,
 )
 from ouroboros.minisketch import (
     Minisketch,
@@ -561,6 +562,9 @@ FIXED_SEEDS_MAINNET = [
 
 
 MAX_INBOUND = 117  # Bitcoin Core default max inbound connections
+# Cap on PeerManager.stop()'s wait for the listening servers to finish
+# closing once every peer is disconnected (shutdown must not hang there).
+SERVER_CLOSE_TIMEOUT = 5.0
 # Core net.h: DEFAULT_MAX_PEER_CONNECTIONS=125, MAX_OUTBOUND_FULL_RELAY=8
 # so inbound = 125 - 8 = 117.  Outbound full-relay slots are reserved so an
 # inbound flood cannot starve sync (net.cpp nMaxInbound = nMaxConnections -
@@ -1068,11 +1072,16 @@ class PeerManager:
         logger.info("Stopping PeerManager...")
         self.running = False
 
-        # Stop listening server(s) (IPv4 + IPv6)
-        for server in self._servers:
+        # Stop accepting (IPv4 + IPv6).  Do NOT await wait_closed() here: on
+        # Python >= 3.12.1 it waits for every accepted connection to close,
+        # and the inbound peers are only disconnected further down, so one
+        # live inbound peer would hang stop() before _save_anchors() and
+        # addrman.save() ran.  The servers are waited on after the peers are
+        # gone (see _wait_servers_closed), as Core's CConnman::Stop closes
+        # every socket before Shutdown() dumps peers.dat / anchors.dat.
+        servers = list(self._servers)
+        for server in servers:
             server.close()
-        for server in self._servers:
-            await server.wait_closed()
         self._servers = []
         self._server = None
 
@@ -1171,7 +1180,31 @@ class PeerManager:
         # Persist address manager
         self.addrman.save()
 
+        await self._wait_servers_closed(servers)
+
         logger.info("PeerManager stopped")
+
+    async def _wait_servers_closed(self, servers, timeout: float = SERVER_CLOSE_TIMEOUT) -> None:
+        """Wait, bounded, for closed listening servers to finish closing.
+
+        By now every registered peer has been disconnected.  An accepted
+        connection that never registered (still in its handshake) would
+        still hold ``wait_closed()`` open, so the remaining client transports
+        are force-closed (``Server.close_clients``, Python >= 3.13) and the
+        wait is capped at *timeout* so shutdown can never hang here.
+        """
+        for server in servers:
+            close_clients = getattr(server, "close_clients", None)
+            if close_clients is not None:
+                close_clients()
+        for server in servers:
+            try:
+                await asyncio.wait_for(server.wait_closed(), timeout=timeout)
+            except TimeoutError:
+                logger.warning(
+                    "Listening server did not close within %.1fs; continuing shutdown",
+                    timeout,
+                )
 
     def set_network_active(self, state: bool) -> bool:
         """Enable/disable all NEW P2P network activity (Core CConnman::SetNetworkActive).
@@ -1265,7 +1298,10 @@ class PeerManager:
         if victim_addr is None:
             return False
 
-        victim = self.inbound_peers.pop(victim_addr, None)
+        # Pop through the accounting helper: the slot must be free before
+        # the caller accepts the new inbound, and disconnect()'s callback
+        # will no longer find the entry to release its netgroup.
+        victim = self._remove_peer_from_bucket(victim_addr)
         if victim is not None:
             logger.info(f"Evicting inbound peer {victim_addr} to make room")
             await victim.disconnect()
@@ -2640,6 +2676,62 @@ class PeerManager:
 
         return elapsed >= backoff_time
 
+    def _remove_peer_from_bucket(self, addr: str) -> "Peer | None":
+        """Pop ``addr`` from its bucket and release its netgroup accounting.
+
+        The single place a live peer leaves ``peers`` / ``block_relay_peers``
+        / ``inbound_peers`` ahead of (or at) its disconnect.  Every pop must
+        come through here: ``_handle_peer_disconnected`` only does the
+        accounting for an entry it still finds, so a caller that popped the
+        bucket itself before ``disconnect()`` (eviction, ban) used to leak one
+        ``_inbound_netgroups`` count per peer and leave a stale entry in
+        ``_outbound_netgroups``.  A leaked inbound count makes the group look
+        already-present forever (``is_new_group`` in the accept path).
+
+        Core keeps no such counter: node/eviction.cpp ``SelectNodeToEvict``
+        recomputes netgroups from the live peer set on every call.  The
+        counter here must therefore track the live ``inbound_peers`` set
+        exactly, which is what doing the decrement at the pop guarantees.
+
+        Returns the popped peer, or None if ``addr`` was in no bucket (so a
+        second call for the same addr, e.g. the disconnect callback after an
+        eviction, is a no-op).
+        """
+        popped_peer = None
+        if addr in self.peers:
+            popped_peer = self.peers.pop(addr)
+            try:
+                self._update_outbound_netgroups()
+            except Exception:
+                logger.debug(
+                    "_update_outbound_netgroups raised on full-relay disconnect of %s",
+                    addr, exc_info=True,
+                )
+        elif addr in self.block_relay_peers:
+            popped_peer = self.block_relay_peers.pop(addr)
+            try:
+                self._update_outbound_netgroups()
+            except Exception:
+                logger.debug(
+                    "_update_outbound_netgroups raised on block-relay disconnect of %s",
+                    addr, exc_info=True,
+                )
+        elif addr in self.inbound_peers:
+            popped_peer = self.inbound_peers.pop(addr)
+            try:
+                host = addr.rsplit(":", 1)[0]
+                group = self._netgroup(host)
+                if group in self._inbound_netgroups:
+                    self._inbound_netgroups[group] -= 1
+                    if self._inbound_netgroups[group] <= 0:
+                        del self._inbound_netgroups[group]
+            except Exception:
+                logger.debug(
+                    "inbound netgroup decrement raised on disconnect of %s",
+                    addr, exc_info=True,
+                )
+        return popped_peer
+
     def _handle_peer_disconnected(self, addr: str) -> None:
         """Event-driven cleanup hook wired into :meth:`Peer.disconnect`.
 
@@ -2683,41 +2775,7 @@ class PeerManager:
         # match in practice — Peer instances are never multi-bucket —
         # but checking all three is cheap and resilient to future
         # bucketing changes.
-        popped_peer = None
-        if addr in self.peers:
-            popped_peer = self.peers.pop(addr)
-            try:
-                self._update_outbound_netgroups()
-            except Exception:
-                logger.debug(
-                    "_update_outbound_netgroups raised on full-relay disconnect of %s",
-                    addr, exc_info=True,
-                )
-        elif addr in self.block_relay_peers:
-            popped_peer = self.block_relay_peers.pop(addr)
-            try:
-                self._update_outbound_netgroups()
-            except Exception:
-                logger.debug(
-                    "_update_outbound_netgroups raised on block-relay disconnect of %s",
-                    addr, exc_info=True,
-                )
-        elif addr in self.inbound_peers:
-            popped_peer = self.inbound_peers.pop(addr)
-            # Mirror the inbound netgroup decrement that
-            # maintain_connections used to do.
-            try:
-                host = addr.rsplit(":", 1)[0]
-                group = self._netgroup(host)
-                if group in self._inbound_netgroups:
-                    self._inbound_netgroups[group] -= 1
-                    if self._inbound_netgroups[group] <= 0:
-                        del self._inbound_netgroups[group]
-            except Exception:
-                logger.debug(
-                    "inbound netgroup decrement raised on disconnect of %s",
-                    addr, exc_info=True,
-                )
+        popped_peer = self._remove_peer_from_bucket(addr)
 
         # Always drop the per-addr caches.  Safe to call even when the
         # peer was not in any bucket (the maps tolerate unknown keys).
@@ -4040,8 +4098,10 @@ class PeerManager:
             f"{peer.host}:{peer.port} (> {MAX_ADDR_TO_SEND}) "
             "— misbehaving"
         )
+        # The connection key, not the bare host: the noban/manual/local
+        # exemptions are decided per connection (_punish).
         self.misbehaving(
-            peer.host, 100,
+            f"{peer.host}:{peer.port}", 100,
             f"{err.command} message size = {err.count}",
         )
 
@@ -4847,7 +4907,15 @@ class PeerManager:
             (self.inbound_peers, True),    # inbound
         ]
         for bucket, _is_inbound in all_buckets:
-            matching = [a for a in list(bucket) if a.startswith(ip)]
+            # Exact address match.  Bans are keyed by address (banman.ban_key),
+            # so every connection from that IP goes, on any port -- and only
+            # that IP: the previous ``a.startswith(ip)`` also hit
+            # 198.51.100.70:* when 198.51.100.7 was banned.
+            matching = [
+                a for a, p in list(bucket.items())
+                if a == ip or ban_key(a) == ip
+                or getattr(p, "host", None) == ip
+            ]
             for addr in matching:
                 peer = bucket.get(addr)
                 if peer is None:
@@ -4869,11 +4937,13 @@ class PeerManager:
                     logger.debug(
                         "_on_peer_banned: local peer %s — disconnect-only", addr
                     )
-                    bucket.pop(addr, None)
+                    self._remove_peer_from_bucket(addr)
                     asyncio.ensure_future(peer.disconnect())
                     continue
                 # Default: disconnect the peer (ban is already in ban_manager).
-                bucket.pop(addr, None)
+                # Pop via the helper so the netgroup counters are released;
+                # the disconnect callback will find no entry to do it.
+                self._remove_peer_from_bucket(addr)
                 asyncio.ensure_future(peer.disconnect())
         self.known_addrs.discard(ip)
 
@@ -4894,7 +4964,93 @@ class PeerManager:
 
         Returns True if the peer was banned.
         """
+        return self._punish(addr, score, reason)
+
+    def _connected_peers_for(self, peer_id: str) -> list:
+        """Connected peers *peer_id* names, as ``(bucket, key, peer)``.
+
+        A connection key (``host:port``, also an unbracketed IPv6 one) names
+        one connection.  A bare address names every connection from it.
+        """
+        buckets = (self.peers, self.block_relay_peers, self.inbound_peers)
+        for bucket in buckets:
+            peer = bucket.get(peer_id)
+            if peer is not None:
+                return [(bucket, peer_id, peer)]
+        found = []
+        for bucket in buckets:
+            for key, peer in list(bucket.items()):
+                host = getattr(peer, "host", None)
+                if host and f"{host}:{getattr(peer, 'port', '')}" == peer_id:
+                    return [(bucket, key, peer)]
+                if host and host == peer_id:
+                    found.append((bucket, key, peer))
+        return found
+
+    def _punish(self, peer_id: str, score: int, reason: str) -> bool:
+        """Score a misbehaving peer with Core's exemptions applied first.
+
+        net_processing.cpp MaybeDiscourageAndDisconnect, in order:
+          1. NoBan permission -> "not punishing noban peer", return.
+          2. Manual connection -> "not punishing manually connected peer".
+          3. ``addr.IsLocal()`` -> disconnect THIS node only, no Discourage
+             ("since that would discourage all peers on the same local
+             address").
+          4. Otherwise Discourage(addr) + DisconnectNode(addr) -- here
+             ``BanManager.ban`` and its ``_on_peer_banned`` callback.
+
+        Bans are keyed by address, so cases 1-3 must never reach ``ban()``:
+        a stored ban for the address would make the inbound gate (which
+        checks ``is_banned(host)`` before any noban flag is known) refuse the
+        next connection from it.  For a bare address naming several
+        connections, the exemption holds only if every one is exempt.
+        """
+        conns = self._connected_peers_for(peer_id)
+        if conns and all(
+            getattr(p, "noban", False) or getattr(p, "is_manual", False)
+            for _b, _k, p in conns
+        ):
+            logger.warning(
+                "Not punishing %s peer %s: %s (+%d)",
+                "noban" if all(getattr(p, "noban", False) for _b, _k, p in conns)
+                else "manually connected", peer_id, reason, score,
+            )
+            return False
+        addr = self._ban_address(peer_id)
+        if is_local_addr(addr):
+            if not self.ban_manager.record_misbehavior(
+                    peer_id, score, reason, discourage=False):
+                return False
+            for _bucket, _key, peer in conns:
+                if getattr(peer, "noban", False) or getattr(peer, "is_manual", False):
+                    continue
+                # disconnect() fires _handle_peer_disconnected, which removes
+                # the bucket entry and its accounting.
+                asyncio.ensure_future(peer.disconnect())
+            return True
         return self.ban_manager.record_misbehavior(addr, score, reason)
+
+    def _ban_address(self, peer_id: str) -> str:
+        """Map a peer identifier to the address a ban/score is keyed by.
+
+        Callers pass connection keys -- usually ``f"{peer.host}:{peer.port}"``.
+        Core discourages ``pnode.addr`` (net_processing.cpp
+        MaybeDiscourageAndDisconnect), never an address+port.  For a key that
+        belongs to a connected peer the peer's own host is authoritative;
+        that is the only reliable way to strip the port from an unbracketed
+        IPv6 key like ``2001:db8::1:8333``.  Anything else goes through
+        ``banman.ban_key``.
+        """
+        for bucket in (self.peers, self.block_relay_peers, self.inbound_peers):
+            peer = bucket.get(peer_id)
+            if peer is not None and getattr(peer, "host", None):
+                return peer.host
+        for bucket in (self.peers, self.block_relay_peers, self.inbound_peers):
+            for peer in list(bucket.values()):
+                host = getattr(peer, "host", None)
+                if host and f"{host}:{getattr(peer, 'port', '')}" == peer_id:
+                    return host
+        return ban_key(peer_id)
 
     def misbehaving(self, peer_id: str, score: int, reason: str) -> bool:
         """Record misbehavior for a peer (Bitcoin Core API compatibility).
@@ -4914,10 +5070,14 @@ class PeerManager:
             score: Misbehavior score to add
             reason: Human-readable reason
 
+        NoBan and manual peers are not punished (returns False); a local
+        address is disconnected but never banned.  See ``_punish``.
+
         Returns:
-            True if the peer was banned as a result
+            True if the peer was punished as a result (its address banned,
+            or a local peer disconnected)
         """
-        return self.ban_manager.misbehaving(peer_id, score, reason)
+        return self._punish(peer_id, score, reason)
 
     def unban_peer(self, addr: str):
         """
