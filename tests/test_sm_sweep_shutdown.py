@@ -76,7 +76,6 @@ async def test_sm_sweep_peer_manager_stop_with_live_inbound_peer_saves_peers(tmp
     assert os.path.exists(tmp_path / "peers.json"), "addrman.save() did not run"
 
 
-@_XFAIL_B
 def test_sm_sweep_signal_scheduled_stop_dumps_mempool(tmp_path):
     from ouroboros.node import BitcoinNode
 
