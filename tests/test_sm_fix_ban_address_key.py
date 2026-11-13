@@ -128,3 +128,99 @@ def test_control_subnet_and_bare_host_keys_unchanged():
 def test_control_below_threshold_does_not_ban(pm):
     assert not pm.misbehaving("198.51.100.16:40000", 10, "invalid tx")
     assert not pm.ban_manager.is_banned("198.51.100.16")
+
+
+# --- Warden review of #186: Core's MaybeDiscourageAndDisconnect exemptions ---
+#
+# net_processing.cpp MaybeDiscourageAndDisconnect returns before
+# ``m_banman->Discourage`` for a NoBan peer and for a manual connection, and
+# for an ``addr.IsLocal()`` peer it sets ``fDisconnect`` on that one node and
+# does NOT discourage ("since that would discourage all peers on the same
+# local address").  With bans keyed by address, storing a ban for any of
+# these would refuse the next connection from that address at the inbound
+# gate, which checks ``is_banned(host)`` before any noban flag is known.
+
+
+def _outbound_peer(pm: PeerManager, host: str, port: int) -> Peer:
+    peer = Peer(
+        host, port, "regtest",
+        on_disconnect=pm._handle_peer_disconnected,
+    )
+    peer.state = PeerState.READY
+    pm.peers[f"{host}:{port}"] = peer
+    return peer
+
+
+@pytest.mark.asyncio
+async def test_local_peer_is_disconnected_but_not_discouraged(pm):
+    bad = _inbound_peer(pm, "127.0.0.1", 18444)
+    good = _inbound_peer(pm, "127.0.0.1", 18445)
+    assert pm.misbehaving("127.0.0.1:18444", 100, "invalid block")
+    await _settle()
+    assert pm.ban_manager.list_banned() == {}
+    assert not pm.ban_manager.is_banned("127.0.0.1")
+    assert not pm.ban_manager.is_banned("127.0.0.1:18446")
+    # only the peer that misbehaved goes
+    assert bad.state != PeerState.READY
+    assert "127.0.0.1:18444" not in pm.inbound_peers
+    assert good.state == PeerState.READY
+    assert "127.0.0.1:18445" in pm.inbound_peers
+
+
+def test_local_address_without_a_connected_peer_is_not_discouraged(pm):
+    pm.misbehaving("127.0.0.1:18444", 100, "invalid block")
+    pm.misbehaving("[::1]:18444", 100, "invalid block")
+    assert not pm.ban_manager.is_banned("127.0.0.1")
+    assert not pm.ban_manager.is_banned("::1")
+
+
+@pytest.mark.asyncio
+async def test_noban_peer_is_neither_banned_nor_disconnected(pm):
+    peer = _inbound_peer(pm, "198.51.100.9", 8333)
+    peer.noban = True
+    assert not pm.misbehaving("198.51.100.9:8333", 100, "invalid block")
+    await _settle()
+    assert not pm.ban_manager.is_banned("198.51.100.9")
+    assert pm.ban_manager.list_banned() == {}
+    assert peer.state == PeerState.READY
+    assert "198.51.100.9:8333" in pm.inbound_peers
+
+
+@pytest.mark.asyncio
+async def test_manual_peer_is_neither_banned_nor_disconnected(pm):
+    peer = _outbound_peer(pm, "198.51.100.8", 8333)
+    peer.is_manual = True
+    assert not pm.misbehaving("198.51.100.8:8333", 100, "invalid block")
+    await _settle()
+    assert not pm.ban_manager.is_banned("198.51.100.8")
+    assert pm.ban_manager.list_banned() == {}
+    assert peer.state == PeerState.READY
+    assert "198.51.100.8:8333" in pm.peers
+
+
+@pytest.mark.asyncio
+async def test_oversize_addr_from_noban_peer_is_not_banned(pm):
+    """``_misbehave_oversize_addr`` used to pass the bare host; it must
+    still find the connected noban peer and leave its address unbanned."""
+    from ouroboros.p2p import AddrCountExceeded
+
+    peer = _inbound_peer(pm, "198.51.100.10", 8333)
+    peer.noban = True
+    pm._misbehave_oversize_addr(peer, AddrCountExceeded("addr", 1001))
+    await _settle()
+    assert not pm.ban_manager.is_banned("198.51.100.10")
+    assert peer.state == PeerState.READY
+
+
+@pytest.mark.asyncio
+async def test_control_ordinary_peer_next_to_noban_peer_is_still_banned(pm):
+    """Control: the exemption is per peer, not per address."""
+    plain = _inbound_peer(pm, "203.0.113.5", 40000)
+    exempt = _inbound_peer(pm, "203.0.113.5", 40001)
+    exempt.noban = True
+    assert pm.misbehaving("203.0.113.5:40000", 100, "invalid block")
+    await _settle()
+    assert pm.ban_manager.is_banned("203.0.113.5")
+    assert plain.state != PeerState.READY
+    # _on_peer_banned keeps its existing noban skip for the other connection
+    assert exempt.state == PeerState.READY
