@@ -125,6 +125,10 @@ def _conflict_and_descendant(pool, db, n: int):
     return coin, o, d
 
 
+def _vsize(tx) -> int:
+    return (tx.get_weight() + 3) // 4
+
+
 def _submit(pool, db, *txs):
     return asyncio.run(RPCServer.rpc_submitpackage(
         _rpc(pool, db), [_hex(t) for t in txs]))
@@ -233,6 +237,24 @@ def test_package_rbf_child_must_raise_the_package_feerate():
         "feerate, package feerate "), res.message
     assert " BTC/kvB <= parent feerate is " in res.message
     _untouched(pool, o, d, parent, child)
+
+
+def test_package_rbf_feerate_check_is_exact_not_rounded():
+    """v31 CFeeRate compares the exact fee/vsize fraction (FeeRateCompare,
+    policy/feerate.h).  Here the package feerate is strictly above the
+    parent's, but both round down to the same sat/kvB: Core accepts."""
+    pool, db = _pool()
+    coin, o, d = _conflict_and_descendant(pool, db, 52)
+    parent = _tx([(coin, 0)], [89_886])                   # fee 10_114
+    child = _tx([(parent.get_txid(), 0)], [74_194, 1_000])  # fee 14_692
+    pv = pool._feerate_per_kvb(10_114, _vsize(parent))
+    tv = pool._feerate_per_kvb(10_114 + 14_692, _vsize(parent) + _vsize(child))
+    assert pv == tv                                       # equal once rounded
+    assert (10_114 + 14_692) * _vsize(parent) > 10_114 * (_vsize(parent) + _vsize(child))
+    res = pool.accept_package([parent, child], 100)
+    assert res.state == "valid", (res.state, res.message)
+    assert o.get_txid() not in pool.transactions
+    assert child.get_txid() in pool.transactions
 
 
 def test_package_rbf_must_improve_the_feerate_diagram():

@@ -6,6 +6,7 @@ sorting, double spend detection, size management, ancestor/descendant
 limits, and standardness checks.
 """
 
+import functools
 import logging
 import math
 import os
@@ -2248,9 +2249,13 @@ def improves_feerate_diagram(old_chunks: list[tuple[int, int]],
     *old_chunks* and somewhere above it.  Chunks are ``(fee, vsize)``; each
     list is taken in decreasing feerate order, and a diagram that ends
     first continues flat."""
+    def by_feerate_desc(a, b):
+        # Exact fee/vsize comparison (no float rounding), highest first.
+        return (b[0] * a[1] > a[0] * b[1]) - (b[0] * a[1] < a[0] * b[1])
+
     def diagram(chunks):
         pts = [(0, 0)]
-        for fee, size in sorted(chunks, key=lambda c: (-c[0] / c[1]) if c[1] else 0):
+        for fee, size in sorted(chunks, key=functools.cmp_to_key(by_feerate_desc)):
             pts.append((pts[-1][0] + size, pts[-1][1] + fee))
         return pts
 
@@ -6803,10 +6808,12 @@ class Mempool:
         if err is not None:
             return fail("package RBF failed: insufficient anti-DoS fees", err)
 
-        # CFeeRate comparison: both sides in sat/kvB, rounded down.
+        # CFeeRate in v31 holds the exact fee/vsize fraction and compares it
+        # with FeeRateCompare (policy/feerate.h), so compare cross-products;
+        # the rounded-down sat/kvB values are only for the ToString() text.
         parent_rate = self._feerate_per_kvb(mod_fees[0], vsizes[0])
         package_rate = self._feerate_per_kvb(total_fee, total_vsize)
-        if package_rate <= parent_rate:
+        if total_fee * vsizes[0] <= mod_fees[0] * total_vsize:
             return fail("package RBF failed: package feerate is less than or "
                         "equal to parent feerate",
                         f"package feerate {_core_feerate_str(package_rate)} <= "
