@@ -8714,28 +8714,31 @@ class RPCServer:
         found by walking the header chain down to the first stored ancestor
         (nHeight = pprev->nHeight + 1, nChainWork = pprev->nChainWork +
         GetBlockProof, chain.cpp); and the walked headers (hash -> bytes)
-        for the median-time walk.  ``chainwork`` is None when the stored
-        ancestor's work is unknown.  None when *block_hash* is not such an
-        entry or the walk does not reach a stored block of known height.
+        for the median-time walk.  None when *block_hash* is not such an
+        entry, or the walk does not reach a stored block of known height and
+        work (then the caller answers -5 rather than a guessed value).
         Read-only: nothing here feeds validation or chain selection.
         """
         bs = getattr(self.node, "block_sync", None)
         db = getattr(self.node, "db", None)
         if bs is None or db is None:
             return None
-        store: dict[bytes, bytes] = {}
+        block_hash = bytes(block_hash)
+        # Membership first, without serializing anything: this runs on every
+        # getblockheader miss, and the queue can be long during header sync.
         try:
-            for h, hdr in list(getattr(bs, "_validated_headers", ()) or ()):
-                if hdr is not None:
-                    store[bytes(h)] = hdr.serialize()
-            for h, hdr in list((getattr(bs, "_fork_headers", {}) or {}).items()):
-                if hdr is not None:
-                    store.setdefault(bytes(h), hdr.serialize())
+            queue = {bytes(h): hdr for h, hdr in list(getattr(bs, "_validated_headers", ()) or ())}
+            fork = getattr(bs, "_fork_headers", {}) or {}
         except Exception:
             return None
-        block_hash = bytes(block_hash)
-        if block_hash not in store:
+        if block_hash not in queue and block_hash not in fork:
             return None
+
+        def _raw(h: bytes) -> bytes | None:
+            hdr = queue.get(h)
+            if hdr is None:
+                hdr = fork.get(h)
+            return hdr.serialize() if hdr is not None else None
 
         def _stored(h: bytes) -> bool:
             try:
@@ -8743,15 +8746,20 @@ class RPCServer:
             except Exception:
                 return False
 
-        path: list[bytes] = []
+        store: dict[bytes, bytes] = {}
+        limit = len(queue) + len(fork)
         cur = block_hash
-        while cur in store and not _stored(cur):
-            if len(path) > len(store):  # a prev-link cycle: not an index chain
-                return None
-            path.append(cur)
-            cur = bytes(store[cur][4:36])
-        if not path or path[0] != block_hash:
-            return None  # the block itself is stored: not headers-only
+        while not _stored(cur):
+            raw = _raw(cur)
+            if raw is None or len(store) > limit:  # unknown parent / a cycle
+                break
+            store[cur] = raw
+            cur = bytes(raw[4:36])
+        path = list(store)
+        if not path or path[0] != block_hash or not _stored(cur):
+            # The block itself is stored (not headers-only), or the chain
+            # does not reach a stored block.
+            return None
         anchor = cur
         anchor_height = self._get_block_height(db, anchor)
         if anchor_height is None:
@@ -8774,24 +8782,25 @@ class RPCServer:
         if work_hex is not None and int(work_hex, 16) > 0:
             anchor_work = int(work_hex, 16)
 
-        chainwork = None
-        if anchor_work is not None:
-            total = anchor_work
-            for h in path:
-                bits = int.from_bytes(store[h][72:76], "little")
-                mantissa = bits & 0x007FFFFF
-                exponent = (bits >> 24) & 0xFF
-                target = (mantissa >> (8 * (3 - exponent)) if exponent <= 3
-                          else mantissa << (8 * (exponent - 3)))
-                # Core GetBlockProof: 0 for a negative or zero target.
-                if not (bits & 0x00800000) and target > 0:
-                    total += (1 << 256) // (target + 1)
-            chainwork = f"{total:064x}"
+        if anchor_work is None:
+            # Without the stored ancestor's work this entry's nChainWork is
+            # unknown; no answer beats the active chain's work at the height.
+            return None
+        total = anchor_work
+        for h in path:
+            bits = int.from_bytes(store[h][72:76], "little")
+            mantissa = bits & 0x007FFFFF
+            exponent = (bits >> 24) & 0xFF
+            target = (mantissa >> (8 * (3 - exponent)) if exponent <= 3
+                      else mantissa << (8 * (exponent - 3)))
+            # Core GetBlockProof: 0 for a negative or zero target.
+            if not (bits & 0x00800000) and target > 0:
+                total += (1 << 256) // (target + 1)
         return {
             "header": store[block_hash],
             "height": anchor_height + len(path),
-            "chainwork": chainwork,
-            "headers": {h: store[h] for h in path},
+            "chainwork": f"{total:064x}",
+            "headers": store,
         }
 
     def _own_index_chainwork(self, block_hash: bytes) -> str | None:
