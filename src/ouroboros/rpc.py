@@ -1681,6 +1681,16 @@ def _format_testmempoolaccept_package(txs: list, pkg: Any, maxfeerate: Any) -> l
     return out
 
 
+def _push_warnings(obj: dict[str, Any], warnings: Any) -> dict[str, Any]:
+    """Core ``PushWarnings`` (rpc/util.cpp), as createwallet, loadwallet,
+    restorewallet and unloadwallet use it: a ``warnings`` array only when
+    there is at least one warning, and no ``warning`` string (Core v31 no
+    longer has that field)."""
+    if warnings:
+        obj["warnings"] = [str(w) for w in warnings]
+    return obj
+
+
 def _format_submitpackage(txs: list, pkg: Any) -> dict[str, Any]:
     """Core rpc/mempool.cpp submitpackage result.
 
@@ -16671,10 +16681,7 @@ class RPCServer:
             bip39_passphrase=bip39_passphrase or "",
         )
         self._sync_legacy_wallet_ref()
-        return {
-            "name": wallet_name,
-            "warning": "\n".join(warnings) if warnings else "",
-        }
+        return _push_warnings({"name": wallet_name}, warnings)
 
     async def rpc_dumpmnemonic(self) -> dict[str, Any]:
         """
@@ -16747,10 +16754,7 @@ class RPCServer:
             load_on_startup=load_on_startup,
         )
         self._sync_legacy_wallet_ref()
-        return {
-            "name": wallet_name,
-            "warning": "\n".join(warnings) if warnings else "",
-        }
+        return _push_warnings({"name": wallet_name}, warnings)
 
     async def rpc_loadwallet(
         self,
@@ -16778,10 +16782,7 @@ class RPCServer:
             load_on_startup=load_on_startup,
         )
         self._sync_legacy_wallet_ref()
-        return {
-            "name": filename,
-            "warning": "\n".join(warnings) if warnings else "",
-        }
+        return _push_warnings({"name": filename}, warnings)
 
     async def rpc_unloadwallet(
         self,
@@ -16829,9 +16830,7 @@ class RPCServer:
             load_on_startup=load_on_startup,
         )
         self._sync_legacy_wallet_ref()
-        return {
-            "warning": "\n".join(warnings) if warnings else "",
-        }
+        return _push_warnings({}, warnings)
 
     async def rpc_getnetworkhashps(
         self, nblocks: int = 120, height: int = -1
