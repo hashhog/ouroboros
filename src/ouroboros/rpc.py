@@ -5361,6 +5361,21 @@ class RPCServer:
                 except Exception as _e:
                     raw_header_bytes = None
 
+            # Headers-only block-index entries: a header accepted over P2P or
+            # by submitheader whose block never arrived lives only in
+            # BlockSync's header stores.  Core's LookupBlockIndex finds it
+            # (AcceptBlockHeader -> AddToBlockIndex), so getblockheader
+            # answers it (rpc/blockchain.cpp getblockheader /
+            # blockheaderToJSON) instead of -5.
+            headers_only = None
+            if not block and raw_header_bytes is None:
+                headers_only = await asyncio.to_thread(
+                    self._headers_only_index_entry, block_hash
+                )
+                if headers_only is not None:
+                    raw_header_bytes = headers_only["header"]
+                    raw_n_tx = 0  # Core: nTx is 0 until the block's data arrives
+
             if not block and raw_header_bytes is None:
                 # Core: getblockheader throws JSONRPCError(RPC_INVALID_ADDRESS_OR_KEY,
                 # "Block not found") when LookupBlockIndex returns null
@@ -5413,7 +5428,10 @@ class RPCServer:
             # post-reorg-consistency corpus entry, 2026-05-05). Reference:
             # bitcoin-core/src/rpc/blockchain.cpp getblockheader reads
             # ``pblockindex->nHeight``.
-            block_height = await asyncio.to_thread(self._get_block_height, self.node.db, block_hash)
+            if headers_only is not None:
+                block_height = headers_only["height"]
+            else:
+                block_height = await asyncio.to_thread(self._get_block_height, self.node.db, block_hash)
 
             # Hash-keyed block index (BLOCK_INDEX_BY_HASH_CF): one point read
             # that answers for every block the node holds an index entry for,
@@ -5462,7 +5480,9 @@ class RPCServer:
             # -1 if block is not on the main chain
             confirmations = -1
             best_hash, best_height = self.node.db.get_best_block()
-            if block_height is not None:
+            # A headers-only entry has no data, so it is never on the active
+            # chain (CChain only holds connected blocks): confirmations -1.
+            if block_height is not None and headers_only is None:
                 # Check if this block is on the active chain.
                 # Primary path: BLOCK_INDEX_CF has the hash at this height.
                 # Fallback for gap blocks (not in BLOCK_INDEX_CF after a snapshot
@@ -5500,7 +5520,12 @@ class RPCServer:
             chainwork_str: str = "0" * 64
             if block_height is not None:
                 own_work = None
-                if confirmations == -1:
+                if headers_only is not None:
+                    # pindex->nChainWork = pprev->nChainWork + GetBlockProof
+                    # (chain.cpp / AddToBlockIndex), summed down the header
+                    # chain to the first stored ancestor.
+                    own_work = headers_only["chainwork"]
+                elif confirmations == -1:
                     # Off the active chain: the work at this HEIGHT belongs to
                     # the active block there, not to this one.  Core reports
                     # pindex->nChainWork (rpc/blockchain.cpp
@@ -5532,7 +5557,10 @@ class RPCServer:
                 # this height is another block's MTP.  Core reports
                 # pindex->GetMedianTimePast(), over this block's own pprev
                 # chain (chain.h).
-                own_mtp = await asyncio.to_thread(self._own_median_time_past, block_hash)
+                own_mtp = await asyncio.to_thread(
+                    self._own_median_time_past, block_hash,
+                    headers_only["headers"] if headers_only is not None else None,
+                )
             if own_mtp is not None:
                 mediantime_val: int = own_mtp
             elif block_height is not None:
@@ -8629,19 +8657,29 @@ class RPCServer:
             "default_witness_commitment": default_witness_commitment,
         }
 
-    def _own_median_time_past(self, block_hash: bytes) -> int | None:
+    def _own_median_time_past(
+        self, block_hash: bytes, headers: dict[bytes, bytes] | None = None
+    ) -> int | None:
         """Core ``CBlockIndex::GetMedianTimePast()`` for any stored block:
         the median of the timestamps of this block and up to 10 ancestors,
         walked through each block's own parent hash (so it is right for a
-        block off the active chain).  None when a header in the window
-        cannot be read, so the caller keeps its height-based answer."""
+        block off the active chain).  *headers* (hash -> 80-byte header)
+        supplies headers-only entries the stores below do not hold.  None
+        when a header in the window cannot be read, so the caller keeps its
+        height-based answer."""
         db = getattr(self.node, "db", None)
         if db is None:
             return None
         times: list[int] = []
         cur = bytes(block_hash)
         for _ in range(11):  # nMedianTimeSpan
-            header = None
+            header = headers.get(cur) if headers else None
+            if header is not None:
+                times.append(int.from_bytes(header[68:72], "little"))
+                cur = header[4:36]
+                if cur == bytes(32):
+                    break
+                continue
             try:
                 raw = db.get_block_bytes(cur)
                 if raw and len(raw) >= 80:
@@ -8663,6 +8701,98 @@ class RPCServer:
                 break
         times.sort()
         return times[len(times) // 2]
+
+    def _headers_only_index_entry(self, block_hash: bytes) -> dict[str, Any] | None:
+        """Core's block-index entry for a header held without its block.
+
+        ouroboros keeps headers-only entries (accepted over P2P or by
+        ``submitheader``; Core AcceptBlockHeader -> AddToBlockIndex) in
+        BlockSync's tip-anchored queue ``_validated_headers`` and its fork
+        store ``_fork_headers``.  Returns ``{"header", "height",
+        "chainwork", "headers"}`` for *block_hash* when it is one of them and
+        has no stored block: the 80-byte header; the height and chainwork
+        found by walking the header chain down to the first stored ancestor
+        (nHeight = pprev->nHeight + 1, nChainWork = pprev->nChainWork +
+        GetBlockProof, chain.cpp); and the walked headers (hash -> bytes)
+        for the median-time walk.  ``chainwork`` is None when the stored
+        ancestor's work is unknown.  None when *block_hash* is not such an
+        entry or the walk does not reach a stored block of known height.
+        Read-only: nothing here feeds validation or chain selection.
+        """
+        bs = getattr(self.node, "block_sync", None)
+        db = getattr(self.node, "db", None)
+        if bs is None or db is None:
+            return None
+        store: dict[bytes, bytes] = {}
+        try:
+            for h, hdr in list(getattr(bs, "_validated_headers", ()) or ()):
+                if hdr is not None:
+                    store[bytes(h)] = hdr.serialize()
+            for h, hdr in list((getattr(bs, "_fork_headers", {}) or {}).items()):
+                if hdr is not None:
+                    store.setdefault(bytes(h), hdr.serialize())
+        except Exception:
+            return None
+        block_hash = bytes(block_hash)
+        if block_hash not in store:
+            return None
+
+        def _stored(h: bytes) -> bool:
+            try:
+                return bool(db.has_block_hash(h))
+            except Exception:
+                return False
+
+        path: list[bytes] = []
+        cur = block_hash
+        while cur in store and not _stored(cur):
+            if len(path) > len(store):  # a prev-link cycle: not an index chain
+                return None
+            path.append(cur)
+            cur = bytes(store[cur][4:36])
+        if not path or path[0] != block_hash:
+            return None  # the block itself is stored: not headers-only
+        anchor = cur
+        anchor_height = self._get_block_height(db, anchor)
+        if anchor_height is None:
+            try:
+                anchor_height = db.get_block_height_by_hash(anchor)
+            except Exception:
+                anchor_height = None
+        if anchor_height is None:
+            return None
+        anchor_height = int(anchor_height)
+
+        anchor_work: int | None = None
+        try:
+            on_active = (anchor_height <= int(db.get_best_block()[1])
+                         and db.get_block_hash_by_height(anchor_height) == anchor)
+        except Exception:
+            on_active = False
+        work_hex = (self.node.get_chainwork_at_height(anchor_height)
+                    if on_active else self._own_index_chainwork(anchor))
+        if work_hex is not None and int(work_hex, 16) > 0:
+            anchor_work = int(work_hex, 16)
+
+        chainwork = None
+        if anchor_work is not None:
+            total = anchor_work
+            for h in path:
+                bits = int.from_bytes(store[h][72:76], "little")
+                mantissa = bits & 0x007FFFFF
+                exponent = (bits >> 24) & 0xFF
+                target = (mantissa >> (8 * (3 - exponent)) if exponent <= 3
+                          else mantissa << (8 * (exponent - 3)))
+                # Core GetBlockProof: 0 for a negative or zero target.
+                if not (bits & 0x00800000) and target > 0:
+                    total += (1 << 256) // (target + 1)
+            chainwork = f"{total:064x}"
+        return {
+            "header": store[block_hash],
+            "height": anchor_height + len(path),
+            "chainwork": chainwork,
+            "headers": {h: store[h] for h in path},
+        }
 
     def _own_index_chainwork(self, block_hash: bytes) -> str | None:
         """This block's own chainwork from the hash-keyed block index, as 64
