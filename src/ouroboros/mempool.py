@@ -2200,10 +2200,78 @@ class PackageAcceptResult:
     # results AcceptMultipleTransactions returned, as opposed to the
     # individual results AcceptPackage merges in for the other txs).
     failed_wtxids: list = field(default_factory=list)
-    # False when the package was refused before any per-tx verdict that a
-    # caller may report (package RBF, which this node does not implement):
-    # submitpackage then returns no tx-results entries.
-    per_tx_results: bool = True
+
+
+def format_money(sats: int) -> str:
+    """Core ``FormatMoney`` (util/moneystr.cpp): ``%d.%08d`` with trailing
+    zeros trimmed down to two decimals, e.g. 6_000 -> "0.00006",
+    100_000_000 -> "1.00"."""
+    sign = "-" if sats < 0 else ""
+    q, r = divmod(abs(int(sats)), 100_000_000)
+    frac = f"{r:08d}".rstrip("0")
+    return f"{sign}{q}.{frac.ljust(2, '0')}"
+
+
+def _core_feerate_str(rate_kvb: int) -> str:
+    """Core ``CFeeRate::ToString()`` in its default BTC_KVB format
+    (policy/feerate.cpp): ``%d.%08d BTC/kvB`` of the sat/kvB rate."""
+    q, r = divmod(int(rate_kvb), 100_000_000)
+    return f"{q}.{r:08d} BTC/kvB"
+
+
+def pays_for_rbf(original_fees: int, replacement_fees: int,
+                 replacement_vsize: int, relay_fee_kvb: int,
+                 txid: bytes) -> str | None:
+    """Core ``PaysForRBF`` (policy/rbf.cpp): ``None`` when the replacement
+    pays for the conflicts (rule 3) and for its own relay at
+    *relay_fee_kvb* (rule 4), else Core's debug string.  *txid* is internal
+    byte order; Core prints it in display order.  Fees are modified fees,
+    *replacement_vsize* the sigop-adjusted vsize."""
+    if replacement_fees < original_fees:
+        return (f"rejecting replacement {txid[::-1].hex()}, less fees than "
+                f"conflicting txs; {format_money(replacement_fees)} < "
+                f"{format_money(original_fees)}")
+    additional = replacement_fees - original_fees
+    needed = -((-replacement_vsize * relay_fee_kvb) // 1000)  # CFeeRate::GetFee, rounds up
+    if additional < needed:
+        return (f"rejecting replacement {txid[::-1].hex()}, not enough "
+                f"additional fees to relay; {format_money(additional)} < "
+                f"{format_money(needed)}")
+    return None
+
+
+def improves_feerate_diagram(old_chunks: list[tuple[int, int]],
+                             new_chunks: list[tuple[int, int]]) -> bool:
+    """Core ``CompareChunks(new, old)`` is ``std::is_gt`` (util/feefrac.cpp,
+    used by ImprovesFeerateDiagram in policy/rbf.cpp): the cumulative
+    (vsize, fee) diagram of *new_chunks* is nowhere below that of
+    *old_chunks* and somewhere above it.  Chunks are ``(fee, vsize)``; each
+    list is taken in decreasing feerate order, and a diagram that ends
+    first continues flat."""
+    def diagram(chunks):
+        pts = [(0, 0)]
+        for fee, size in sorted(chunks, key=lambda c: (-c[0] / c[1]) if c[1] else 0):
+            pts.append((pts[-1][0] + size, pts[-1][1] + fee))
+        return pts
+
+    def at(pts, x):
+        # Fee of the diagram at size x, as an exact fraction (num, den).
+        for (x0, y0), (x1, y1) in zip(pts, pts[1:]):
+            if x <= x1:
+                if x1 == x0:
+                    return (y1, 1)
+                return (y0 * (x1 - x0) + (y1 - y0) * (x - x0), x1 - x0)
+        return (pts[-1][1], 1)
+
+    old_pts, new_pts = diagram(old_chunks), diagram(new_chunks)
+    better = False
+    for x in sorted({p[0] for p in old_pts} | {p[0] for p in new_pts}):
+        (a, ad), (b, bd) = at(new_pts, x), at(old_pts, x)
+        if a * bd < b * ad:
+            return False
+        if a * bd > b * ad:
+            better = True
+    return better
 
 
 DEFAULT_MAX_MEMPOOL_MB = 300  # Core kernel/mempool_options.h DEFAULT_MAX_MEMPOOL_SIZE_MB
@@ -2731,6 +2799,7 @@ class Mempool:
         package_feerate: bool = False,
         workspace: dict | None = None,
         package_member: bool = False,
+        allow_replacement: bool = False,
     ) -> tuple[bool, str]:
         """Unlocked implementation of add_transaction.
 
@@ -2757,6 +2826,12 @@ class Mempool:
           the orphan pool does not block it, since the package supplies the
           parents the orphan was waiting for (Core's package path never
           consults the orphanage).
+        * *allow_replacement* -- with *package_coins*: a member that spends
+          an outpoint a pool tx already spends is validated as if the
+          conflict were gone, and the direct conflicts go to
+          ``workspace["conflicts"]`` (Core PreChecks with
+          ``m_allow_replacement``, PackageChildWithParents args).  The caller
+          runs the package RBF checks; nothing is replaced here.
 
         *bypass_limits* (Core ``MemPoolAccept::ATMPArgs::m_bypass_limits``, set
         only by the reorg refill ``update_for_reorg``) skips the fee-rate floor
@@ -3058,16 +3133,25 @@ class Mempool:
             (tx_in.prev_txid, tx_in.prev_vout) in self.spent_outputs
             for tx_in in tx.inputs
         )
-        if has_conflict and package_coins is not None:
-            # Package evaluation (Core AcceptMultipleTransactions) does not
-            # replace in-pool transactions here: Core's PackageTestAccept
-            # disallows replacement (PreChecks "bad-txns-spends-conflicting-tx")
-            # and package RBF (PackageRBFChecks) is not implemented by this
-            # node, so a conflicting package member is refused instead of
-            # being sent down the single-transaction RBF path, which cannot
-            # see the package overlay.
+        if has_conflict and package_coins is not None and not allow_replacement:
+            # Package test accept (testmempoolaccept of several txs): Core's
+            # PackageTestAccept args disallow replacement, so a conflicting
+            # package member is refused instead of being sent down the
+            # single-transaction RBF path, which cannot see the package
+            # overlay.
             return False, "bad-txns-spends-conflicting-tx"
-        if has_conflict:
+        if has_conflict and package_coins is not None:
+            # Package submission (Core PackageChildWithParents args,
+            # m_allow_replacement): PreChecks only records the direct
+            # conflicts (ws.m_conflicts); PackageRBFChecks, run by the
+            # caller over the whole package, decides the replacement.
+            if workspace is not None:
+                workspace["conflicts"] = {
+                    self.spender_by_outpoint[(i.prev_txid, i.prev_vout)]
+                    for i in tx.inputs
+                    if (i.prev_txid, i.prev_vout) in self.spender_by_outpoint
+                }
+        elif has_conflict:
             # _add_transaction_inner already runs unlocked under the caller's
             # lock; call the unlocked replacement helper directly. In test_accept
             # (dry-run) mode it validates the BIP125 RBF rules without evicting
@@ -3178,6 +3262,7 @@ class Mempool:
         if workspace is not None:
             workspace["fee"] = fee
             workspace["vsize"] = tx_vsize
+            workspace["sigop_cost"] = tx_sigop_cost
 
         # PreCheckEphemeralTx — a non-zero-fee transaction may not have dust
         # outputs (the dust output must be CPFP'd by a child in a package).
@@ -5256,11 +5341,10 @@ class Mempool:
         # surfaced through testmempoolaccept / sendrawtransaction normalizes to
         # the SAME category as Core; the verbose tail mirrors PaysForRBF's
         # "less fees than conflicting txs" detail string.
+        pays_err = pays_for_rbf(old_fees, new_fee_modified, new_vsize,
+                                self.INCREMENTAL_RELAY_FEE, new_tx.get_txid())
         if new_fee_modified < old_fees:
-            return False, (
-                f"insufficient fee, rejecting replacement, less fees than "
-                f"conflicting txs; {new_fee_modified} < {old_fees}"
-            )
+            return False, f"insufficient fee, {pays_err}"
 
         # Rule #4 (PaysForRBF, part 2): The additional fees must pay for the
         # replacement's own bandwidth at or above the incremental relay feerate.
@@ -5280,10 +5364,7 @@ class Mempool:
         ) // 1000
         additional_fee = new_fee_modified - old_fees
         if additional_fee < incremental_fee_needed:
-            return False, (
-                f"insufficient fee, rejecting replacement, not enough additional "
-                f"fees to relay; {additional_fee} < {incremental_fee_needed}"
-            )
+            return False, f"insufficient fee, {pays_err}"
 
         # Rule 6 (cluster mempool): new linearization must be strictly better
         # The new tx must improve the feerate diagram of the affected cluster(s).
@@ -6355,9 +6436,6 @@ class Mempool:
         results_final: dict[bytes, PackageTxResult] = {}
         individual_nonfinal: dict[bytes, PackageTxResult] = {}
         quit_early = False
-        # Set by the first tx whose individual failure Core would retry as a
-        # package RBF; the outpoint is named while the conflict is in the pool.
-        package_rbf_refusal: PackageAcceptResult | None = None
         eval_txs: list[Transaction] = []
         for tx in txs:
             txid = tx.get_txid()
@@ -6380,13 +6458,12 @@ class Mempool:
                 )
             else:
                 res = self._accept_single_in_package(tx, height)
-                if (res.kind != "valid" and len(txs) > 1
-                        and package_rbf_refusal is None
-                        and self._needs_package_rbf(tx, res.reject_reason or "")):
-                    package_rbf_refusal = self._package_rbf_unsupported(tx)
+                reason = res.reject_reason or ""
                 if res.kind == "valid":
                     results_final[wtxid] = res
-                elif len(txs) == 1 or not self._is_reconsiderable(res.reject_reason or ""):
+                elif len(txs) == 1 or not (
+                        self._is_reconsiderable(reason)
+                        or self._needs_package_rbf(tx, reason)):
                     # A failure package evaluation cannot change (consensus,
                     # standardness, ...).  Keep validating the rest
                     # individually: some may still be valid.
@@ -6396,11 +6473,6 @@ class Mempool:
                     individual_nonfinal[wtxid] = res
                     eval_txs.append(tx)
 
-        if package_rbf_refusal is not None:
-            # The rest were still tried individually (Core's AcceptPackage
-            # loop), so the pool matches Core's before its package RBF step.
-            self._trim_to_size(self.max_size)
-            return package_rbf_refusal
         if quit_early:
             multi = PackageAcceptResult(state="tx", message="transaction failed")
         elif not eval_txs:
@@ -6451,33 +6523,14 @@ class Mempool:
         """*tx* failed single-tx RBF on its fee against in-pool conflicts.
 
         Core's PaysForRBF and feerate-diagram failures are
-        TX_RECONSIDERABLE: AcceptPackage retries such a tx with the rest of
-        the package as a package RBF (``PackageRBFChecks``)."""
+        TX_RECONSIDERABLE (validation.cpp ReplacementChecks): AcceptPackage
+        retries such a tx with the rest of the package, where
+        AcceptMultipleTransactions runs ``PackageRBFChecks``."""
         if not any((inp.prev_txid, inp.prev_vout) in self.spender_by_outpoint
                    for inp in tx.inputs):
             return False
         return (reason.startswith("insufficient fee")
                 or reason.startswith("Replacement would worsen cluster feerate"))
-
-    def _package_rbf_unsupported(self, tx: Transaction) -> "PackageAcceptResult":
-        """The answer for a package that needs package RBF.
-
-        This node does not implement package RBF, so it cannot give the
-        verdicts Core would.  It refuses the package as the package path did
-        before staged acceptance: a package-level message naming the first
-        conflicting outpoint, and no per-tx results.  The conflicts stay in
-        the pool; package txs accepted individually stay too, as Core leaves
-        them."""
-        for inp in tx.inputs:
-            if (inp.prev_txid, inp.prev_vout) in self.spender_by_outpoint:
-                return PackageAcceptResult(
-                    state="policy",
-                    message=(f"Package conflicts with mempool: "
-                             f"{inp.prev_txid.hex()[:16]}...:{inp.prev_vout} "
-                             f"already spent"),
-                    per_tx_results=False,
-                )
-        raise AssertionError("_package_rbf_unsupported without a conflict")
 
     def _replacement_candidates(self, tx: Transaction) -> set[bytes]:
         """In-pool spenders of *tx*'s inputs and their descendants: the txs a
@@ -6545,7 +6598,7 @@ class Mempool:
             ok, reason = self._add_transaction_inner(
                 tx, height, test_accept=True, store_orphan=False,
                 package_coins=package_coins, package_feerate=package_feerates,
-                workspace=ws,
+                workspace=ws, allow_replacement=not test_accept,
             )
             if not ok and not (script_failure is None
                                and self._is_script_failure(reason)):
@@ -6610,6 +6663,15 @@ class Mempool:
                 return PackageAcceptResult(
                     state="tx", message="transaction failed", results=results)
 
+        # Core: "Apply package mempool RBF checks" (PackageRBFChecks) when a
+        # member conflicts with the pool, after the package feerate check.
+        replaced: set[bytes] = set()
+        if any(ws.get("conflicts") for ws in workspaces):
+            rbf = self._package_rbf_checks(txs, workspaces)
+            if isinstance(rbf, PackageAcceptResult):
+                return rbf
+            replaced = rbf
+
         # Ephemeral dust (Core PreCheckEphemeralTx per tx + CheckEphemeralSpends
         # for the package).  Core gates both on require_standard; this node
         # has always enforced them on every package (the previous
@@ -6650,10 +6712,14 @@ class Mempool:
                 effective_feerate=(package_rate if package_feerates
                                    else self._feerate_per_kvb(ws["fee"], ws["vsize"])),
                 effective_includes=list(wtxids) if package_feerates else [w],
+                replaced=sorted(replaced),
             )
         if test_accept:
             return PackageAcceptResult(state="valid", message="", results=results)
 
+        # Core SubmitPackage applies the changeset: the replaced txs leave
+        # the pool before the package txs enter it.
+        evicted = self._evict_for_package_rbf(replaced)
         inserted: list[bytes] = []
         for tx in txs:
             ok, reason = self._add_transaction_inner(
@@ -6668,6 +6734,7 @@ class Mempool:
                 extra.difference_update(inserted)
                 for t in [*extra, *reversed(inserted)]:
                     self._remove_transaction_inner(t, _reason="package-rollback")
+                self._restore_after_package_rbf(evicted, height)
                 if reason == "too-large-cluster":
                     return PackageAcceptResult(state="policy", message=reason)
                 res = self._package_failure(tx, reason)
@@ -6680,6 +6747,137 @@ class Mempool:
             f"(total fee {total_fee}, package rate {package_rate} sat/kvB)"
         )
         return PackageAcceptResult(state="valid", message="", results=results)
+
+    def _package_rbf_checks(
+        self, txs: list[Transaction], workspaces: list[dict],
+    ) -> "PackageAcceptResult | set[bytes]":
+        """Core ``MemPoolAccept::PackageRBFChecks`` (validation.cpp): the
+        txids the package replaces, or the package-level failure.
+
+        Checks, in Core's order: the package is one parent and one child;
+        neither has an in-pool parent; the conflicts touch at most 100
+        clusters (GetEntriesForConflicts); the package pays for what it
+        replaces and for its own relay (PaysForRBF over the package's
+        modified fees and vsize, attributed to the child); the package
+        feerate is above the parent's own; the new cluster fits the cluster
+        limits; and the replacement strictly improves the feerate diagram
+        (ImprovesFeerateDiagram).  Messages are Core's
+        ``PackageValidationState::ToString()``: reject reason, then
+        ``", " + debug`` when there is one."""
+        def fail(reason: str, debug: str = "") -> PackageAcceptResult:
+            return PackageAcceptResult(
+                state="policy", message=f"{reason}, {debug}" if debug else reason)
+
+        if len(txs) != 2 or not self.is_child_with_parents(txs):
+            return fail("package RBF failed: package must be 1-parent-1-child")
+        for tx in txs:
+            if any(inp.prev_txid in self.transactions for inp in tx.inputs):
+                return fail("package RBF failed: new transaction cannot have "
+                            "mempool ancestors")
+
+        direct: set[bytes] = set()
+        for ws in workspaces:
+            direct |= ws.get("conflicts") or set()
+        child = txs[1]
+        cluster_ids = set()
+        for c in direct:
+            cid = self._cluster_manager.get_cluster_id(c)
+            cluster_ids.add(cid if cid is not None else c)
+        if len(cluster_ids) > self.MAX_REPLACEMENT_EVICTIONS:
+            return fail("package RBF failed: too many potential replacements",
+                        f"rejecting replacement {child.get_txid()[::-1].hex()}; "
+                        f"too many conflicting clusters ({len(cluster_ids)} > "
+                        f"{self.MAX_REPLACEMENT_EVICTIONS})")
+        all_conflicts: set[bytes] = set()
+        for c in direct:
+            all_conflicts |= self._collect_descendants(c)
+        all_conflicts &= set(self.transactions)
+
+        mod_fees = [ws["fee"] + int(self.map_deltas.get(tx.get_txid(), 0))
+                    for tx, ws in zip(txs, workspaces, strict=True)]
+        vsizes = [ws["vsize"] for ws in workspaces]
+        total_fee, total_vsize = sum(mod_fees), sum(vsizes)
+        conflicting_fees = sum(self.get_modified_fee(t) for t in all_conflicts)
+        err = pays_for_rbf(conflicting_fees, total_fee, total_vsize,
+                           self.INCREMENTAL_RELAY_FEE, child.get_txid())
+        if err is not None:
+            return fail("package RBF failed: insufficient anti-DoS fees", err)
+
+        # CFeeRate comparison: both sides in sat/kvB, rounded down.
+        parent_rate = self._feerate_per_kvb(mod_fees[0], vsizes[0])
+        package_rate = self._feerate_per_kvb(total_fee, total_vsize)
+        if package_rate <= parent_rate:
+            return fail("package RBF failed: package feerate is less than or "
+                        "equal to parent feerate",
+                        f"package feerate {_core_feerate_str(package_rate)} <= "
+                        f"parent feerate is {_core_feerate_str(parent_rate)}")
+
+        # CheckMemPoolPolicyLimits on the staged changeset.  With no in-pool
+        # parents (checked above) and nothing in the pool spending a package
+        # tx, the new cluster is the two package txs alone.
+        new_weight = sum(
+            get_sigops_adjusted_weight(tx.get_weight(), ws.get("sigop_cost", 0),
+                                       DEFAULT_BYTES_PER_SIGOP)
+            for tx, ws in zip(txs, workspaces, strict=True))
+        if len(txs) > MAX_CLUSTER_COUNT or new_weight > MAX_CLUSTER_SIZE_WEIGHT:
+            return fail(CLUSTER_REJECT_TOKEN)
+
+        # ImprovesFeerateDiagram: the chunks of every cluster the conflicts
+        # are in, before, against the same clusters without the conflicts
+        # plus the package, after.
+        affected: set[bytes] = set()
+        for t in all_conflicts:
+            cid = self._cluster_manager.get_cluster_id(t)
+            cluster = self._cluster_manager._clusters.get(cid) if cid is not None else None
+            affected |= set(cluster.txids) if cluster is not None else {t}
+        affected &= set(self.transactions)
+        old_chunks = self._fee_vsize_chunks(affected)
+        new_chunks = self._fee_vsize_chunks(affected - all_conflicts)
+        if mod_fees[1] * vsizes[0] > mod_fees[0] * vsizes[1]:
+            new_chunks.append((total_fee, total_vsize))      # child pays for parent
+        else:
+            new_chunks += [(mod_fees[0], vsizes[0]), (mod_fees[1], vsizes[1])]
+        if not improves_feerate_diagram(old_chunks, new_chunks):
+            return fail("package RBF failed: insufficient feerate: does not "
+                        "improve feerate diagram")
+        return all_conflicts
+
+    def _fee_vsize_chunks(self, txids: set[bytes]) -> list[tuple[int, int]]:
+        """Chunks of the pool txs *txids*, as ``(modified fee, vsize)``, from
+        the node's cluster linearization."""
+        if not txids:
+            return []
+        _, chunks = ClusterLinearizer(self.transactions).linearize(set(txids))
+        return [(sum(self.get_modified_fee(t) for t in c.txids),
+                 sum(self.transactions[t].vsize for t in c.txids))
+                for c in chunks]
+
+    def _evict_for_package_rbf(self, replaced: set[bytes]) -> list[Transaction]:
+        """Remove the txs a package RBF replaces; returns them parents first
+        so a failed submit can put them back."""
+        if not replaced:
+            return []
+        evicted = sorted((self.transactions[t] for t in replaced if t in self.transactions),
+                         key=lambda e: e.ancestor_count)
+        for e in evicted:
+            self._remove_transaction_inner(e.tx.get_txid(), _skip_recount=True,
+                                           _reason="replaced")
+        for e in evicted:
+            self._update_descendants_after_removal(e.tx.get_txid())
+        return [e.tx for e in evicted]
+
+    def _restore_after_package_rbf(self, evicted: list[Transaction], height: int) -> None:
+        """Put back the txs a package RBF evicted when the package itself
+        could not be inserted (Core applies its changeset atomically, so the
+        conflicts are never lost there)."""
+        for tx in evicted:
+            ok, reason = self._add_transaction_inner(
+                tx, height, store_orphan=False, bypass_limits=True,
+                package_member=True)
+            if not ok:
+                logger.warning(
+                    f"package RBF rollback could not restore "
+                    f"{tx.get_txid()[::-1].hex()}: {reason}")
 
     def validate_package(
         self, txs: list[Transaction], height: int
