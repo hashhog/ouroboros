@@ -438,29 +438,27 @@ def _conflict_and_descendant(pool, db, n: int):
     return coin, o, d
 
 
-def test_submitpackage_needing_package_rbf_is_refused_without_per_tx_results():
+def test_submitpackage_needing_package_rbf_replaces_the_conflicts():
     """Parent double-spends a pool tx and pays less than the conflicts, so it
-    fails RBF on its own: Core retries it with its child as a package RBF.
-    This node has no package RBF, so it refuses the package before any
-    per-tx verdict, as master did: master's package_msg and no tx-results
-    entries, rather than per-tx errors that only exist because the package
-    RBF step is missing.  The conflicts stay; nothing is admitted.  On #145's
-    second head this returned "transaction failed" with an insufficient-fee
-    error for the parent and a missing-inputs error for the child."""
+    fails RBF on its own: Core's AcceptPackage retries it with its child, and
+    PackageRBFChecks lets the 1-parent-1-child package replace ``O`` and
+    ``D`` (validation.cpp).  Master refused the package with its own
+    "Package conflicts with mempool" message and no tx-results."""
     pool, db = _pool()
     coin, o, d = _conflict_and_descendant(pool, db, 23)
     parent = _tx([(coin, 0)], [94_000])                  # fee 6_000 < 11_000
     child = _tx([(parent.get_txid(), 0)], [50_000])
     res = asyncio.run(RPCServer.rpc_submitpackage(
         _rpc(pool, db), [_hex(parent), _hex(child)]))
-    assert res["package_msg"] == (
-        f"Package conflicts with mempool: {coin.hex()[:16]}...:0 already spent")
-    assert res["tx-results"] == {}
-    assert res["replaced-transactions"] == []
-    assert o.get_txid() in pool.transactions
-    assert d.get_txid() in pool.transactions
-    assert parent.get_txid() not in pool.transactions
-    assert child.get_txid() not in pool.transactions
+    assert res["package_msg"] == "success", res
+    assert set(res["tx-results"]) == {_be(parent.get_wtxid()), _be(child.get_wtxid())}
+    assert res["replaced-transactions"] == sorted(
+        [_be(o.get_txid()), _be(d.get_txid())],
+        key=lambda h: bytes.fromhex(h)[::-1])
+    assert o.get_txid() not in pool.transactions
+    assert d.get_txid() not in pool.transactions
+    assert parent.get_txid() in pool.transactions
+    assert child.get_txid() in pool.transactions
 
 
 def test_package_parent_that_pays_for_single_rbf_still_replaces():
@@ -484,20 +482,21 @@ def test_package_parent_that_pays_for_single_rbf_still_replaces():
     assert d.get_txid() not in pool.transactions
 
 
-def test_package_rbf_refusal_still_tries_the_other_parents_individually():
+def test_package_rbf_with_a_mempool_parent_still_tries_the_other_parents_individually():
     """Core's AcceptPackage tries every tx on its own before any package
     step, so an independent parent that is valid alone is admitted even
-    though its sibling needs package RBF.  The refusal comes after that
-    loop: the pool ends as Core's does before its package RBF step."""
+    though its sibling needs package RBF.  The child then has that parent in
+    the pool, and PackageRBFChecks refuses: "package RBF failed: new
+    transaction cannot have mempool ancestors".  The conflicts stay."""
     pool, db = _pool()
     coin, o, d = _conflict_and_descendant(pool, db, 25)
     rbf_parent = _tx([(coin, 0)], [94_000])              # needs package RBF
     other = _tx([(_funded(db, 26), 0)], [95_000])        # valid alone
     child = _tx([(rbf_parent.get_txid(), 0), (other.get_txid(), 0)], [100_000])
-    ok, err = pool.validate_package([rbf_parent, other, child], 100)
-    assert not ok
-    assert err == (
-        f"Package conflicts with mempool: {coin.hex()[:16]}...:0 already spent")
+    res = pool.accept_package([rbf_parent, other, child], 100)
+    assert res.state == "policy"
+    assert res.message == (
+        "package RBF failed: new transaction cannot have mempool ancestors")
     assert other.get_txid() in pool.transactions
     assert o.get_txid() in pool.transactions
     assert d.get_txid() in pool.transactions
