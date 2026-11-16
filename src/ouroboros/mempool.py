@@ -2592,6 +2592,12 @@ class Mempool:
         with self._lock:
             current = self.map_deltas.get(txid, 0)
             new_delta = self._saturating_add(current, int(delta_sats))
+            # The modified fee moves TxGraph's chunking, and with it the
+            # chunk-index share of DynamicMemoryUsage(): recount this
+            # cluster's usage term on the next read.
+            cid = self._cluster_manager.get_cluster_id(txid)
+            if cid is not None:
+                self._cluster_manager.usage_dirty.add(cid)
             if new_delta == 0:
                 self.map_deltas.pop(txid, None)
                 logger.info(
@@ -5515,10 +5521,29 @@ class Mempool:
             cluster = cm._clusters.get(cid)
             if cluster is not None and len(cluster.txids) > 1:
                 corr = core_cluster_usage_correction(
-                    len(cluster.txids), len(cm.get_chunks(cluster)))
+                    len(cluster.txids), self._txgraph_chunk_count(cluster.txids))
                 self._cluster_usage_corr[cid] = corr
                 self._cluster_usage_total += corr
         return self._cluster_usage_total
+
+    def _txgraph_chunk_count(self, txids: set[bytes]) -> int:
+        """Number of chunks Core's TxGraph holds for this cluster, one
+        m_main_chunkindex node each (txgraph.cpp GetMainMemoryUsage).
+
+        TxGraph chunks the cluster's optimal linearization of MODIFIED fee
+        and sigop-adjusted WEIGHT (txmempool.cpp StageAddition /
+        PrioritiseTransaction), the same chunking getmempoolentry reports
+        (main_chunk_feerate).  ClusterManager.get_chunks is a greedy
+        ancestor-set chunking of base fee and vsize, which can merge chunks
+        Core keeps apart, so it does not give Core's count."""
+        cluster = {t for t in txids if t in self.transactions}
+        if len(cluster) <= 1:
+            return len(cluster)
+        fee = {t: int(self.transactions[t].fee) + int(self.map_deltas.get(t, 0))
+               for t in cluster}
+        size = {t: int(self.transactions[t].sigop_adjusted_weight) for t in cluster}
+        parents = {t: set(self.transactions[t].parents) & cluster for t in cluster}
+        return len(optimal_chunks(cluster, fee, size, parents))
 
     def dynamic_memory_usage(self) -> int:
         """Core's CTxMemPool::DynamicMemoryUsage(): what -maxmempool bounds
