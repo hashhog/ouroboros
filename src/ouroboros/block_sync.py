@@ -514,6 +514,31 @@ def _can_serve_block_at(peer, height: int) -> bool:
     return True
 
 
+def _announcers_first(peers: list, height: int) -> list:
+    """``peers`` with those that announced a header at ``height`` or above
+    moved to the front, order otherwise kept.
+
+    ``Peer.synced_headers`` is ouroboros' ``pindexBestKnownBlock``: it only
+    advances on the peer's own header announcements and deliveries, never
+    on VERSION startHeight.  Core fetches a block only from a peer whose
+    pindexBestKnownBlock covers it (FindNextBlocksToDownload) and fetches a
+    new tip from the announcing peer (HeadersDirectFetchBlocks).  The other
+    peers stay behind as a fallback.  Returns ``peers`` itself when nobody
+    announced.
+    """
+    def _announced(p) -> bool:
+        try:
+            return int(getattr(p, "synced_headers", -1)) >= int(height)
+        except (TypeError, ValueError):
+            return False
+
+    flags = [_announced(p) for p in peers]
+    if not any(flags):
+        return peers
+    return ([p for p, f in zip(peers, flags) if f]
+            + [p for p, f in zip(peers, flags) if not f])
+
+
 def _distribute_blocks_round_robin(
     items: list,
     candidates: list,
@@ -7122,6 +7147,25 @@ class BlockSync:
                 candidates = [fallback]
         candidates.sort(key=lambda p: -getattr(p, 'score', 100))
 
+        # At tip, the frontier body goes first to a peer that ANNOUNCED it.
+        # Core only fetches a block from a peer whose pindexBestKnownBlock
+        # (set by that peer's headers/inv/cmpctblock, never by VERSION
+        # startHeight) covers it, and fetches a new tip directly from the
+        # announcing peer (HeadersDirectFetchBlocks).  ``_can_serve_block_at``
+        # keeps "no height signal" peers eligible, so score order alone sent
+        # tip+1 to a silent score-100 inbound that never served it, and every
+        # such block waited out the 128 s HEAD_TIMEOUT (mainnet 2026-11-15:
+        # ~2m15s Core-to-connected on most blocks).  Announcers are moved to
+        # the front (score order kept within each group); the rest stay as a
+        # fallback.  Far from tip the queue is longer than the head window
+        # and the order is unchanged.  The HEAD pass below orders each slot
+        # the same way, so tip+2 of a two-block burst is covered too.
+        at_tip = len(self._validated_headers) <= HEAD_OF_WINDOW
+        frontier_order = (
+            _announcers_first(candidates, frontier_height) if at_tip
+            else candidates
+        )
+
         now = time.time()
 
         # ------------------------------------------------------------------
@@ -7178,20 +7222,20 @@ class BlockSync:
                     # defer the connect cursor (866210, buf=725).
                     stalled = self._last_stalled_peer.get(frontier_hash)
                     others = [
-                        p for p in candidates
+                        p for p in frontier_order
                         if p is not current_peer and p is not stalled
                     ]
                     frontier_peer = self._pick_peer_for_head(
                         others, head_set, allow_over_cap=False,
                     )
                     if frontier_peer is None:
-                        rest = [p for p in candidates if p is not current_peer]
+                        rest = [p for p in frontier_order if p is not current_peer]
                         frontier_peer = self._pick_peer_for_head(
                             rest, head_set, allow_over_cap=False,
                         )
                     if frontier_peer is None:
                         frontier_peer = self._pick_peer_for_head(
-                            candidates, head_set, allow_over_cap=True,
+                            frontier_order, head_set, allow_over_cap=True,
                         )
                     if frontier_peer is not None:
                         try:
@@ -7314,17 +7358,28 @@ class BlockSync:
         per_peer: dict = {c: [] for c in candidates}
         assigned: list = []
 
+        # Slot N of the validated-header queue is height tip+1+N (the queue
+        # is anchored to the DB tip); used for the at-tip announcer order.
+        slot_height = (
+            {bh: frontier_height + i
+             for i, (bh, _) in enumerate(self._validated_headers)}
+            if at_tip else {}
+        )
         for item in head_items:
             bh = item[1]
             stalled = self._last_stalled_peer.get(bh)
-            others = [p for p in candidates if p is not stalled]
+            order = (
+                _announcers_first(candidates, slot_height[bh])
+                if bh in slot_height else candidates
+            )
+            others = [p for p in order if p is not stalled]
             over_cap = bh == frontier_hash
             target = self._pick_peer_for_head(
                 others, head_set, allow_over_cap=False,
             )
             if target is None:
                 target = self._pick_peer_for_head(
-                    candidates, head_set, allow_over_cap=over_cap,
+                    order, head_set, allow_over_cap=over_cap,
                 )
             if target is None:
                 continue
