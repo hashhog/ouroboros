@@ -2478,6 +2478,12 @@ class RPCServer:
         return out
 
     def _label_for_address(self, wallet: Any, address: str) -> str:
+        return self._address_book_label(wallet, address) or ""
+
+    def _address_book_label(self, wallet: Any, address: str) -> str | None:
+        """The label of the wallet key entry for *address* (the node's
+        address book: getnewaddress and imports record one, "" for the
+        default label), or None when the wallet has no entry for it."""
         for kd in getattr(wallet, "keys", []) or []:
             if kd.get("label") is None:
                 continue
@@ -2496,7 +2502,7 @@ class RPCServer:
                         return str(kd.get("label") or "")
                 except Exception:
                     continue
-        return ""
+        return None
 
     def _parse_output_pairs(self, outputs: Any) -> list[tuple[str, Any]]:
         """Normalize Core send/walletcreatefundedpsbt outputs to (addr, amount)."""
@@ -16709,7 +16715,9 @@ class RPCServer:
                                     continue
             except Exception:
                 ischange = False
-        label = self._label_for_address(wallet, address) if wallet is not None else ""
+        book_label = (self._address_book_label(wallet, address)
+                      if wallet is not None else None)
+        label = book_label or ""
         out: dict[str, Any] = {
             "address": address,
             "scriptPubKey": spk_bytes.hex(),
@@ -16721,7 +16729,11 @@ class RPCServer:
             "script": script_type,
             "pubkey": pubkey_hex,
             "label": label,
-            "labels": [label] if label else [],
+            # Core getaddressinfo (wallet/rpc/addresses.cpp): the label of
+            # the address-book entry, "" included; [] when the address has
+            # no entry (change addresses never do: FindAddressBookEntry
+            # with allow_change=false).
+            "labels": [book_label] if book_label is not None and not ischange else [],
         }
         out.update(self._witness_fields(spk_bytes))
         if desc:
