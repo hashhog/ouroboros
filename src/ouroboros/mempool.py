@@ -5013,9 +5013,13 @@ class Mempool:
         new_rate = new_total_fee / new_total_size if new_total_size > 0 else 0
 
         if new_rate < old_rate:
+            # Core MemPoolAccept::ReplacementChecks (validation.cpp): a failed
+            # ImprovesFeerateDiagram is TX_RECONSIDERABLE "replacement-failed"
+            # with policy/rbf.cpp's debug string.  "<token>: <debug>" is the
+            # shape the RPC layer splits into reject-reason / reject-details.
             return False, (
-                f"Replacement would worsen cluster feerate: "
-                f"{new_rate:.2f} < {old_rate:.2f} sat/vB"
+                "replacement-failed: "
+                "insufficient feerate: does not improve feerate diagram"
             )
 
         # Additional check: the new tx's feerate should be at least as good as
@@ -6535,7 +6539,7 @@ class Mempool:
                    for inp in tx.inputs):
             return False
         return (reason.startswith("insufficient fee")
-                or reason.startswith("Replacement would worsen cluster feerate"))
+                or reason.startswith("replacement-failed"))
 
     def _replacement_candidates(self, tx: Transaction) -> set[bytes]:
         """In-pool spenders of *tx*'s inputs and their descendants: the txs a

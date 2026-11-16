@@ -4484,6 +4484,14 @@ class RPCServer:
         # bucket. Must run BEFORE the conflict check below (an RBF reject string
         # also mentions "replacement"/"conflicting txs").
         # Reference: bitcoin-core/src/policy/rbf.cpp PaysForRBF.
+        #
+        # The feerate-diagram reject already carries Core's token and debug
+        # string ("replacement-failed: insufficient feerate: ...",
+        # validation.cpp ReplacementChecks), so it passes through whole; it
+        # must be matched first because its debug text contains
+        # "insufficient fee".
+        if error.startswith("replacement-failed: "):
+            return error
         if "insufficient fee" in error_lower:
             return "insufficient fee"
 
