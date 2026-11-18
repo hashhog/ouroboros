@@ -1,0 +1,11 @@
+# recorded 2026-11-18T04:15:01Z at ouroboros 950dec0; old build = master c4778b1 (its Rust is identical to deployed tag mainnet-2026-11-16 / 015638b)
+$ OLD_PYTHONPATH=<master>/src:<master sync site> NEW_PYTHONPATH=src:<this sync site> PY=.venv/bin/python bash tools/index_header_fill/rollback_check.sh <scratch>
+old build wrote #52 rows: (126, 0, 126)
+new build filled 126 (126, 126, 0)
+old build reads the filled datadir: metadata IDENTICAL
+old build rewrote h60: header kept=True
+after the old build rewrites h60 on both: metadata IDENTICAL
+new build filled 0 (126, 126, 0)
+new build re-opens it: metadata IDENTICAL
+negative control (control rewritten at h61 alone): metadata DIFFERENT
+exit=0
