@@ -1,0 +1,5 @@
+# recorded 2026-11-18T04:15:03Z at ouroboros 950dec0, release sync build
+$ PYTHONPATH=src:<this sync site> .venv/bin/python tools/index_header_fill/bench.py <scratch>/db 200000
+setup 200000 header-less entries in 2.1s; summary=(200000, 0, 200000)
+fill: steps=202 accepts=101 worst_step_ms=23.9 worst_accept_ms=23.5 total_s=2.1 attached=200000
+summary after=(200000, 200000, 0)

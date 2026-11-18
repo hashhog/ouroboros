@@ -5385,6 +5385,29 @@ class RPCServer:
                 except Exception as _e:
                     raw_header_bytes = None
 
+            # Hash-index v2 entry (BLOCK_INDEX_BY_HASH_CF): the header the v2
+            # migration or the online index header fill
+            # (ouroboros.index_header_fill) stored with the entry itself.  The
+            # pre-snapshot rows of an assumeUTXO node have no body and no
+            # HEADERS_CF row, so this is the only store that holds their
+            # header; Core's CBlockIndex always carries it, and getblockheader
+            # answers it (rpc/blockchain.cpp getblockheader ->
+            # blockheaderToJSON).  nTx is the entry's own (0 until the block's
+            # transactions are held, as Core's pindex->nTx).
+            if not block and raw_header_bytes is None:
+                entry_fn = getattr(getattr(self.node.db, "_db", None), "get_block_index_entry", None)
+                if entry_fn is not None:
+                    try:
+                        entry = await asyncio.to_thread(entry_fn, block_hash)
+                    except Exception:
+                        entry = None
+                    if entry is not None and entry[4] is not None:
+                        hdr80 = bytes(entry[4])
+                        if (len(hdr80) == 80 and _hashlib.sha256(
+                                _hashlib.sha256(hdr80).digest()).digest() == block_hash):
+                            raw_header_bytes = hdr80
+                            raw_n_tx = int(entry[5])
+
             # Headers-only block-index entries: a header accepted over P2P or
             # by submitheader whose block never arrived lives only in
             # BlockSync's header stores.  Core's LookupBlockIndex finds it

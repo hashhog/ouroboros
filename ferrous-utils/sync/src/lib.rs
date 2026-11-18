@@ -3450,6 +3450,113 @@ impl PyBlockchainDB {
         Ok(m)
     }
 
+    /// Resume points of the online hash-index header fill:
+    /// ``(height_or_None, key_or_None, key_pass_done)``.
+    fn index_header_fill_cursor(&self) -> PyResult<(Option<u32>, Option<Vec<u8>>, bool)> {
+        let (h, k, d) = self.db.index_header_fill_cursor().map_err(|e| {
+            PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(format!("Database error: {}", e))
+        })?;
+        Ok((h, k.map(|k| k.to_vec()), d))
+    }
+
+    /// One bounded step of the online header fill over the active chain
+    /// (``BlockchainDB::fill_index_headers_by_height``).  Returns
+    /// ``(counts, next_height, done, peer_run)``: ``counts`` a dict
+    /// (scanned, already_v2, from_headers, from_body, hash_mismatch,
+    /// corrupt_body, unlinked, need_peer, no_source, malformed, no_entry),
+    /// ``peer_run`` a list of ``(height, hash)``.  ``write=False`` writes
+    /// nothing (dry run).
+    #[pyo3(signature = (from_height, max_scan, budget_ms, max_peer_run, write))]
+    fn fill_index_headers_by_height(
+        &self,
+        py: Python<'_>,
+        from_height: u32,
+        max_scan: u32,
+        budget_ms: u64,
+        max_peer_run: usize,
+        write: bool,
+    ) -> PyResult<(std::collections::HashMap<String, u64>, u32, bool, Vec<(u32, Vec<u8>)>)> {
+        let s = py
+            .allow_threads(|| {
+                self.db.fill_index_headers_by_height(from_height, max_scan, budget_ms, max_peer_run, write)
+            })
+            .map_err(|e| {
+                PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(format!("Database error: {}", e))
+            })?;
+        let run = s.peer_run.iter().map(|(h, k)| (*h, k.to_vec())).collect();
+        Ok((index_fill_step_map(&s), s.next_height, s.done, run))
+    }
+
+    /// One bounded step of the online header fill over every hash-index
+    /// key after ``start_after`` (``fill_index_headers_by_hash``).  Returns
+    /// ``(counts, next_key_or_None, done)``.
+    #[pyo3(signature = (start_after, max_scan, budget_ms, write))]
+    fn fill_index_headers_by_hash(
+        &self,
+        py: Python<'_>,
+        start_after: Option<Vec<u8>>,
+        max_scan: u32,
+        budget_ms: u64,
+        write: bool,
+    ) -> PyResult<(std::collections::HashMap<String, u64>, Option<Vec<u8>>, bool)> {
+        let start = match start_after {
+            Some(k) if k.len() == 32 => {
+                let mut a = [0u8; 32];
+                a.copy_from_slice(&k);
+                Some(a)
+            }
+            Some(_) => {
+                return Err(PyErr::new::<pyo3::exceptions::PyValueError, _>(
+                    "start_after must be 32 bytes",
+                ))
+            }
+            None => None,
+        };
+        let s = py
+            .allow_threads(|| self.db.fill_index_headers_by_hash(start, max_scan, budget_ms, write))
+            .map_err(|e| {
+                PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(format!("Database error: {}", e))
+            })?;
+        Ok((index_fill_step_map(&s), s.next_key.map(|k| k.to_vec()), s.done))
+    }
+
+    /// Attach peer-served 80-byte headers to their hash-index entries
+    /// (``attach_index_headers``).  Returns a dict (attached, already_v2,
+    /// unknown, unlinked, malformed); a header of the wrong length counts
+    /// as ``malformed`` and is not written.
+    #[pyo3(signature = (headers, resume_height=None, write=true))]
+    fn attach_index_headers(
+        &self,
+        py: Python<'_>,
+        headers: Vec<Vec<u8>>,
+        resume_height: Option<u32>,
+        write: bool,
+    ) -> PyResult<std::collections::HashMap<String, u64>> {
+        let mut bad = 0u64;
+        let mut hs: Vec<[u8; 80]> = Vec::with_capacity(headers.len());
+        for h in &headers {
+            if h.len() == 80 {
+                let mut a = [0u8; 80];
+                a.copy_from_slice(h);
+                hs.push(a);
+            } else {
+                bad += 1;
+            }
+        }
+        let r = py
+            .allow_threads(|| self.db.attach_index_headers(&hs, resume_height, write))
+            .map_err(|e| {
+                PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(format!("Database error: {}", e))
+            })?;
+        Ok(std::collections::HashMap::from([
+            ("attached".to_string(), r.attached),
+            ("already_v2".to_string(), r.already_v2),
+            ("unknown".to_string(), r.unknown),
+            ("unlinked".to_string(), r.unlinked),
+            ("malformed".to_string(), r.malformed + bad),
+        ]))
+    }
+
     /// Counts from the hash-index v2 migration that opening this database
     /// ran (same keys as ``migrate_block_index_v2``), or ``None`` when an
     /// earlier open had already completed it.
@@ -7412,6 +7519,24 @@ mod tests {
 }
 
 /// Python dict form of `BlockIndexMigrationStats`.
+fn index_fill_step_map(
+    s: &crate::storage::db::IndexHeaderFillStep,
+) -> std::collections::HashMap<String, u64> {
+    std::collections::HashMap::from([
+        ("scanned".to_string(), s.scanned),
+        ("already_v2".to_string(), s.already_v2),
+        ("from_headers".to_string(), s.from_headers),
+        ("from_body".to_string(), s.from_body),
+        ("hash_mismatch".to_string(), s.hash_mismatch),
+        ("corrupt_body".to_string(), s.corrupt_body),
+        ("unlinked".to_string(), s.unlinked),
+        ("need_peer".to_string(), s.need_peer),
+        ("no_source".to_string(), s.no_source),
+        ("malformed".to_string(), s.malformed),
+        ("no_entry".to_string(), s.no_entry),
+    ])
+}
+
 fn index_migration_stats_map(
     s: &crate::storage::db::BlockIndexMigrationStats,
 ) -> std::collections::HashMap<String, u64> {

@@ -230,6 +230,24 @@ pub mod meta_keys {
     /// point read.  Deleting it makes the next open re-run the pass, which is
     /// idempotent (v2 entries are skipped).  Value: 1 byte, `2`.
     pub const BLOCK_INDEX_V2_MIGRATED: &[u8] = b"block_index_v2_migrated";
+
+    /// Resume point of the online header fill over the active chain
+    /// (`BlockchainDB::fill_index_headers_by_height`): the lowest height
+    /// whose hash-index entry may still lack its header.  Written in the
+    /// same batch as the entries a step upgrades, so a kill resumes exactly
+    /// there.  Advisory: the walk skips entries that are already v2, so a
+    /// missing or low value only costs a re-scan.  Older binaries ignore it.
+    /// Value: u32 LE.
+    pub const INDEX_HEADER_FILL_HEIGHT: &[u8] = b"index_header_fill_height";
+
+    /// Resume point of the online header fill's pass over every hash-index
+    /// key (off-chain entries; `fill_index_headers_by_hash`): the last key
+    /// it visited.  Value: 32 bytes.
+    pub const INDEX_HEADER_FILL_KEY: &[u8] = b"index_header_fill_key";
+
+    /// Marker: the by-key pass reached the end of the hash index once.
+    /// Value: 1 byte, `1`.
+    pub const INDEX_HEADER_FILL_KEY_DONE: &[u8] = b"index_header_fill_key_done";
 }
 
 /// Encode a block hash as a 32-byte key
