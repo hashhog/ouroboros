@@ -36,9 +36,11 @@ import os
 import sys
 import time
 
-_SRC = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "src")
-if os.path.isdir(_SRC) and _SRC not in sys.path:
-    sys.path.append(_SRC)
+# This checkout's ouroboros package, ahead of any installed one (the venv's
+# may be the deployed tree, which has no index_header_fill).
+_SRC = os.path.normpath(os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "src"))
+if os.path.isdir(_SRC):
+    sys.path.insert(0, _SRC)
 
 
 def _inside(child: str, parent: str) -> bool:
