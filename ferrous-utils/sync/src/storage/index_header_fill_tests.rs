@@ -168,6 +168,11 @@ mod tests {
         assert_eq!(s.from_body, 1, "only height 3's body verifies");
         assert_eq!(s.corrupt_body, 2, "flipped tx byte + truncated body");
         assert_eq!(s.hash_mismatch, 1, "foreign body");
+        assert_eq!(s.need_peer, 0, "a refused entry is not handed to a peer either");
+        // With peer runs on, the walk must not stop at, recount, or queue them.
+        let s2 = db.fill_index_headers_by_height(4, 3, 0, 2000, true).unwrap();
+        assert_eq!((s2.corrupt_body, s2.hash_mismatch, s2.need_peer), (2, 1, 0));
+        assert!(s2.peer_run.is_empty() && s2.next_height == 7);
         for (i, n) in (4..=6).enumerate() {
             assert_eq!(raw_entry(&db, &h(&blocks[n])), before[i], "height {n} must stay unchanged");
         }
@@ -249,5 +254,82 @@ mod tests {
         let s = db.fill_index_headers_by_height(3, 2, 0, 2000, true).unwrap();
         assert_eq!((s.scanned, s.from_body, s.next_height, s.done), (2, 2, 5, false));
         assert_eq!(db.index_header_fill_cursor().unwrap().0, Some(5));
+    }
+
+    #[test]
+    fn step_is_bounded_by_its_time_budget() {
+        // 80 bodies of 400 transactions: parsing + merkle-checking all of
+        // them takes far longer than 1 ms, so a 1 ms budget must stop early.
+        let tmp = TempDir::new("ihf_budget").unwrap();
+        let db = BlockchainDB::open(tmp.path().to_str().unwrap()).unwrap();
+        let mut prev = BlockHash::all_zeros();
+        let mut last = [0u8; 32];
+        for n in 0..80u32 {
+            let b = block(n, prev, 400, 0);
+            prev = b.block_hash();
+            put_legacy(&db, n, &b, true);
+            put_body(&db, &h(&b), &b.bitcoin_serialize().unwrap());
+            last = h(&b);
+        }
+        db.update_best_block(&last, 79).unwrap();
+        let s = db.fill_index_headers_by_height(0, 10_000, 1, 2000, true).unwrap();
+        assert!(s.scanned >= 1 && s.scanned < 80, "1 ms budget must stop the walk early (scanned {})", s.scanned);
+        assert!(!s.done);
+        assert_eq!(db.index_header_fill_cursor().unwrap().0, Some(s.next_height));
+        let rest = db.fill_index_headers_by_height(s.next_height, 10_000, 0, 2000, true).unwrap();
+        assert_eq!(s.from_body + rest.from_body, 80, "the next step picks up where the budget stopped");
+    }
+
+    /// Generator for `tests/fixtures/index_header_fill/local-bodies.tar.xz`
+    /// (run: `INDEX_FILL_FIXTURE_OUT=<empty dir> cargo test --lib
+    /// make_index_fill_fixture -- --ignored`).  The mainnet shape after the
+    /// v2 deploy (v2 and nTx-reconcile markers present, so open runs neither
+    /// pass) with 20 legacy entries; heights 5..=9 also have a body in
+    /// BLOCKS_CF, 7's with one transaction byte flipped (header intact) and
+    /// 8's truncated.  Writes `db/` and `headers.json` (height, internal hash
+    /// hex, header hex, nTx).
+    #[test]
+    #[ignore]
+    fn make_index_fill_fixture() {
+        let out = std::path::PathBuf::from(std::env::var("INDEX_FILL_FIXTURE_OUT").unwrap());
+        let path = out.join("db");
+        let db = BlockchainDB::open(path.to_str().unwrap()).unwrap();
+        let mut prev = BlockHash::all_zeros();
+        let mut rows = Vec::new();
+        let mut blocks = Vec::new();
+        for n in 0..20u32 {
+            let b = block(n, prev, 1 + (n as usize % 3), 5);
+            prev = b.block_hash();
+            put_legacy(&db, n, &b, true);
+            rows.push(format!(
+                "{{\"height\": {}, \"hash\": \"{}\", \"header\": \"{}\", \"n_tx\": {}}}",
+                n,
+                h(&b).iter().map(|x| format!("{:02x}", x)).collect::<String>(),
+                header80(&b).iter().map(|x| format!("{:02x}", x)).collect::<String>(),
+                b.inner().txdata.len()
+            ));
+            blocks.push(b);
+        }
+        for n in [5usize, 6, 9] {
+            put_body(&db, &h(&blocks[n]), &blocks[n].bitcoin_serialize().unwrap());
+        }
+        let mut bad = blocks[7].bitcoin_serialize().unwrap();
+        let at = bad.len() - 6;
+        bad[at] ^= 0x01;
+        put_body(&db, &h(&blocks[7]), &bad);
+        let mut short = blocks[8].bitcoin_serialize().unwrap();
+        short.truncate(90);
+        put_body(&db, &h(&blocks[8]), &short);
+        db.update_best_block(&h(&blocks[19]), 19).unwrap();
+        let r = db.raw_db();
+        let meta = r.cf_handle(META_CF).unwrap();
+        r.put_cf(meta, meta_keys::BLOCK_INDEX_V2_MIGRATED, [2u8]).unwrap();
+        r.put_cf(meta, meta_keys::HEADERS_NTX_RECONCILED_V1, [1u8]).unwrap();
+        r.flush_wal(true).unwrap();
+        for cf in [BLOCK_INDEX_BY_HASH_CF, BLOCK_INDEX_CF, BLOCKS_CF, META_CF] {
+            r.flush_cf(r.cf_handle(cf).unwrap()).unwrap();
+        }
+        drop(db);
+        std::fs::write(out.join("headers.json"), format!("[\n{}\n]\n", rows.join(",\n"))).unwrap();
     }
 }

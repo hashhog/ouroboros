@@ -441,3 +441,53 @@ def test_block_sync_tick_asks_peers_and_fills_through_handle_headers(tmp_path):
         assert e[4] is not None and bytes(e[4]) == HEADERS[h], h
     server = server_for(bdb, str(tmp_path))
     assert getblockheader(server, 77, False) == CHAIN[77]["header_hex"]
+
+
+LOCAL = FIXTURE.parent / "local-bodies.tar.xz"
+
+
+def test_corrupted_stored_block_is_counted_and_not_written(tmp_path):
+    """Local-body source, on the mainnet shape after the v2 deploy (v2 marker
+    present, so open migrates nothing): 20 header-less entries; heights 5, 6
+    and 9 have their body, 7's body has one transaction byte flipped (its
+    header still hashes to the key) and 8's is truncated.  The fill takes 5,
+    6 and 9 from their bodies (nTx from the body), counts 7 and 8 as
+    corrupt_body and leaves those two entries byte-for-byte as they were,
+    and takes the rest from the peer.  Fixture and generator:
+    fixtures/index_header_fill/ (``make_index_fill_fixture`` in
+    ``index_header_fill_tests.rs``)."""
+    import tarfile
+
+    want_sha = (FIXTURE.parent / "local-bodies.SHA256").read_text().split()[0]
+    assert hashlib.sha256(LOCAL.read_bytes()).hexdigest() == want_sha
+    with tarfile.open(LOCAL) as tar:
+        tar.extractall(tmp_path, filter="data")
+    rows = json.loads((tmp_path / "headers.json").read_text())
+    hdrs = [bytes.fromhex(r["header"]) for r in rows]
+    keys = [bytes.fromhex(r["hash"]) for r in rows]
+    from ouroboros.database import BlockchainDatabase
+
+    bdb = BlockchainDatabase(str(tmp_path / "db"))
+    assert bdb._db.block_index_summary() == (20, 0, 20), "setup: every entry legacy"
+    before = {h: tuple(bdb._db.get_block_index_entry(keys[h])[:4]) for h in range(20)}
+    fill = new_fill(bdb)
+    replies = 0
+    while not fill.is_complete():
+        fill.step()
+        if fill.waiting_on_peer():
+            loc = fill.locator()
+            start = keys.index(loc[0]) + 1 if loc else 0
+            fill.accept(hdrs[start:start + (2000 if loc else 1)])
+            replies += 1
+        assert replies < 100
+    c = fill.counts
+    assert (c["from_body"], c["corrupt_body"], c["attached"]) == (3, 2, 15), c
+    for h in range(20):
+        e = bdb._db.get_block_index_entry(keys[h])
+        assert tuple(e[:4]) == before[h], f"height {h}: metadata changed"
+        if h in (7, 8):
+            assert e[4] is None, f"height {h}: a corrupted stored block must not be written"
+        else:
+            assert e[4] is not None and bytes(e[4]) == hdrs[h], h
+            want_ntx = rows[h]["n_tx"] if h in (5, 6, 9) else 0
+            assert e[5] == want_ntx, f"height {h}: nTx {e[5]} != {want_ntx}"

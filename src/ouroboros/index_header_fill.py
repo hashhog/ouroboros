@@ -229,8 +229,10 @@ class IndexHeaderFill:
         counts = self.db.attach_index_headers(mine, resume, True)
         self._add(counts)
         self._log_refusals(counts, "peer headers")
-        # A run member whose header did not verify stays in the run (the
-        # caller re-asks another peer); attached or already-v2 members leave.
+        # Members the reply did not serve stay in the run (the caller asks
+        # another peer).  A served member that failed attach's checks
+        # (unlinked) is counted and leaves the run: the same header from any
+        # peer would fail the same way, and its entry is left unchanged.
         if remaining:
             still = []
             for h, k in remaining:

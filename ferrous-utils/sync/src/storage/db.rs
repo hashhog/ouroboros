@@ -118,6 +118,16 @@ pub struct IndexHeaderFillStep {
     pub peer_run: Vec<(u32, [u8; 32])>,
 }
 
+/// What a local store holds for a header-less hash-index entry.
+enum LocalIndexHeader {
+    /// A verified header: `(header, nTx, from_body)`.
+    Found([u8; 80], u32, bool),
+    /// A stored header or body that does not verify: leave the entry alone.
+    Refused,
+    /// Nothing stored locally: a peer has to serve it.
+    NoSource,
+}
+
 /// Counts from `BlockchainDB::attach_index_headers`.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub struct IndexHeaderAttach {
@@ -676,39 +686,43 @@ impl BlockchainDB {
     /// BLOCKS_CF.  A body is used only if it parses and its transactions
     /// hash to the header's merkle root, so a corrupted stored block never
     /// supplies a header or an nTx.  Counts the refusals in `step`.
-    /// Returns `(header, nTx, from_body)`.
+    /// An entry whose local store holds a header or body that does not
+    /// verify is `Refused`: it is left as it is and NOT handed to a peer, so
+    /// a damaged store shows up in the counts instead of being papered over.
     fn local_index_header(
         &self,
         hash: &[u8; 32],
         step: &mut IndexHeaderFillStep,
-    ) -> Result<Option<([u8; 80], u32, bool)>> {
+    ) -> Result<LocalIndexHeader> {
+        let mut refused = false;
         if let Some((header, n_tx)) = self.get_raw_header(hash)? {
             if header_hashes_to(&header, hash) {
-                return Ok(Some((header, n_tx, false)));
+                return Ok(LocalIndexHeader::Found(header, n_tx, false));
             }
             step.hash_mismatch += 1;
+            refused = true;
         }
         let blocks_cf = self.db.cf_handle(BLOCKS_CF)
             .ok_or_else(|| DbError::ColumnFamilyNotFound(BLOCKS_CF.to_string()))?;
         if let Some(body) = self.db.get_pinned_cf(blocks_cf, hash)? {
             if body.len() < 80 || !header_hashes_to(&body[0..80], hash) {
                 step.hash_mismatch += 1;
-                return Ok(None);
+                return Ok(LocalIndexHeader::Refused);
             }
             match bitcoin::consensus::deserialize::<bitcoin::Block>(&body) {
                 Ok(block) if block.check_merkle_root() => {
                     let mut header = [0u8; 80];
                     header.copy_from_slice(&body[0..80]);
                     let n_tx = u32::try_from(block.txdata.len()).unwrap_or(0);
-                    return Ok(Some((header, n_tx, true)));
+                    return Ok(LocalIndexHeader::Found(header, n_tx, true));
                 }
                 _ => {
                     step.corrupt_body += 1;
-                    return Ok(None);
+                    return Ok(LocalIndexHeader::Refused);
                 }
             }
         }
-        Ok(None)
+        Ok(if refused { LocalIndexHeader::Refused } else { LocalIndexHeader::NoSource })
     }
 
     /// True when `header`'s parent is in the hash index one height below
@@ -817,7 +831,8 @@ impl BlockchainDB {
                 step.already_v2 += 1;
             } else {
                 match self.local_index_header(&hash, &mut step)? {
-                    Some((header, n_tx, from_body)) => {
+                    LocalIndexHeader::Refused => {}
+                    LocalIndexHeader::Found(header, n_tx, from_body) => {
                         if self.header_links_at(&header, h)? {
                             let md = BlockMetadata::from_bytes(&value).map_err(|e| {
                                 DbError::InvalidData(format!("hash-index entry: bad BlockMetadata: {}", e))
@@ -831,7 +846,7 @@ impl BlockchainDB {
                             step.unlinked += 1;
                         }
                     }
-                    None => {
+                    LocalIndexHeader::NoSource => {
                         if max_peer_run > 0 {
                             let extends = match step.peer_run.last() {
                                 None => true,
@@ -922,7 +937,8 @@ impl BlockchainDB {
                 continue;
             }
             match self.local_index_header(&hash, &mut step)? {
-                Some((header, n_tx, from_body)) => {
+                LocalIndexHeader::Refused => {}
+                LocalIndexHeader::Found(header, n_tx, from_body) => {
                     if self.header_links_at(&header, md.height)? {
                         let md_bytes = md.to_bytes().map_err(|e| {
                             DbError::Serialization(SerializeError::Encode(format!("{}", e)))
@@ -933,7 +949,7 @@ impl BlockchainDB {
                         step.unlinked += 1;
                     }
                 }
-                None => step.no_source += 1,
+                LocalIndexHeader::NoSource => step.no_source += 1,
             }
         }
         step.next_key = last;

@@ -8051,8 +8051,11 @@ class BlockSync:
         peers = self.peer_manager.get_all_ready_peers()
         if not peers:
             return
-        others = [p for p in peers if p is not prev_peer]
-        peer = others[0] if others else peers[0]
+        # Rotate through EVERY ready peer: the one after the last asked, so
+        # two peers that never answer (e.g. in their own IBD) cannot hold
+        # the run while others could serve it.
+        idx = next((i for i, p in enumerate(peers) if p is prev_peer), -1)
+        peer = peers[(idx + 1) % len(peers)]
         try:
             msg = GetHeadersMessage(version=70015, locator_hashes=locator,
                                     hash_stop=fill.hash_stop())
