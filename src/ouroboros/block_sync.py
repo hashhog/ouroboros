@@ -784,6 +784,12 @@ class BlockSync:
         # satisfied. Populated lazily by _maybe_start_header_backfill.
         self._header_backfill = None
         self._backfill_done: bool = False
+        # Online backfill of the header into header-less block-index entries
+        # (ouroboros.index_header_fill): the #52 rows above carry no header,
+        # so getblockheader could not answer them.  Armed by
+        # _index_header_fill_tick once the block index is contiguous.
+        self._index_fill = None
+        self._index_fill_off: bool = False
         # True only once the block index is PROVEN contiguous from genesis
         # (survey found no gap, or a backfill committed).  Distinct from
         # ``_backfill_done``, which also latches on the give-up paths.  While
@@ -2188,6 +2194,8 @@ class BlockSync:
                     await self._maybe_start_header_backfill()
                     if self._header_backfill is not None:
                         await self._request_backfill_headers()
+                elif self._prebase_headers_complete and not self._index_fill_off:
+                    await self._index_header_fill_tick()
 
                 # Check if we're behind
                 best_hash, best_height = self.db.get_best_block()
@@ -5391,6 +5399,15 @@ class BlockSync:
                 if await self._consume_backfill_headers(raw_headers, peer):
                     return
 
+            # Online index header fill: a reply to its getheaders also starts
+            # far below the tip.  wants() is non-mutating.
+            _fill = self._index_fill
+            if _fill is not None and _fill.waiting_on_peer():
+                raw_headers = [h.serialize() for h in headers_msg.headers]
+                if _fill.wants(raw_headers):
+                    await self._consume_index_fill_headers(raw_headers, peer)
+                    return
+
             # Core: IsContinuationOfLowWorkHeadersSync (net_processing.cpp:3007)
             # runs BEFORE the headers are looked at as ordinary sync headers.
             # A peer in low-work PRESYNC is serving a chain that is NOT anchored
@@ -7968,6 +7985,99 @@ class BlockSync:
             "currently being SKIPPED. Walking headers to rebuild it.",
             start_height, end_height - 1, end_height - start_height,
         )
+
+    async def _index_header_fill_tick(self) -> None:
+        """One step of the online index header fill per sync_loop tick.
+
+        A local step (bounded: ``index_header_fill.STEP_MAX_SCAN`` entries,
+        ``STEP_BUDGET_MS`` ms) runs under the chain lock, so it never
+        interleaves with a connect, a reorg or invalidate/reconsider (the
+        drain hands the lock over between blocks).  While a run of entries
+        waits on a peer, the tick (re)sends its getheaders instead.  Never
+        raises: the fill is best effort and must not stall sync.
+        """
+        from ouroboros import index_header_fill as ihf
+
+        try:
+            fill = self._index_fill
+            if fill is None:
+                raw = getattr(self.db, "_db", None)
+                if not ihf.enabled() or raw is None or not ihf.supported(raw):
+                    self._index_fill_off = True
+                    return
+                fill = ihf.IndexHeaderFill(raw)
+                self._index_fill = fill
+                logger.info(
+                    "index header fill: starting at height %d (key pass %s)",
+                    fill.next_height, "done" if fill.key_done else "pending",
+                )
+            if fill.is_complete():
+                if not fill._logged_done:
+                    fill._logged_done = True
+                    logger.warning("index header fill COMPLETE: %s", fill.summary())
+                self._index_fill_off = True
+                return
+            if fill.waiting_on_peer():
+                await self._request_index_fill_headers(fill)
+                return
+            counts = await ihf.run_step(fill, self._chain_lock())
+            done = counts.get("from_headers", 0) + counts.get("from_body", 0)
+            if done:
+                logger.debug("index header fill: %d local headers, next height %d",
+                             done, fill.next_height)
+            if fill.waiting_on_peer():
+                await self._request_index_fill_headers(fill)
+        except Exception as exc:  # pragma: no cover - defensive
+            _now = time.time()
+            if _now - getattr(self, "_last_index_fill_err", 0.0) > 60.0:
+                self._last_index_fill_err = _now
+                logger.warning("index header fill: step failed (%s); retrying", exc)
+
+    async def _request_index_fill_headers(self, fill) -> None:
+        """Send the getheaders for the fill's outstanding run: one request in
+        flight, re-sent to ANOTHER peer after ``RESPONSE_TIME`` without a
+        reply (the #52 walk's rotation rule)."""
+        from ouroboros import index_header_fill as ihf
+
+        locator = fill.locator()
+        if locator is None:
+            return
+        now = time.time()
+        prev_peer = fill.req_peer
+        if locator == fill.req_locator and prev_peer is not None:
+            alive = not hasattr(prev_peer, "is_connected") or prev_peer.is_connected()
+            if alive and now - fill.req_time < ihf.RESPONSE_TIME:
+                return
+        peers = self.peer_manager.get_all_ready_peers()
+        if not peers:
+            return
+        others = [p for p in peers if p is not prev_peer]
+        peer = others[0] if others else peers[0]
+        try:
+            msg = GetHeadersMessage(version=70015, locator_hashes=locator,
+                                    hash_stop=fill.hash_stop())
+            network = getattr(self.peer_manager, "network", "mainnet")
+            await peer.send_message(msg.to_network_message(network))
+        except Exception as exc:
+            logger.debug("index header fill: getheaders send failed: %s", exc)
+            return
+        fill.req_locator, fill.req_time, fill.req_peer = list(locator), now, peer
+
+    async def _consume_index_fill_headers(self, raw_headers: list[bytes], peer) -> None:
+        from ouroboros import index_header_fill as ihf
+
+        fill = self._index_fill
+        try:
+            counts = await ihf.run_accept(fill, raw_headers, self._chain_lock())
+        except Exception as exc:
+            logger.warning("index header fill: attach failed (%s)", exc)
+            return
+        if fill.waiting_on_peer():
+            # The peer did not serve (all of) the run: ask someone else.
+            fill.req_locator = None
+            fill.req_peer = peer
+        if fill.counts["attached"] % 50000 < counts.get("attached", 0):
+            logger.info("index header fill: %s", fill.summary())
 
     # Core HEADERS_RESPONSE_TIME (net_processing.cpp:100): how long a sent
     # getheaders counts as in flight before the same request may be re-sent.

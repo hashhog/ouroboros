@@ -79,6 +79,60 @@ pub struct BlockIndexDryRun {
     pub extra_bytes: u64,
 }
 
+/// Counts and resume point from one step of the online hash-index header
+/// fill (`fill_index_headers_by_height` / `fill_index_headers_by_hash`).
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct IndexHeaderFillStep {
+    /// Entries (or heights) visited.
+    pub scanned: u64,
+    /// Already carried a header: left as they were.
+    pub already_v2: u64,
+    /// Upgraded with a verified header from HEADERS_CF.
+    pub from_headers: u64,
+    /// Upgraded with the header and tx count of a verified body.
+    pub from_body: u64,
+    /// A stored header (HEADERS_CF, or a body's first 80 bytes) hashed to
+    /// something other than the key: not used.
+    pub hash_mismatch: u64,
+    /// A body whose header hashes to the key but which does not parse or
+    /// whose transactions miss the header's merkle root: not used.
+    pub corrupt_body: u64,
+    /// A header whose parent is not the index entry one height below: not
+    /// written.
+    pub unlinked: u64,
+    /// Active-chain entries with no local header (a peer must serve it).
+    pub need_peer: u64,
+    /// Off-chain entries with no local header (by-key pass only).
+    pub no_source: u64,
+    /// Values too short to be a `BlockMetadata`.
+    pub malformed: u64,
+    /// Heights without a BLOCK_INDEX_CF row or hash-index entry.
+    pub no_entry: u64,
+    /// By-height walk: the next height to visit.
+    pub next_height: u32,
+    /// By-key pass: the last key visited.
+    pub next_key: Option<[u8; 32]>,
+    /// The walk reached the tip (by height) or the last key (by key).
+    pub done: bool,
+    /// By-height walk: the first run of consecutive heights needing a peer.
+    pub peer_run: Vec<(u32, [u8; 32])>,
+}
+
+/// Counts from `BlockchainDB::attach_index_headers`.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct IndexHeaderAttach {
+    /// Headers written into their entry.
+    pub attached: u64,
+    /// The entry already had a header (or the header repeated in the batch).
+    pub already_v2: u64,
+    /// No hash-index entry hashes to the header: not ours, not written.
+    pub unknown: u64,
+    /// The parent is not the entry one height below: not written.
+    pub unlinked: u64,
+    /// The entry's value is too short to be a `BlockMetadata`.
+    pub malformed: u64,
+}
+
 /// One hash-index entry: what Core keeps in a `CBlockIndex` for this block.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BlockIndexEntry {
@@ -615,6 +669,348 @@ impl BlockchainDB {
             Ok(())
         })?;
         Ok(BlockIndexDryRun { migrated, ntx_reconciled, stats, extra_bytes })
+    }
+
+    /// A header this node holds locally for the hash-index entry `hash`,
+    /// verified against the hash: HEADERS_CF first, then the body in
+    /// BLOCKS_CF.  A body is used only if it parses and its transactions
+    /// hash to the header's merkle root, so a corrupted stored block never
+    /// supplies a header or an nTx.  Counts the refusals in `step`.
+    /// Returns `(header, nTx, from_body)`.
+    fn local_index_header(
+        &self,
+        hash: &[u8; 32],
+        step: &mut IndexHeaderFillStep,
+    ) -> Result<Option<([u8; 80], u32, bool)>> {
+        if let Some((header, n_tx)) = self.get_raw_header(hash)? {
+            if header_hashes_to(&header, hash) {
+                return Ok(Some((header, n_tx, false)));
+            }
+            step.hash_mismatch += 1;
+        }
+        let blocks_cf = self.db.cf_handle(BLOCKS_CF)
+            .ok_or_else(|| DbError::ColumnFamilyNotFound(BLOCKS_CF.to_string()))?;
+        if let Some(body) = self.db.get_pinned_cf(blocks_cf, hash)? {
+            if body.len() < 80 || !header_hashes_to(&body[0..80], hash) {
+                step.hash_mismatch += 1;
+                return Ok(None);
+            }
+            match bitcoin::consensus::deserialize::<bitcoin::Block>(&body) {
+                Ok(block) if block.check_merkle_root() => {
+                    let mut header = [0u8; 80];
+                    header.copy_from_slice(&body[0..80]);
+                    let n_tx = u32::try_from(block.txdata.len()).unwrap_or(0);
+                    return Ok(Some((header, n_tx, true)));
+                }
+                _ => {
+                    step.corrupt_body += 1;
+                    return Ok(None);
+                }
+            }
+        }
+        Ok(None)
+    }
+
+    /// True when `header`'s parent is in the hash index one height below
+    /// `height` (genesis: an all-zero parent at height 0).  Core: a
+    /// `CBlockIndex` is only ever added with `pprev` set to its parent's
+    /// entry (`AddToBlockIndex`), so nHeight = pprev->nHeight + 1.
+    fn header_links_at(&self, header: &[u8; 80], height: u32) -> Result<bool> {
+        let prev = &header[4..36];
+        if height == 0 {
+            return Ok(prev.iter().all(|&b| b == 0));
+        }
+        let mut p = [0u8; 32];
+        p.copy_from_slice(prev);
+        Ok(matches!(self.get_block_metadata_by_hash(&p)?, Some(m) if m.height + 1 == height))
+    }
+
+    /// Resume points of the online header fill: `(height, key, key_pass_done)`.
+    pub fn index_header_fill_cursor(&self) -> Result<(Option<u32>, Option<[u8; 32]>, bool)> {
+        let meta_cf = self.db.cf_handle(META_CF)
+            .ok_or_else(|| DbError::ColumnFamilyNotFound(META_CF.to_string()))?;
+        let height = self.db.get_cf(meta_cf, meta_keys::INDEX_HEADER_FILL_HEIGHT)?
+            .filter(|v| v.len() == 4)
+            .map(|v| u32::from_le_bytes([v[0], v[1], v[2], v[3]]));
+        let key = self.db.get_cf(meta_cf, meta_keys::INDEX_HEADER_FILL_KEY)?
+            .filter(|v| v.len() == 32)
+            .map(|v| {
+                let mut k = [0u8; 32];
+                k.copy_from_slice(&v);
+                k
+            });
+        let done = self.db.get_pinned_cf(meta_cf, meta_keys::INDEX_HEADER_FILL_KEY_DONE)?.is_some();
+        Ok((height, key, done))
+    }
+
+    /// One bounded step of the online header fill over the ACTIVE chain,
+    /// in height order from `from_height` up to the tip.
+    ///
+    /// Core answers `getblockheader` for every entry of its block index,
+    /// because a `CBlockIndex` always holds the header fields.  ouroboros'
+    /// hash-index entries written by the assumeUTXO header backfill (and any
+    /// other legacy writer) carry only height / chainwork / time / status,
+    /// and the v2 migration could not upgrade them where no store held the
+    /// header.  This step upgrades such entries in place to v2:
+    ///
+    /// - a local header (HEADERS_CF, or a body that verifies; see
+    ///   `local_index_header`) whose sha256d is the key and whose parent is
+    ///   the index entry one height below is written with the entry's own
+    ///   44 metadata bytes unchanged;
+    /// - an entry with no local header is a `need_peer`; the first run of
+    ///   consecutive such heights (at most `max_peer_run`) is returned in
+    ///   `peer_run` and the walk stops at the first height that would break
+    ///   the run, so the caller can fetch the run with one `getheaders`
+    ///   and resume after it.  `max_peer_run == 0` never stops (dry run);
+    /// - a header that fails a check is counted and never written.
+    ///
+    /// Stops after `max_scan` heights or `budget_ms` milliseconds.  With
+    /// `write`, the upgrades and the resume height
+    /// (`meta_keys::INDEX_HEADER_FILL_HEIGHT` = the lowest height still
+    /// waiting on a peer, else where the walk stopped) are one atomic batch,
+    /// so a kill at any point loses at most the step in flight.  Without
+    /// `write` nothing is written (dry run; also valid on a secondary).
+    pub fn fill_index_headers_by_height(
+        &self,
+        from_height: u32,
+        max_scan: u32,
+        budget_ms: u64,
+        max_peer_run: usize,
+        write: bool,
+    ) -> Result<IndexHeaderFillStep> {
+        let started = std::time::Instant::now();
+        let index_cf = self.db.cf_handle(BLOCK_INDEX_BY_HASH_CF)
+            .ok_or_else(|| DbError::ColumnFamilyNotFound(BLOCK_INDEX_BY_HASH_CF.to_string()))?;
+        let meta_cf = self.db.cf_handle(META_CF)
+            .ok_or_else(|| DbError::ColumnFamilyNotFound(META_CF.to_string()))?;
+        let (_, tip) = self.get_best_block()?;
+        let mut step = IndexHeaderFillStep::default();
+        let mut batch = WriteBatch::default();
+        let mut h = from_height;
+        let mut scanned = 0u32;
+        while h <= tip && scanned < max_scan
+            && (budget_ms == 0 || (started.elapsed().as_millis() as u64) < budget_ms)
+        {
+            let hash = match self.get_block_hash_by_height(h)? {
+                Some(x) => x,
+                None => {
+                    step.scanned += 1;
+                    step.no_entry += 1;
+                    scanned += 1;
+                    h += 1;
+                    continue;
+                }
+            };
+            let value = match self.db.get_pinned_cf(index_cf, hash)? {
+                Some(v) => v.to_vec(),
+                None => {
+                    step.scanned += 1;
+                    step.no_entry += 1;
+                    scanned += 1;
+                    h += 1;
+                    continue;
+                }
+            };
+            if value.len() < 40 {
+                step.malformed += 1;
+            } else if value.len() >= BLOCK_INDEX_ENTRY_V2_LEN {
+                step.already_v2 += 1;
+            } else {
+                match self.local_index_header(&hash, &mut step)? {
+                    Some((header, n_tx, from_body)) => {
+                        if self.header_links_at(&header, h)? {
+                            let md = BlockMetadata::from_bytes(&value).map_err(|e| {
+                                DbError::InvalidData(format!("hash-index entry: bad BlockMetadata: {}", e))
+                            })?;
+                            let md_bytes = md.to_bytes().map_err(|e| {
+                                DbError::Serialization(SerializeError::Encode(format!("{}", e)))
+                            })?;
+                            batch.put_cf(index_cf, hash, v2_value(&md_bytes, &header, n_tx));
+                            if from_body { step.from_body += 1 } else { step.from_headers += 1 }
+                        } else {
+                            step.unlinked += 1;
+                        }
+                    }
+                    None => {
+                        if max_peer_run > 0 {
+                            let extends = match step.peer_run.last() {
+                                None => true,
+                                Some((last, _)) => *last + 1 == h && step.peer_run.len() < max_peer_run,
+                            };
+                            if !extends {
+                                break; // resume here once the run is served
+                            }
+                            step.peer_run.push((h, hash));
+                        }
+                        step.need_peer += 1;
+                    }
+                }
+            }
+            step.scanned += 1;
+            scanned += 1;
+            h += 1;
+        }
+        step.next_height = h;
+        step.done = h > tip;
+        if write {
+            let resume = step.peer_run.first().map(|(ph, _)| *ph).unwrap_or(h);
+            batch.put_cf(meta_cf, meta_keys::INDEX_HEADER_FILL_HEIGHT, resume.to_le_bytes());
+            self.db.write(batch)?;
+        }
+        Ok(step)
+    }
+
+    /// One bounded step of the online header fill over EVERY hash-index key
+    /// (in key order, after `start_after`): reaches the entries that are not
+    /// on the active chain (side branches, invalidated blocks), which the
+    /// by-height walk cannot see.  Only local headers are used (a peer
+    /// cannot be asked for a stale branch by locator); an off-chain entry
+    /// without one is counted in `no_source`.  Active-chain entries are left
+    /// to the by-height walk and counted in `need_peer` here (untouched).  `next_key` is where the
+    /// next step starts; `done` once the end is reached.  With `write`, the
+    /// upgrades, `INDEX_HEADER_FILL_KEY` and (at the end)
+    /// `INDEX_HEADER_FILL_KEY_DONE` are one atomic batch.
+    pub fn fill_index_headers_by_hash(
+        &self,
+        start_after: Option<[u8; 32]>,
+        max_scan: u32,
+        budget_ms: u64,
+        write: bool,
+    ) -> Result<IndexHeaderFillStep> {
+        let started = std::time::Instant::now();
+        let index_cf = self.db.cf_handle(BLOCK_INDEX_BY_HASH_CF)
+            .ok_or_else(|| DbError::ColumnFamilyNotFound(BLOCK_INDEX_BY_HASH_CF.to_string()))?;
+        let meta_cf = self.db.cf_handle(META_CF)
+            .ok_or_else(|| DbError::ColumnFamilyNotFound(META_CF.to_string()))?;
+        let mut step = IndexHeaderFillStep::default();
+        let mut batch = WriteBatch::default();
+        let mode = match start_after.as_ref() {
+            Some(k) => IteratorMode::From(k, rocksdb::Direction::Forward),
+            None => IteratorMode::Start,
+        };
+        let mut last: Option<[u8; 32]> = start_after;
+        let mut reached_end = true;
+        for item in self.db.iterator_cf(index_cf, mode) {
+            let (key, value) = item?;
+            if start_after.as_ref().map_or(false, |k| &key[..] == &k[..]) {
+                continue;
+            }
+            if step.scanned >= max_scan as u64
+                || (budget_ms != 0 && (started.elapsed().as_millis() as u64) >= budget_ms)
+            {
+                reached_end = false;
+                break;
+            }
+            step.scanned += 1;
+            if key.len() != 32 || value.len() < 40 {
+                step.malformed += 1;
+                continue;
+            }
+            let mut hash = [0u8; 32];
+            hash.copy_from_slice(&key);
+            last = Some(hash);
+            if value.len() >= BLOCK_INDEX_ENTRY_V2_LEN {
+                step.already_v2 += 1;
+                continue;
+            }
+            let md = BlockMetadata::from_bytes(&value).map_err(|e| {
+                DbError::InvalidData(format!("hash-index entry: bad BlockMetadata: {}", e))
+            })?;
+            if self.get_block_hash_by_height(md.height)?.as_ref() == Some(&hash) {
+                // Active chain: the by-height walk owns it (and can ask a peer).
+                step.need_peer += 1;
+                continue;
+            }
+            match self.local_index_header(&hash, &mut step)? {
+                Some((header, n_tx, from_body)) => {
+                    if self.header_links_at(&header, md.height)? {
+                        let md_bytes = md.to_bytes().map_err(|e| {
+                            DbError::Serialization(SerializeError::Encode(format!("{}", e)))
+                        })?;
+                        batch.put_cf(index_cf, hash, v2_value(&md_bytes, &header, n_tx));
+                        if from_body { step.from_body += 1 } else { step.from_headers += 1 }
+                    } else {
+                        step.unlinked += 1;
+                    }
+                }
+                None => step.no_source += 1,
+            }
+        }
+        step.next_key = last;
+        step.done = reached_end;
+        if write {
+            if let Some(k) = last {
+                batch.put_cf(meta_cf, meta_keys::INDEX_HEADER_FILL_KEY, k);
+            }
+            if reached_end {
+                batch.put_cf(meta_cf, meta_keys::INDEX_HEADER_FILL_KEY_DONE, [1u8]);
+            }
+            self.db.write(batch)?;
+        }
+        Ok(step)
+    }
+
+    /// Attach headers a peer served to the hash-index entries they belong
+    /// to.  A header is written only when its sha256d is an existing legacy
+    /// entry's key (so it IS that block's header) and its parent is the
+    /// entry one height below; its 44 metadata bytes are kept and nTx is 0
+    /// (Core: nTx stays 0 until the block's transactions are received).
+    /// Anything else is counted, never written.  With `write`, the upgrades
+    /// and `resume_height` (if given) are one atomic batch.
+    pub fn attach_index_headers(
+        &self,
+        headers: &[[u8; 80]],
+        resume_height: Option<u32>,
+        write: bool,
+    ) -> Result<IndexHeaderAttach> {
+        let index_cf = self.db.cf_handle(BLOCK_INDEX_BY_HASH_CF)
+            .ok_or_else(|| DbError::ColumnFamilyNotFound(BLOCK_INDEX_BY_HASH_CF.to_string()))?;
+        let meta_cf = self.db.cf_handle(META_CF)
+            .ok_or_else(|| DbError::ColumnFamilyNotFound(META_CF.to_string()))?;
+        let mut out = IndexHeaderAttach::default();
+        let mut batch = WriteBatch::default();
+        let mut seen = std::collections::HashSet::new();
+        for header in headers {
+            let hash = bitcoin::hashes::sha256d::Hash::hash(header).to_byte_array();
+            if !seen.insert(hash) {
+                out.already_v2 += 1;
+                continue;
+            }
+            let value = match self.db.get_pinned_cf(index_cf, hash)? {
+                Some(v) => v.to_vec(),
+                None => {
+                    out.unknown += 1;
+                    continue;
+                }
+            };
+            if value.len() < 40 {
+                out.malformed += 1;
+                continue;
+            }
+            if value.len() >= BLOCK_INDEX_ENTRY_V2_LEN {
+                out.already_v2 += 1;
+                continue;
+            }
+            let md = BlockMetadata::from_bytes(&value).map_err(|e| {
+                DbError::InvalidData(format!("hash-index entry: bad BlockMetadata: {}", e))
+            })?;
+            if !self.header_links_at(header, md.height)? {
+                out.unlinked += 1;
+                continue;
+            }
+            let md_bytes = md.to_bytes().map_err(|e| {
+                DbError::Serialization(SerializeError::Encode(format!("{}", e)))
+            })?;
+            batch.put_cf(index_cf, hash, v2_value(&md_bytes, header, 0));
+            out.attached += 1;
+        }
+        if write {
+            if let Some(r) = resume_height {
+                batch.put_cf(meta_cf, meta_keys::INDEX_HEADER_FILL_HEIGHT, r.to_le_bytes());
+            }
+            self.db.write(batch)?;
+        }
+        Ok(out)
     }
 
     /// The classification pass shared by `migrate_block_index_v2` and
