@@ -593,6 +593,70 @@ class BlockchainDatabase:
             height=None,
         )
 
+    def get_index_header_bytes(self, block_hash: bytes) -> bytes | None:
+        """The 80-byte header of a block-index entry, whether or not its body
+        is held: Core's ``CBlockIndex::GetBlockHeader()``.
+
+        Unlike :meth:`get_block_header`, which answers only for a stored body,
+        this reads the stores that carry headers without the block: the v2
+        hash-index entry (BLOCK_INDEX_BY_HASH_CF — written by the v2 migration
+        and the online index header fill, the only header source for an
+        assumeUTXO node's pre-snapshot rows), then HEADERS_CF, then the body —
+        the stores ``getblockheader`` reads.  A candidate is returned only if
+        it hashes to ``block_hash``, so the order cannot change the answer.
+        A store whose read raises is skipped, as in ``getblockheader``.  None
+        when no store holds a header for the hash.
+        """
+        if len(block_hash) != 32:
+            raise ValueError("Block hash must be 32 bytes")
+        block_hash = bytes(block_hash)
+
+        def _verified(raw) -> bytes | None:
+            if raw is None:
+                return None
+            hdr = bytes(raw[:80])
+            if len(hdr) != 80:
+                return None
+            if hashlib.sha256(hashlib.sha256(hdr).digest()).digest() != block_hash:
+                return None
+            return hdr
+
+        entry_fn = getattr(self._db, "get_block_index_entry", None)
+        if entry_fn is not None:
+            try:
+                entry = entry_fn(block_hash)
+            except Exception:
+                entry = None
+            if entry is not None:
+                hdr = _verified(entry[4])
+                if hdr is not None:
+                    return hdr
+
+        raw_fn = getattr(self._db, "get_raw_header", None)
+        if raw_fn is not None:
+            try:
+                raw = raw_fn(block_hash)
+            except Exception:
+                raw = None
+            if raw is not None:
+                hdr = _verified(raw[0])
+                if hdr is not None:
+                    return hdr
+
+        try:
+            block = self.get_block_header(block_hash)
+        except Exception:
+            block = None
+        if block is None:
+            return None
+        return _verified(
+            int(block.version).to_bytes(4, "little", signed=True)
+            + bytes(block.prev_blockhash) + bytes(block.merkle_root)
+            + int(block.timestamp).to_bytes(4, "little")
+            + int(block.bits).to_bytes(4, "little")
+            + int(block.nonce).to_bytes(4, "little")
+        )
+
     def get_block_height_by_hash(self, block_hash: bytes) -> int | None:
         """Height of any known block (active chain or fork) from the hash index.
 
