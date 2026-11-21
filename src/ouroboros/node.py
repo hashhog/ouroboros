@@ -2299,8 +2299,17 @@ class BitcoinNode:
                     # mainnet-sized blocks.  Core copies them out of
                     # CBlockIndex (ProcessGetHeaders).  The batch still runs
                     # in one worker thread so RPC + peer dispatch continue.
+                    #
+                    # The header comes from the block index, not the body
+                    # (get_index_header_bytes: v2 hash-index header, then
+                    # HEADERS_CF, then the body).  This used to be
+                    # get_block_header, which is None for a block without a
+                    # body, so an assumeUTXO node answered every locator in
+                    # its pre-snapshot range with an empty reply and a
+                    # genesis locator with only the headers below the first
+                    # missing body.
                     _, best_height = self.db.get_best_block()
-                    hash_stop = getheaders.hash_stop
+                    hash_stop = bytes(getheaders.hash_stop)
 
                     def _collect_headers():
                         out = []
@@ -2308,20 +2317,14 @@ class BitcoinNode:
                             block_hash = self.db.get_block_hash_by_height(h)
                             if block_hash is None:
                                 break
-                            block = self.db.get_block_header(block_hash)
-                            if block is None:
+                            block_hash = bytes(block_hash)
+                            raw = self.db.get_index_header_bytes(block_hash)
+                            if raw is None:
                                 break
-                            out.append(BlockHeader(
-                                version=block.version,
-                                prev_blockhash=block.prev_blockhash,
-                                merkle_root=block.merkle_root,
-                                timestamp=block.timestamp,
-                                bits=block.bits,
-                                nonce=block.nonce,
-                            ))
+                            out.append(BlockHeader.from_payload(raw)[0])
 
                             # Stop if we've reached hash_stop.
-                            if hash_stop != b'\x00' * 32 and block.hash == hash_stop:
+                            if hash_stop != b'\x00' * 32 and block_hash == hash_stop:
                                 break
                         return out
 
