@@ -166,7 +166,6 @@ class TestReceiverCredit:
             _run(original, _make_receiver_ctx(receiver, utxos_value=[40_000]), query)
         assert exc.value.code == payjoin.ERR_ORIGINAL_PSBT_REJECTED
 
-
     def test_fee_output_index_on_second_receiver_output_refused(self):
         """Same, when the Original pays the receiver script twice and the
         sender names the second one: matched by script, not by index."""
