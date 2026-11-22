@@ -101,36 +101,111 @@ class _FakeWriter:
         self.closed = True
 
 
-def test_inbound_gate_refuses_discouraged_address_on_a_new_port(tmp_path, monkeypatch):
-    """The gate must still see an automatically punished address: it moved
-    from ``banned`` to ``discouraged``, so a gate that only consulted
-    ``is_banned`` would let it straight back in."""
-    import asyncio
-
-    from ouroboros.p2p import PeerManager
-
+def _inbound_pm(tmp_path, monkeypatch, max_inbound=None):
+    """A listen-less PeerManager whose handshake only records who reached it
+    (and whether the Peer was marked prefer_evict when it got there)."""
     from ouroboros import p2p as p2p_mod
+    from ouroboros.p2p import PeerManager
 
     handshakes = []
 
     async def fake_accept(self, reader, writer, start_height):
-        handshakes.append(self.host)
+        handshakes.append((self.host, getattr(self, "prefer_evict", False)))
         return False
 
     monkeypatch.setattr(p2p_mod.Peer, "accept_inbound", fake_accept)
+    pm = PeerManager(network="regtest", data_dir=str(tmp_path), listen=False,
+                     max_inbound=max_inbound)
+    return pm, handshakes
 
-    pm = PeerManager(network="regtest", data_dir=str(tmp_path), listen=False)
-    # Control: an unpunished address does reach the handshake.
-    asyncio.run(pm._handle_inbound_connection(None, _FakeWriter("198.51.100.41", 1)))
-    assert handshakes == ["198.51.100.41"]
+
+def _inbound(pm, host, port):
+    import asyncio
+
+    w = _FakeWriter(host, port)
+    asyncio.run(pm._handle_inbound_connection(None, w))
+    return w
+
+
+def test_inbound_discouraged_with_free_slots_reaches_handshake_prefer_evict(
+        tmp_path, monkeypatch):
+    """Core net.cpp AcceptConnection drops a discouraged address only when
+    ``nInbound + 1 >= m_max_inbound``; with room left it is accepted and the
+    CNode gets ``prefer_evict = discouraged``.  The address moved from
+    ``banned`` to ``discouraged``, so it must not be refused like a ban."""
+    pm, handshakes = _inbound_pm(tmp_path, monkeypatch)
+    assert not pm.inbound_peers
+    # Control: an unpunished address reaches the handshake, not prefer_evict.
+    _inbound(pm, "198.51.100.41", 1)
+    assert handshakes == [("198.51.100.41", False)]
 
     assert pm.misbehaving("198.51.100.40:51000", 100, "invalid block")
+    assert pm.ban_manager.is_discouraged("198.51.100.40")
+    assert not pm.ban_manager.is_banned("198.51.100.40")
     assert not (tmp_path / "bans.json").exists()
-    w = _FakeWriter("198.51.100.40", 52000)
-    asyncio.run(pm._handle_inbound_connection(None, w))
+    _inbound(pm, "198.51.100.40", 52000)
+    assert handshakes[-1] == ("198.51.100.40", True), (
+        "discouraged inbound with free slots must reach the handshake, "
+        "marked prefer_evict")
+
+
+def test_inbound_discouraged_refused_when_inbound_almost_full(
+        tmp_path, monkeypatch):
+    """``len(inbound_peers) + pending + 1 >= max_inbound``: the discouraged
+    address is closed before the handshake, while an unpunished address at
+    the same fill still gets in (control)."""
+    from types import SimpleNamespace
+
+    pm, handshakes = _inbound_pm(tmp_path, monkeypatch, max_inbound=2)
+    pm.inbound_peers["192.0.2.1:1"] = SimpleNamespace(
+        host="192.0.2.1", is_connected=lambda: True)
+    assert pm.misbehaving("198.51.100.40:51000", 100, "invalid block")
+    w = _inbound(pm, "198.51.100.40", 52000)
     assert w.closed
-    assert handshakes == ["198.51.100.41"], (
-        "discouraged address must be refused at the inbound gate, before the handshake")
+    assert handshakes == [], "discouraged inbound must be dropped when almost full"
+    # Control: same fill, not discouraged -> handshake.
+    _inbound(pm, "203.0.113.7", 3)
+    assert handshakes == [("203.0.113.7", False)]
+
+
+def test_inbound_setban_address_refused_even_with_free_slots(
+        tmp_path, monkeypatch):
+    """A banned (setban) address is always dropped (Core: ``banned`` check
+    has no slot condition), whatever port it arrives from."""
+    pm, handshakes = _inbound_pm(tmp_path, monkeypatch)
+    assert not pm.inbound_peers
+    pm.ban_manager.setban("198.51.100.60", "add")
+    w = _inbound(pm, "198.51.100.60", 40000)
+    assert w.closed
+    assert handshakes == []
+
+
+def _cand(i, prefer=False):
+    from types import SimpleNamespace
+
+    return SimpleNamespace(host="10.0.0.1", latency=0, score=0,
+                           last_block_time=0, connected_at=float(i),
+                           prefer_evict=prefer, is_connected=lambda: True)
+
+
+def test_eviction_prefers_prefer_evict_after_protections(tmp_path):
+    """Core eviction.cpp SelectNodeToEvict: after every protection, if any
+    remaining candidate has prefer_evict, only those stay eligible."""
+    from ouroboros.p2p import PeerManager
+
+    pm = PeerManager(network="regtest", data_dir=str(tmp_path), listen=False)
+    # Insert newest first so the stable-sort protections take the newest;
+    # 30 peers leave peers 0..12 unprotected, oldest = 0.
+    for i in reversed(range(30)):
+        pm.inbound_peers[f"10.0.0.1:{i}"] = _cand(i)
+    assert pm._select_eviction_candidate() == "10.0.0.1:0"  # control
+    pm.inbound_peers["10.0.0.1:5"].prefer_evict = True
+    assert pm._select_eviction_candidate() == "10.0.0.1:5", (
+        "an unprotected prefer_evict (discouraged) inbound must be evicted first")
+    # A prefer_evict peer inside a protected group is still protected.
+    pm.inbound_peers["10.0.0.1:5"].prefer_evict = False
+    pm.inbound_peers["10.0.0.1:29"].prefer_evict = True
+    assert pm._select_eviction_candidate() == "10.0.0.1:0"
 
 
 def test_clearbanned_clears_bans_but_not_discouragement(tmp_path):
