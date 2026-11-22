@@ -28,7 +28,7 @@ Gates:
   G10  No CachingTransactionSignatureChecker equivalent
   G11  Only one cache (SigCache); no dual-cache (signature + script execution)
   G12  SigCache: shared_mutex absent (Python threading.Lock not shared reader)
-  G13  No PrecomputedTransactionData equivalent (no upfront Taproot batch setup)
+  G13  (FIXED) PrecomputedTransactionData equivalent (tx-wide sighash hashes once per tx)
   G14  Rust ScriptInterpreter never called from Rust block validation path
   G15  Rust verify_signature_in_script: P2SH/P2WPKH/P2WSH return Ok(false) stub
   G16  Rust verify_witness: complete placeholder (Ok(false) unconditionally)
@@ -575,38 +575,33 @@ class TestG12LockGranularity(unittest.TestCase):
 # ---------------------------------------------------------------------------
 class TestG13NoPrecomputedTxData(unittest.TestCase):
     """
-    BUG-G13: No PrecomputedTransactionData equivalent.
+    G13 (FIXED): PrecomputedTransactionData equivalent.
 
-    Core (hash.h / interpreter.cpp): PrecomputedTransactionData is constructed
-    once per tx and caches the serialized hash midstates needed for BIP-143
-    (SegWit v0) and BIP-341 (Taproot) sighash computation.  Building it once
-    amortises the SHA256 work across all inputs.  ConnectBlock pre-allocates
-    txsdata(block.vtx.size()) before the input loop.
+    Core (interpreter.cpp): PrecomputedTransactionData is constructed once
+    per tx and caches the BIP-143 (SegWit v0) and BIP-341 (Taproot)
+    tx-wide hashes; CheckInputScripts hands the same txdata to every input.
 
-    ouroboros: script.py passes input_amounts and input_script_pubkeys as lists
-    to verify() but re-derives sighash inside each call.  No PrecomputedTxData,
-    no amortised midstate caching.  For Taproot txs with many inputs (e.g. CTV
-    vaults, batch spends) this means N redundant SHA256 over all outputs.
+    ouroboros used to re-derive hashPrevouts/hashSequence/hashOutputs and
+    sha_* inside every sighash call (N redundant SHA256 over all outputs
+    per signature check).  script.py now has PrecomputedTransactionData,
+    and validation.py builds one per tx for its input checks.  Counting
+    tests: tests/test_cffix_sighash_precompute.py.
     """
 
     def test_no_precomputed_tx_data_class(self):
-        """No PrecomputedTransactionData class in script.py."""
+        """script.py has a PrecomputedTransactionData class (was: none)."""
         import ouroboros.script as script_mod
-        import inspect
-        src = inspect.getsource(script_mod)
-        self.assertNotIn("PrecomputedTransactionData", src)
-        self.assertNotIn("precomputed_txdata", src)
-        self.assertNotIn("txsdata", src)
+        self.assertTrue(hasattr(script_mod, "PrecomputedTransactionData"))
 
     def test_sighash_recomputed_per_input(self):
-        """Each verify() call recomputes the sighash — no amortised midstate."""
-        import ouroboros.script as script_mod
+        """validation.py passes one txdata per tx to each input's verify()."""
+        import ouroboros.validation as validation_mod
         import inspect
-        src = inspect.getsource(script_mod)
-        # Taproot sighash function called inside verify_taproot
-        self.assertIn("def verify_taproot", src)
-        # No Init(tx, spent_outputs) call — everything done per-input
-        self.assertNotIn(".Init(", src)
+        src = inspect.getsource(validation_mod)
+        self.assertTrue("PrecomputedTransactionData(" in src,
+                        "validation.py builds no PrecomputedTransactionData")
+        self.assertTrue("txdata=txdata" in src,
+                        "validation.py does not pass txdata to verify()")
 
 
 # ---------------------------------------------------------------------------
