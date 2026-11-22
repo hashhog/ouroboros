@@ -631,11 +631,15 @@ class AddressManager:
         addr_key = f"{host}:{port}"
         source_group = get_network_group(source.split(":")[0] if source else "")
 
-        # Already in tried - just update last_seen
+        # Already known: Core's AddSingle ORs the advertised services into
+        # the stored ones (addrman.cpp "add services") before any early
+        # return, so gossip can add flags but never strip them.
+        # Already in tried - update last_seen and services
         if addr_key in self._in_tried:
             info = self._addrs[addr_key]
             if timestamp > info.last_seen:
                 info.last_seen = timestamp
+            info.services |= services
             return False
 
         # Already in new - update if newer
@@ -643,8 +647,7 @@ class AddressManager:
             info = self._addrs[addr_key]
             if timestamp > info.last_seen:
                 info.last_seen = timestamp
-            if services:
-                info.services = services
+            info.services |= services
             return False
 
         # Create new address info
@@ -663,10 +666,20 @@ class AddressManager:
         bucket = self._get_new_bucket(info, source_group)
         position = self._get_bucket_position(info, is_new=True, bucket=bucket)
 
-        # Check if slot is occupied
+        # Check if slot is occupied. Core's AddSingle overwrites an occupied
+        # new-table slot only if the incumbent IsTerrible(), or it is
+        # referenced from more than one bucket while the newcomer (always
+        # nRefCount == 0 here) is in none. Otherwise the newcomer is
+        # dropped and the healthy incumbent stays.
         existing_key = self._new_buckets[bucket][position]
         if existing_key is not None:
-            # Evict existing entry
+            existing = self._addrs.get(existing_key)
+            if (
+                existing is not None
+                and not self._is_terrible(existing)
+                and existing.ref_count <= 1
+            ):
+                return False
             self._remove_from_new(existing_key, bucket, position)
 
         # Insert new address
