@@ -105,7 +105,7 @@ async def test_outbound_v2_garbage_drip_aborted_within_handshake_timeout(
 
 
 @pytest.mark.asyncio
-async def test_outbound_v2_deadline_covers_negotiation_and_version(
+async def test_outbound_v2_slow_drip_aborted_within_handshake_timeout(
         monkeypatch):
     # A coarser drip (0.5 s, the audit's few-seconds interval scaled to a
     # 2 s deadline): still ends on the overall deadline, not on a later
@@ -116,3 +116,41 @@ async def test_outbound_v2_deadline_covers_negotiation_and_version(
     assert ok is False
     assert peer.state == PeerState.DISCONNECTED
     assert elapsed < 2.0 + 1.0, elapsed
+
+
+@pytest.mark.asyncio
+async def test_outbound_v1_only_peer_still_flagged_for_v1_retry(monkeypatch):
+    # Control for the restructured failure path: a v1-only peer answering
+    # our key with the network magic must still end in the V2NegotiationFailed
+    # arm -- flagged for a fresh-socket v1 retry, disconnected, False -- and
+    # not be mistaken for a deadline expiry.
+    from ouroboros.peer import get_magic
+
+    monkeypatch.setattr(peer_mod, "HANDSHAKE_TIMEOUT", 5.0)
+    magic = get_magic("regtest").to_bytes(4, "little")
+
+    async def _handle(reader, writer):
+        try:
+            await reader.readexactly(64)
+            writer.write(magic + b"version\x00\x00\x00\x00\x00")
+            await writer.drain()
+            await reader.read()  # hold until the dialer hangs up
+        except (asyncio.IncompleteReadError, ConnectionError, OSError):
+            pass
+        finally:
+            writer.close()
+
+    server = await asyncio.start_server(_handle, "127.0.0.1", 0)
+    port = server.sockets[0].getsockname()[1]
+    peer = Peer("127.0.0.1", port, "regtest", transport_version=2)
+    try:
+        ok = await asyncio.wait_for(
+            peer.connect(start_height=0, retry=False), timeout=8.0)
+    finally:
+        server.close()
+        await server.wait_closed()
+
+    assert ok is False
+    assert peer.v2_negotiation_failed is True
+    assert peer.state == PeerState.DISCONNECTED
+    assert peer.reader is None and peer.writer is None

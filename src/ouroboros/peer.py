@@ -834,9 +834,14 @@ class Peer:
                 # path: a peer that sent us bytes is not v1-only (Core's
                 # V2Transport::ShouldReconnectV1 requires an empty receive
                 # buffer).  The 5 s TCP connect above stays outside.
+                v2_failed = False
                 async with asyncio.timeout(HANDSHAKE_TIMEOUT):
                     # BIP 324 v2 transport negotiation (before version handshake)
                     if self.transport_version == 2:
+                        # A failed negotiation only records the failure here;
+                        # the disconnect runs after this block so the deadline
+                        # cannot cancel that cleanup half-way and turn a
+                        # flagged v1-retry into a plain timeout.
                         try:
                             await self._negotiate_v2()
                         except V2NegotiationFailed as v2_err:
@@ -854,8 +859,7 @@ class Peer:
                             )
                             self._v2_transport = None
                             self.v2_negotiation_failed = True
-                            await self.disconnect()
-                            return False
+                            v2_failed = True
                         except Exception as v2_err:  # pragma: no cover
                             # Defensive: any other failure path should be
                             # treated as a v2 negotiation failure to avoid a
@@ -867,10 +871,14 @@ class Peer:
                             )
                             self._v2_transport = None
                             self.v2_negotiation_failed = True
-                            await self.disconnect()
-                            return False
+                            v2_failed = True
 
-                    await self._handshake(start_height)
+                    if not v2_failed:
+                        await self._handshake(start_height)
+
+                if v2_failed:
+                    await self.disconnect()
+                    return False
 
                 self.state = PeerState.READY
                 self._retry_count = 0
