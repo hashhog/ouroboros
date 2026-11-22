@@ -156,3 +156,67 @@ def test_inv_single_block_still_fetched_directly():
     h = b"\x55" * 32
     _run(bs.handle_inv(_inv_blocks([h]), peer))
     assert _getdata_block_items(peer) == [h]
+
+
+def _age_all_requests(bs, seconds=100_000):
+    for h in list(bs.requested_blocks):
+        bs.requested_blocks[h] -= seconds
+
+
+def _junk_load(bs, peer, junk):
+    return sum(1 for h, p in bs._block_request_peer.items()
+               if p is peer and h in junk and h in bs.requested_blocks)
+
+
+def test_inv_junk_not_rerouted_to_honest_peers_on_timeout():
+    # The finding's harm is slots held across timeout cycles: the timeout
+    # sweep must not move one peer's headerless inv announces onto honest
+    # peers, or the flood fills every peer's per-peer cap over a few cycles.
+    flooder = _ready_witness_peer(10)
+    honest = [_ready_witness_peer(11 + i) for i in range(4)]
+    bs = _block_sync([flooder] + honest)
+    junk: set[bytes] = set()
+    for _cycle in range(8):
+        batch = _random_hashes(300)
+        junk.update(batch)
+        _run(bs.handle_inv(_inv_many(batch), flooder))
+        _age_all_requests(bs)
+        _run(bs._handle_timeouts())
+    for p in honest:
+        assert _junk_load(bs, p, junk) == 0, _junk_load(bs, p, junk)
+        assert _getdata_block_items(p) == []
+    # Only the last cycle's fresh inv could still be in flight after a
+    # final flood; after its timeout nothing junk remains.
+    assert not (junk & set(bs.requested_blocks))
+
+
+def test_inv_flood_from_many_peers_leaves_download_window():
+    # 20 inbound flooders, each within its own per-peer cap, must not fill
+    # the 256-slot window that IBD's cap_inflight is computed from.
+    import ouroboros.block_sync as block_sync
+    # 4 x MAX_BLOCKS_IN_FLIGHT_PER_PEER; read via getattr so this file still
+    # imports on master and fails there on the assertion.
+    inv_budget = getattr(block_sync, "INV_FETCH_MAX_IN_FLIGHT", 64)
+    flooders = [_ready_witness_peer(50 + i) for i in range(20)]
+    bs = _block_sync(flooders)
+    for p in flooders:
+        _run(bs.handle_inv(_inv_many(_random_hashes(300)), p))
+    assert len(bs.requested_blocks) <= inv_budget
+    assert bs._max_blocks_in_flight - len(bs.requested_blocks) >= 192
+
+
+def test_inv_fetched_block_with_header_is_still_rerequested():
+    # Guard against over-dropping: once the announced block's header is in
+    # the validated-header queue it is a real download and a timeout
+    # re-requests it from another peer, as for any queued block.
+    first = _ready_witness_peer(80)
+    second = _ready_witness_peer(81)
+    bs = _block_sync([first, second])
+    h = b"\x66" * 32
+    _run(bs.handle_inv(_inv_blocks([h]), first))
+    assert bs._block_request_peer.get(h) is first
+    bs._validated_headers.append((h, None))
+    _age_all_requests(bs)
+    _run(bs._handle_timeouts())
+    assert h in bs.requested_blocks
+    assert bs._block_request_peer.get(h) is second
