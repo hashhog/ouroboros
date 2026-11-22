@@ -147,7 +147,7 @@ def test_on_addr_1001_entries_scores_peer_and_relays_nothing():
     msg = NetworkMessage(command="addr", payload=_v1_payload(1001),
                          magic=get_magic("regtest"))
     _run(sender.message_handlers["addr"](msg))
-    assert pm.ban_manager.is_banned(SENDER_HOST), \
+    assert pm.ban_manager.is_discouraged(SENDER_HOST), \
         "oversize addr must Misbehave the sender (Core net_processing.cpp:5637)"
     assert pm.addrman.size() == before, "nothing from an oversize addr is stored"
     assert all(t.sent == [] for t in targets), "nothing is relayed"
@@ -159,7 +159,7 @@ def test_on_addrv2_1001_entries_scores_peer_and_relays_nothing():
     msg = NetworkMessage(command="addrv2", payload=_v2_payload(1001),
                          magic=get_magic("regtest"))
     _run(sender.message_handlers["addrv2"](msg))
-    assert pm.ban_manager.is_banned(SENDER_HOST), \
+    assert pm.ban_manager.is_discouraged(SENDER_HOST), \
         "oversize addrv2 must Misbehave the sender (Core net_processing.cpp:5637)"
     assert pm.addrman.size() == before
     assert all(t.sent == [] for t in targets)

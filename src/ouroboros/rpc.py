@@ -13155,6 +13155,8 @@ class RPCServer:
         bm = pm.ban_manager
         # Clear all bans
         bm.banned.clear()
+        # Core's BanMan::ClearBanned clears m_banned only; m_discouraged is
+        # left alone, so discouraged addresses stay refused.
         bm.scores.clear()
         if bm._data_dir:
             bm._save_bans()

@@ -1289,6 +1289,15 @@ class PeerManager:
         if not candidates:
             return None
 
+        # Core SelectNodeToEvict: after every protection, if any remaining
+        # candidate is prefer_evict (accepted while discouraged), consider
+        # only those.
+        if any(getattr(p, "prefer_evict", False) for _a, p in candidates):
+            candidates = [
+                (a, p) for a, p in candidates
+                if getattr(p, "prefer_evict", False)
+            ]
+
         # Step 7 — From remaining, evict the one connected longest
         candidates.sort(key=lambda ap: ap[1].connected_at)
         return candidates[0][0]
@@ -1534,9 +1543,22 @@ class PeerManager:
         host, port = peername[0], peername[1]
         addr = f"{host}:{port}"
 
-        # Check ban list
+        # Core net.cpp AcceptConnection: a banned address is always dropped.
         if self.ban_manager.is_banned(host) or self.ban_manager.is_banned(addr):
             logger.debug(f"Rejected banned inbound peer {addr}")
+            writer.close()
+            return
+
+        # A discouraged address is dropped only when inbound is (almost)
+        # full (``nInbound + 1 >= m_max_inbound``); otherwise it is accepted
+        # and marked prefer_evict, so eviction takes it first.
+        discouraged = (self.ban_manager.is_discouraged(host)
+                       or self.ban_manager.is_discouraged(addr))
+        if discouraged and (
+            len(self.inbound_peers) + self._pending_inbound + 1
+            >= self.max_inbound
+        ):
+            logger.debug(f"Rejected discouraged inbound peer {addr}: inbound almost full")
             writer.close()
             return
 
@@ -1583,6 +1605,7 @@ class PeerManager:
                     node_compact_filters=self.node_compact_filters,
                     node_network_limited=self.node_network_limited,
                     on_disconnect=self._handle_peer_disconnected)
+        peer.prefer_evict = discouraged
         # Reserve the slot before the first read; give it back however the
         # handshake ends (success moves it into inbound_peers below).
         self._pending_inbound += 1
@@ -1702,7 +1725,7 @@ class PeerManager:
                 break
             if addr in self._all_outbound_addrs():
                 continue
-            if self.ban_manager.is_banned(addr):
+            if self.ban_manager.is_banned_or_discouraged(addr):
                 continue
 
             try:
@@ -2115,7 +2138,7 @@ class PeerManager:
             for addr_info in addrs:
                 ip = addr_info[4][0]
                 addr = f"{ip}:{port}"
-                if not self.ban_manager.is_banned(addr):
+                if not self.ban_manager.is_banned_or_discouraged(addr):
                     self._add_known_addr(addr)
                     self.addrman.add(ip, port, source=seed)
                     count += 1
@@ -2155,7 +2178,7 @@ class PeerManager:
             except ValueError:
                 continue
             addr = f"{ip}:{port}"
-            if self.ban_manager.is_banned(addr) or self.ban_manager.is_banned(ip):
+            if self.ban_manager.is_banned_or_discouraged(addr) or self.ban_manager.is_banned_or_discouraged(ip):
                 continue
             self._add_known_addr(addr)
             # addrman.add drops non-routable + dedups; only routable entries
@@ -2427,7 +2450,7 @@ class PeerManager:
                 available = (
                     self.known_addrs
                     - self._all_outbound_addrs()
-                    - {a for a in self.known_addrs if self.ban_manager.is_banned(a)}
+                    - {a for a in self.known_addrs if self.ban_manager.is_banned_or_discouraged(a)}
                 )
                 # Filter by network group
                 available = {
@@ -2521,7 +2544,7 @@ class PeerManager:
         if addr in self.peers or addr in self.block_relay_peers:
             logger.info(f"Already connected to {addr}")
             return True
-        if self.ban_manager.is_banned(addr) or self.ban_manager.is_banned(host):
+        if self.ban_manager.is_banned_or_discouraged(addr) or self.ban_manager.is_banned_or_discouraged(host):
             logger.warning(f"Cannot connect to banned peer {addr}")
             return False
 
@@ -2595,7 +2618,7 @@ class PeerManager:
                 available = (
                     self.known_addrs
                     - self._all_outbound_addrs()
-                    - {a for a in self.known_addrs if self.ban_manager.is_banned(a)}
+                    - {a for a in self.known_addrs if self.ban_manager.is_banned_or_discouraged(a)}
                 )
                 available = {
                     a for a in available
@@ -3098,6 +3121,7 @@ class PeerManager:
                                 self.ban_manager.unban(addr)
                             if self.ban_manager.is_banned(host):
                                 self.ban_manager.unban(host)
+                            self.ban_manager.undiscourage(host)
                             try:
                                 logger.info(f"Reconnecting to --connect peer {addr}")
                                 await self.connect_to_node(host, port)
@@ -3938,7 +3962,7 @@ class PeerManager:
                     if ts_f <= 100_000_000 or ts_f > _now + 600:
                         ts_f = _now - 5 * 24 * 3600
                     host_str = self._netaddr_to_host(net_addr)
-                    if host_str and not self.ban_manager.is_banned(host_str):
+                    if host_str and not self.ban_manager.is_banned_or_discouraged(host_str):
                         if self.addrman.add(
                             host_str, net_addr.port,
                             services=net_addr.services,
@@ -3995,7 +4019,7 @@ class PeerManager:
                     if ts_f <= 100_000_000 or ts_f > _now + 600:
                         ts_f = _now - 5 * 24 * 3600
                     host_str = self._addr_bytes_to_host(net_id, addr_bytes)
-                    if host_str and not self.ban_manager.is_banned(host_str):
+                    if host_str and not self.ban_manager.is_banned_or_discouraged(host_str):
                         if self.addrman.add(
                             host_str, port,
                             services=services,
@@ -4997,11 +5021,12 @@ class PeerManager:
              ("since that would discourage all peers on the same local
              address").
           4. Otherwise Discourage(addr) + DisconnectNode(addr) -- here
-             ``BanManager.ban`` and its ``_on_peer_banned`` callback.
+             ``BanManager.discourage`` and its ``_on_peer_banned`` callback.
 
-        Bans are keyed by address, so cases 1-3 must never reach ``ban()``:
-        a stored ban for the address would make the inbound gate (which
-        checks ``is_banned(host)`` before any noban flag is known) refuse the
+        Discouragement is keyed by address, so cases 1-3 must never reach
+        ``discourage()``: a recorded address would make the inbound gate
+        (which checks ``is_banned_or_discouraged(host)`` before any noban
+        flag is known) refuse the
         next connection from it.  For a bare address naming several
         connections, the exemption holds only if every one is exempt.
         """
@@ -5095,7 +5120,7 @@ class PeerManager:
         Args:
             addr: Peer address (host:port)
         """
-        if not self.ban_manager.is_banned(addr):
+        if not self.ban_manager.is_banned_or_discouraged(addr):
             self._add_known_addr(addr)
             logger.debug(f"Added peer address: {addr}")
 
