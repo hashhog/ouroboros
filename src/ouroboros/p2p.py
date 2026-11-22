@@ -869,6 +869,11 @@ class PeerManager:
         self._trickle_queues: dict[str, TrickleQueue] = {}
         self._trickle_task: asyncio.Task | None = None
         self._trickle_interval: float = 1.0  # check interval in seconds
+        # addr -> the in-flight trickle INV send for that peer.  Each send
+        # runs as its own task so one slow-reading peer cannot park relay
+        # for the rest (Core: SocketSendData is non-blocking; a full send
+        # buffer pauses only that peer via fPauseSend).
+        self._trickle_send_tasks: dict[str, asyncio.Task] = {}
 
         # Eclipse attack mitigation state
         # Anchor connections: persistent block-relay-only peers across restarts
@@ -1108,6 +1113,9 @@ class PeerManager:
                 await self._trickle_task
             except asyncio.CancelledError:
                 pass
+        for send_task in list(self._trickle_send_tasks.values()):
+            send_task.cancel()
+        self._trickle_send_tasks.clear()
 
         # Cancel self-address announcement task
         if self._local_addr_task:
@@ -5136,19 +5144,28 @@ class PeerManager:
                         queue.clear()
                         continue
 
+                    # The previous trickle send to this peer is still
+                    # draining: leave its queue due and serve it on a later
+                    # pass, as Core skips a peer with fPauseSend set.
+                    in_flight = self._trickle_send_tasks.get(addr)
+                    if in_flight is not None and not in_flight.done():
+                        continue
+
                     try:
                         # Get INVs to send, filtering by peer's feefilter (BIP133)
                         inv_items = queue.get_invs_to_send(
                             feefilter=peer.peer_feefilter
                         )
                         if inv_items:
-                            # Send INV message
+                            # Send without awaiting: send_message's bounded
+                            # drain may wait as long as a slow peer keeps
+                            # reading, and awaiting it here would hold every
+                            # peer later in this pass behind that one.
                             inv_msg = InvMessage(inv_items)
-                            await peer.send_message(
-                                inv_msg.to_network_message(self.network)
-                            )
-                            logger.debug(
-                                f"Trickled {len(inv_items)} tx INVs to {addr}"
+                            self._spawn_trickle_send(
+                                addr, peer,
+                                inv_msg.to_network_message(self.network),
+                                len(inv_items),
                             )
 
                         # Schedule next send with Poisson delay
@@ -5163,6 +5180,29 @@ class PeerManager:
             logger.debug("Trickle loop cancelled")
         except Exception as e:
             logger.error(f"Error in trickle loop: {e}")
+
+    def _spawn_trickle_send(
+        self, addr: str, peer: Peer, msg: NetworkMessage, count: int
+    ) -> None:
+        """Run one peer's trickled INV send as its own task."""
+
+        async def _send() -> None:
+            try:
+                await peer.send_message(msg)
+                logger.debug(f"Trickled {count} tx INVs to {addr}")
+            except asyncio.CancelledError:
+                raise
+            except Exception as e:
+                logger.warning(f"Failed to send trickled INVs to {addr}: {e}")
+
+        task = asyncio.ensure_future(_send())
+        self._trickle_send_tasks[addr] = task
+
+        def _done(t: asyncio.Task) -> None:
+            if self._trickle_send_tasks.get(addr) is t:
+                del self._trickle_send_tasks[addr]
+
+        task.add_done_callback(_done)
 
     def queue_tx_for_relay(
         self,
