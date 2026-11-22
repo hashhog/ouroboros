@@ -220,3 +220,97 @@ def test_inv_fetched_block_with_header_is_still_rerequested():
     _run(bs._handle_timeouts())
     assert h in bs.requested_blocks
     assert bs._block_request_peer.get(h) is second
+
+
+# --- Warden review of #198: the cap must never leave a needed block unrequested.
+
+
+def _getheaders_count(peer):
+    return sum(1 for m in peer.sent if m.command == "getheaders")
+
+
+def _all_getdata(peers):
+    return {p: _getdata_block_items(p) for p in peers}
+
+
+def test_peer_at_cap_still_gets_connect_frontier_and_extra_inv_gets_getheaders():
+    # (1) A peer filled to MAX_BLOCKS_IN_FLIGHT_PER_PEER by inv fetches must
+    # still be asked for the connect frontier (_validated_headers[0]) by the
+    # header-driven path; the cap only gates the inv shortcut.  A further inv
+    # from that peer is not getdata'd but still triggers getheaders.
+    import ouroboros.block_sync as block_sync
+    peer = _ready_witness_peer(90)
+    bs = _block_sync([peer])
+    _run(bs.handle_inv(_inv_blocks(_random_hashes(PER_PEER_CAP)), peer))
+    assert len(_getdata_block_items(peer)) == PER_PEER_CAP
+    assert sum(1 for p in bs._block_request_peer.values() if p is peer) \
+        == block_sync.MAX_BLOCKS_IN_FLIGHT_PER_PEER
+
+    frontier = b"\x88" * 32
+    bs._validated_headers.append((frontier, None))
+    peer.sent.clear()
+    _run(bs._request_next_blocks())
+    assert frontier in _getdata_block_items(peer), "connect frontier not requested"
+    assert bs._block_request_peer.get(frontier) is peer
+
+    extra = b"\x89" * 32
+    peer.sent.clear()
+    _run(bs.handle_inv(_inv_blocks([extra]), peer))
+    assert extra not in _getdata_block_items(peer)
+    assert extra not in bs.requested_blocks
+    assert _getheaders_count(peer) >= 1, "inv over the cap must still send getheaders"
+
+
+def test_stalled_headerless_inv_dropped_then_fetched_once_header_arrives():
+    # (2) A headerless inv fetch that times out is dropped, not re-routed.
+    # Once its header is queued, the normal download path fetches it.
+    stalled = _ready_witness_peer(91)
+    other = _ready_witness_peer(92)
+    bs = _block_sync([stalled, other])
+    h = b"\x91" * 32
+    _run(bs.handle_inv(_inv_blocks([h]), stalled))
+    assert bs._block_request_peer.get(h) is stalled
+    _age_all_requests(bs)
+    stalled.sent.clear()
+    _run(bs._handle_timeouts())
+    assert h not in bs.requested_blocks
+    assert h not in bs._block_request_peer
+    assert h not in _getdata_block_items(other)
+    assert h not in _getdata_block_items(stalled)
+
+    bs._validated_headers.append((h, None))
+    _run(bs._request_next_blocks())
+    asked = [p for p in (stalled, other) if h in _getdata_block_items(p)]
+    assert asked, "block not requested after its header was queued"
+    assert h in bs.requested_blocks
+
+
+def test_inv_only_reorg_over_global_budget_gets_getheaders_then_body():
+    # (3) With the global inv budget full, a new inv from a peer under its own
+    # cap is not getdata'd but sends getheaders; once the header is queued
+    # (the reorg's next block) a ready peer is asked for the body.
+    import ouroboros.block_sync as block_sync
+    # getattr: still imports on master, where the budget does not exist.
+    budget = getattr(block_sync, "INV_FETCH_MAX_IN_FLIGHT", 64)
+    n_flooders = budget // PER_PEER_CAP
+    flooders = [_ready_witness_peer(100 + i) for i in range(n_flooders)]
+    announcer = _ready_witness_peer(120)
+    bs = _block_sync(flooders + [announcer])
+    for p in flooders:
+        _run(bs.handle_inv(_inv_blocks(_random_hashes(PER_PEER_CAP)), p))
+    assert len(bs.requested_blocks) == budget
+
+    fork = b"\xf0" * 32
+    _run(bs.handle_inv(_inv_blocks([fork]), announcer))
+    assert sum(1 for p in bs._block_request_peer.values() if p is announcer) \
+        < block_sync.MAX_BLOCKS_IN_FLIGHT_PER_PEER
+    assert fork not in _getdata_block_items(announcer)
+    assert fork not in bs.requested_blocks
+    assert _getheaders_count(announcer) >= 1
+
+    bs._validated_headers = [(fork, None)]
+    _run(bs._request_next_blocks())
+    peers = flooders + [announcer]
+    asked = [p for p in peers if fork in _getdata_block_items(p)]
+    assert asked, "reorg block body never requested"
+    assert fork in bs.requested_blocks
