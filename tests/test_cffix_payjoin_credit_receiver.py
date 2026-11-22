@@ -167,6 +167,21 @@ class TestReceiverCredit:
         assert exc.value.code == payjoin.ERR_ORIGINAL_PSBT_REJECTED
 
 
+    def test_fee_output_index_on_second_receiver_output_refused(self):
+        """Same, when the Original pays the receiver script twice and the
+        sender names the second one: matched by script, not by index."""
+        sender = _make_key(b"cf-pj-sender-6b")
+        receiver = _make_key(b"cf-pj-receiver-6b")
+        recv_script = _p2wpkh_script(receiver)
+        original = _build_original_psbt(sender, recv_script)  # [60k, 30k]
+        original.tx.outputs[1].script_pubkey = recv_script
+        query = {"additionalfeeoutputindex": "1",
+                 "maxadditionalfeecontribution": "30000"}
+        with pytest.raises(payjoin.PayJoinError) as exc:
+            _run(original, _make_receiver_ctx(receiver, utxos_value=[40_000]), query)
+        assert exc.value.code == payjoin.ERR_ORIGINAL_PSBT_REJECTED
+
+
 class TestOriginalAmounts:
     def test_negative_output_rejected(self):
         sender = _make_key(b"cf-pj-sender-7")
@@ -200,6 +215,30 @@ class TestOriginalAmounts:
         with pytest.raises(payjoin.PayJoinError) as exc:
             _run(original, _make_receiver_ctx(receiver, utxos_value=[RECEIVER_UTXO]))
         assert exc.value.code == payjoin.ERR_ORIGINAL_PSBT_REJECTED
+
+    def test_matching_non_witness_utxo_accepted(self):
+        """Control for the txid check: the real prevout tx is accepted and
+        its value is what the balance check uses."""
+        from ouroboros.psbt import _deserialize_tx_full, _serialize_tx_with_witness
+
+        sender = _make_key(b"cf-pj-sender-8b")
+        receiver = _make_key(b"cf-pj-receiver-8b")
+        recv_script = _p2wpkh_script(receiver)
+        prev = Transaction(
+            txid=bytes(32), version=2, locktime=0,
+            inputs=[TxIn(prev_txid=b"\x22" * 32, prev_vout=0,
+                         script_sig=b"", sequence=0xFFFFFFFF)],
+            outputs=[TxOut(value=100_000, script_pubkey=_p2wpkh_script(sender))],
+            has_witness=False,
+        )
+        original = _build_original_psbt(sender, recv_script)  # 100k -> 60k + 30k
+        raw_prev = _serialize_tx_with_witness(prev)
+        original.tx.inputs[0].prev_txid = _deserialize_tx_full(raw_prev).get_txid()
+        original.inputs[0].witness_utxo = None
+        original.inputs[0].non_witness_utxo = raw_prev
+        body = _run(original, _make_receiver_ctx(receiver, utxos_value=[40_000]))
+        proposal = PSBT.from_base64(body.decode("ascii"))
+        assert _receiver_output_value(proposal, recv_script) == 100_000
 
 
 class TestBroadcastableHook:
@@ -282,6 +321,7 @@ class TestRouteTestAccept:
         original = _build_original_psbt(_make_key(b"cf-pj-route-s2"), recv_script)
         r = client.post("/payjoin", content=original.to_base64(),
                         headers={"Content-Type": "text/plain"})
+        assert r.status_code == 503, r.text
         assert r.json().get("errorCode") == payjoin.ERR_UNAVAILABLE, r.text
 
     def test_route_credits_receiver_when_mempool_accepts(self):

@@ -684,12 +684,19 @@ def process_payjoin_request(
     # a conservative upper bound — the wallet-managed sender bumps the
     # output by the exact delta when re-broadcasting later.
     #
-    # The designated output is the sender's change.  Pointing it at the
-    # receiver's own output would let the sender's chosen cap claw back
-    # the credit above, so refuse that.
-    if params.additionalfeeoutputindex == payment_idx:
+    # The designated output is the sender's change.  Pointing it at any
+    # receiver-owned output (the payment output or another one paying the
+    # receiver script) would let the sender's chosen cap claw back the
+    # credit above or cut the payment, so refuse that.  Compared by
+    # script, not index: an Original may pay the receiver script twice.
+    fee_idx = params.additionalfeeoutputindex
+    if (
+        fee_idx is not None
+        and fee_idx < len(psbt.tx.outputs)
+        and psbt.tx.outputs[fee_idx].script_pubkey == ctx.receiver_script
+    ):
         raise err_original_psbt_rejected(
-            "additionalfeeoutputindex names the receiver's payment output"
+            "additionalfeeoutputindex names an output paying the receiver"
         )
     apply_fee_adjustment(
         psbt,
