@@ -21553,11 +21553,39 @@ class RPCServer:
                         continue
             return None
 
+        # BIP-78 receiver checklist: "verify that the transaction in the
+        # original PSBT is broadcastable (testmempoolaccept)" before
+        # signing anything into it.  Fail closed: no mempool -> unavailable.
+        def check_broadcastable(original) -> "str | None":
+            mempool = getattr(self.node, "mempool", None)
+            db = getattr(self.node, "db", None)
+            if (
+                mempool is None
+                or db is None
+                or not hasattr(mempool, "accept_to_memory_pool")
+            ):
+                raise _payjoin.err_unavailable(
+                    "Receiver mempool not ready; cannot test the Original PSBT"
+                )
+            raw_hex = _payjoin._finalize_psbt_to_raw_hex(original)
+            if raw_hex is None:
+                return "Original PSBT cannot be finalized"
+            try:
+                tx = _decode_hex_tx(raw_hex)
+            except Exception:
+                return "Original PSBT does not extract to a valid transaction"
+            _, best_height = db.get_best_block()
+            res = mempool.accept_to_memory_pool(tx, best_height, test_accept=True)
+            if not res.get("accepted"):
+                return str(res.get("reject_reason") or "rejected")
+            return None
+
         ctx = _payjoin.ReceiverContext(
             list_utxos=list_utxos,
             get_key_for_script=get_key_for_script,
             receiver_script=receiver_script,
             min_amount=min_amount,
+            check_broadcastable=check_broadcastable,
         )
 
         # G18 / G30 — pre-decode the Original PSBT so the TTL and replay
