@@ -4527,8 +4527,9 @@ class Mempool:
             left = {t: len(ps) for t, ps in parents_of.items()}
 
             def _key(t):
+                # Same unit as the snapshot's chunk sizes: vsize, witness in.
                 fee, size, _ = pre.get(t, (self.transactions[t].fee,
-                                           self.transactions[t].size, None))
+                                           self.transactions[t].vsize, None))
                 return -Fraction(fee, size if size > 0 else 1)
 
             heap: list = []
