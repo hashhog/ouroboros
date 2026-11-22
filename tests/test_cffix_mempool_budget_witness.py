@@ -1,6 +1,6 @@
 """Witness bytes count against -maxmempool and in eviction feerates.
 
-Cloudflare security-audit blind pass on ouroboros 721bcd5, record
+Security-audit blind pass on ouroboros 721bcd5, record
 ``ouroboros:mempool:stripped-size-mempool-budget-and-eviction``: the pool
 kept its byte budget and its chunk feerates on the STRIPPED (witness-less)
 size of each transaction.  A transaction carrying a ~390 KB tapscript witness
@@ -136,3 +136,31 @@ def test_witness_heavy_replacement_does_not_beat_chunk_on_stripped_size():
     ok, _err = pool.add_transaction(replacement, 200)
     assert not ok, "a 0.2 sat/vB replacement displaced a 10 sat/vB transaction"
     assert victim.txid in pool.transactions
+
+
+def test_honest_replacement_of_witness_heavy_tx_improves_diagram():
+    """The reverse role: a 1 sat/vB witness-heavy transaction must not pin
+    its outpoint against an honest replacement paying ~186 sat/vB and more
+    absolute fee.  On stripped size the victim looked ~1600 sat/B, so the
+    diagram check rejected the replacement; on vsize Core accepts it."""
+    victim = _tx(0, _fee_for(1.0, 0, True), True)
+    victim_fee = _VALUE - victim.outputs[0].value
+    fee = victim_fee + 20_000
+    per = (_VALUE - fee) // 20
+    outs = [TxOut(value=per, script_pubkey=b"\x51") for _ in range(20)]
+    outs[0] = TxOut(value=_VALUE - fee - per * 19, script_pubkey=b"\x51")
+    replacement = Transaction(
+        txid=b"\xc1" + b"\x00" * 31, version=2, locktime=0,
+        inputs=[TxIn(prev_txid=_prev(0), prev_vout=0, script_sig=b"",
+                     sequence=0xFFFFFFFD)],
+        outputs=outs,
+    )
+    assert fee / replacement.get_vsize() > 100 * victim_fee / victim.get_vsize()
+
+    pool = _pool(1, max_size=10**9)
+    ok, err = pool.add_transaction(victim, 200)
+    assert ok, err
+    ok, err = pool.add_transaction(replacement, 200)
+    assert ok, f"honest replacement of a 1 sat/vB witness-heavy tx rejected: {err}"
+    assert replacement.txid in pool.transactions
+    assert victim.txid not in pool.transactions

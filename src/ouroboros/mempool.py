@@ -4953,7 +4953,8 @@ class Mempool:
     MAX_REPLACEMENT_EVICTIONS = 100
 
     def _check_cluster_rbf(
-        self, new_tx: Transaction, to_evict: set[bytes], new_fee: int
+        self, new_tx: Transaction, to_evict: set[bytes], new_fee: int,
+        new_vsize: int | None = None,
     ) -> tuple[bool, str]:
         """Check if replacement improves the cluster linearization.
 
@@ -4963,8 +4964,16 @@ class Mempool:
         The feerate diagram is a cumulative plot of (size, fee) for each chunk
         in order. A diagram A is better than B if A is always above B.
 
+        Sizes are sigop-adjusted vsize (Core GetTxSize), witness included,
+        on both sides: *new_vsize* is the replacement's, computed by the
+        caller with its sigop cost (falls back to the plain vsize).  The
+        stripped size would make a witness-heavy transaction look far
+        higher-feerate than it is, in either role.
+
         Reference: Bitcoin Core txgraph.h - GetMainStagingDiagrams()
         """
+        if new_vsize is None:
+            new_vsize = new_tx.get_vsize()
         # Find clusters affected by the eviction
         affected_cluster_ids: set[int] = set()
         for txid in to_evict:
@@ -4993,7 +5002,7 @@ class Mempool:
 
         # Compute what the new diagram would look like after replacement
         # This is approximate: we simulate adding the new tx after eviction
-        new_size = len(new_tx.serialize())
+        new_size = new_vsize
 
         # Calculate total old MODIFIED fee/size from affected clusters
         # (FIX-72) — diagram comparisons must honour prioritisetransaction so
@@ -5007,7 +5016,7 @@ class Mempool:
                     entry = self.transactions.get(txid)
                     if entry:
                         old_total_fee += self.get_modified_fee(entry)
-                        old_total_size += entry.size
+                        old_total_size += entry.vsize
 
         # Calculate new total after eviction + addition (use MODIFIED fee on
         # the evicted side; new_fee already includes the replacement's delta).
@@ -5016,7 +5025,7 @@ class Mempool:
             for t in to_evict
             if t in self.transactions
         )
-        evicted_size = sum(self.transactions[t].size for t in to_evict if t in self.transactions)
+        evicted_size = sum(self.transactions[t].vsize for t in to_evict if t in self.transactions)
 
         new_total_fee = old_total_fee - evicted_fee + new_fee
         new_total_size = old_total_size - evicted_size + new_size
@@ -5039,7 +5048,6 @@ class Mempool:
         # Additional check: the new tx's feerate should be at least as good as
         # the worst chunk it would displace.  Chunk feerates are over vsize
         # (witness included), so this side is too.
-        new_vsize = new_tx.get_vsize()
         new_tx_rate = new_fee / new_vsize if new_vsize > 0 else 0
         for cid in affected_cluster_ids:
             cluster = self._cluster_manager._clusters.get(cid)
@@ -5396,7 +5404,7 @@ class Mempool:
         # Reference: Bitcoin Core txgraph.h - GetMainStagingDiagrams()
         # Pass the MODIFIED fee so diagram comparisons honour prioritisation.
         cluster_ok, cluster_err = self._check_cluster_rbf(
-            new_tx, to_evict, new_fee_modified
+            new_tx, to_evict, new_fee_modified, new_vsize
         )
         if not cluster_ok:
             return False, cluster_err
