@@ -871,8 +871,8 @@ class PeerManager:
         self._trickle_interval: float = 1.0  # check interval in seconds
         # addr -> the in-flight trickle INV send for that peer.  Each send
         # runs as its own task so one slow-reading peer cannot park relay
-        # for the rest (Core: SocketSendData is non-blocking; a full send
-        # buffer pauses only that peer via fPauseSend).
+        # for the rest (Core: SocketSendData is non-blocking, so a peer that
+        # reads slowly never holds SendMessages for the other peers).
         self._trickle_send_tasks: dict[str, asyncio.Task] = {}
 
         # Eclipse attack mitigation state
@@ -1113,9 +1113,12 @@ class PeerManager:
                 await self._trickle_task
             except asyncio.CancelledError:
                 pass
-        for send_task in list(self._trickle_send_tasks.values()):
-            send_task.cancel()
+        send_tasks = list(self._trickle_send_tasks.values())
         self._trickle_send_tasks.clear()
+        for send_task in send_tasks:
+            send_task.cancel()
+        if send_tasks:
+            await asyncio.gather(*send_tasks, return_exceptions=True)
 
         # Cancel self-address announcement task
         if self._local_addr_task:
@@ -2864,6 +2867,9 @@ class PeerManager:
             the announcing addr stored in the tuple).
         """
         self._trickle_queues.pop(addr, None)
+        send_task = self._trickle_send_tasks.pop(addr, None)
+        if send_task is not None:
+            send_task.cancel()
         self._erlay_peers.pop(addr, None)
         self._erlay_local_salts.pop(addr, None)
         self._erlay_pending_recon.pop(addr, None)
@@ -5146,7 +5152,9 @@ class PeerManager:
 
                     # The previous trickle send to this peer is still
                     # draining: leave its queue due and serve it on a later
-                    # pass, as Core skips a peer with fPauseSend set.
+                    # pass.  Core instead keeps appending to the peer's
+                    # vSendMsg; skipping here bounds what a stalled peer can
+                    # make us hold to one INV message.
                     in_flight = self._trickle_send_tasks.get(addr)
                     if in_flight is not None and not in_flight.done():
                         continue
