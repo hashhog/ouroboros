@@ -144,8 +144,11 @@ def test_peer_with_send_in_flight_is_not_sent_again():
     """While a peer's trickle send is still draining, the loop must not stack
     another send on it; its queue stays due and is sent once it unblocks.
 
-    Guards the fix's in-flight bookkeeping; the inline-await code on master
-    satisfies it trivially, so it is a regression pin, not the repro."""
+    A regression pin for the fix's in-flight bookkeeping, not the repro.  On
+    master its result depends on the Poisson draw: the inline await re-arms
+    the queue's send time only after the slow drain returns, so the queued
+    tx usually waits a fresh delay (avg 5 s inbound) and the last assert
+    fails.  On the fix it is deterministic."""
     async def run():
         pm = PeerManager(network="mainnet", listen=False, dns_seed=False)
         slow_w = _FakeWriter(HIGH_WATER + 200 * 10)
