@@ -2405,6 +2405,12 @@ class BlockSync:
             # :2589): block fetches require NODE_WITNESS, and tx fetches only
             # carry MSG_WITNESS_FLAG for a witness-capable peer.
             _peer_can_witness = _can_serve_witness_blocks(peer)
+            # Blocks this peer already has in flight (lazily counted on the
+            # first unknown block inv).  Core never getdata's a block from an
+            # inv at all (it sends getheaders; FindNextBlocksToDownload then
+            # fetches at most MAX_BLOCKS_IN_FLIGHT_PER_PEER per peer), so the
+            # direct-fetch shortcut below must honour the same per-peer cap.
+            _peer_in_flight: int | None = None
             for inv_type, inv_hash in inv.inventory:
                 if inv_type == INV_TYPE_BLOCK:
                     if not self.db.has_block_hash(inv_hash):
@@ -2441,11 +2447,25 @@ class BlockSync:
                         # Core CanServeWitnesses: never request a block body
                         # from a peer without NODE_WITNESS (the announce still
                         # counts -- getheaders below -- just not the fetch).
+                        #
+                        # Per-peer cap (Core MAX_BLOCKS_IN_FLIGHT_PER_PEER):
+                        # the global cap alone let ONE peer announcing 256+
+                        # random hashes take every slot.  Those bodies never
+                        # come (a notfound frees nothing), so the slots stay
+                        # held until the download timeout and IBD's
+                        # ``cap_inflight`` falls to zero.
+                        if _peer_in_flight is None:
+                            _peer_in_flight = sum(
+                                1 for bh, rp in self._block_request_peer.items()
+                                if rp is peer and bh in self.requested_blocks
+                            )
                         if (
                             _peer_can_witness
                             and inv_hash not in self.requested_blocks
                             and inv_hash not in self._perm_rejected_blocks
                             and len(self.requested_blocks) < self._max_blocks_in_flight
+                            and _peer_in_flight + len(blocks_to_request)
+                            < MAX_BLOCKS_IN_FLIGHT_PER_PEER
                         ):
                             blocks_to_request.append((MSG_WITNESS_BLOCK, inv_hash))
                             self.requested_blocks[inv_hash] = now
