@@ -9,8 +9,10 @@ it in the iteration waits until the slow buffer drains.
 Core: ``CConnman::SocketSendData`` is non-blocking.  A full send buffer sets
 ``fPauseSend`` on THAT peer only; ``SendMessages`` for the other peers carries
 on.  The fix dispatches each peer's trickle send as its own task and skips a
-peer whose previous trickle send is still in flight (its queue stays due, as
-Core leaves a paused peer's inventory timer expired).
+peer whose previous trickle send is still in flight; its queue stays due.  The
+skip departs from Core on purpose: Core keeps queueing INVs to a paused peer
+(fPauseSend gates only message processing and getdata), while skipping bounds
+what a stalled peer can make us hold to one INV message.
 
 No sockets: both peers use fake writers whose transport reports a buffer size.
 """
@@ -74,12 +76,16 @@ class _FakeWriter:
         return None
 
 
+SHRINK_PERIOD = 0.05     # the slow peer reads 200 B this often
+STALL_WINDOW = 0.2       # well past SHRINK_PERIOD: every window sees progress
+
+
 def _ready_peer(host: str, writer: _FakeWriter) -> Peer:
     peer = Peer(host, 8333, network="mainnet")
     peer.writer = writer
     peer.state = PeerState.READY
     peer.relay_txs = True
-    peer._send_stall_timeout = 0.05
+    peer._send_stall_timeout = STALL_WINDOW
     return peer
 
 
@@ -107,7 +113,7 @@ def test_slow_peer_does_not_park_trickle_for_honest_peer():
 
         async def shrink():
             while slow_w.transport.unsent > 0:
-                await asyncio.sleep(0.05)
+                await asyncio.sleep(SHRINK_PERIOD)
                 slow_w.transport.unsent = max(0, slow_w.transport.unsent - 200)
 
         shrinker = asyncio.ensure_future(shrink())
