@@ -2660,23 +2660,24 @@ class Peer:
         if self.score == 0 and not self._ban_recorded:
             self._ban_recorded = True
             if self.ban_manager is not None:
-                # Idempotent: BanManager.ban() updates banned[host] and
+                # Idempotent: BanManager.discourage() records the host and
                 # invokes _on_peer_banned which closes the socket and
                 # removes the peer from PeerManager.peers.  We use the
                 # latch above so we never call this twice for the same
                 # Peer instance.
-                ban_count = len(self.ban_manager.banned) + 1
+                # Automatic punishment -> discourage (bounded, in memory),
+                # not a persisted ban: Core's MaybeDiscourageAndDisconnect.
                 logger.warning(
                     f"Disconnecting peer {self.host}:{self.port} after "
-                    f"score clamp (ban count={ban_count})"
+                    f"score clamp"
                 )
                 try:
-                    self.ban_manager.ban(
+                    self.ban_manager.discourage(
                         self.host, reason="peer score clamped to 0 (repeated failures)"
                     )
                 except Exception as exc:  # never let bookkeeping crash the loop
                     logger.error(
-                        f"BanManager.ban failed for {self.host}: {exc}"
+                        f"BanManager.discourage failed for {self.host}: {exc}"
                     )
             else:
                 # Fallback: no manager wired in (e.g. unit tests with a
