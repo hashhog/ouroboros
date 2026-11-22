@@ -48,9 +48,12 @@ async def _settle():
 def test_ban_by_host_port_blocks_same_ip_on_a_new_port(pm):
     """Inbound gate checks ``host`` and ``host:newport``; both must be banned."""
     assert pm.misbehaving("198.51.100.7:51234", 100, "invalid block")
-    assert pm.ban_manager.is_banned_or_discouraged("198.51.100.7")
-    assert pm.ban_manager.is_banned_or_discouraged("198.51.100.7:40000")
-    assert pm.ban_manager.is_banned_or_discouraged("198.51.100.7:51234")
+    assert pm.ban_manager.is_discouraged("198.51.100.7")
+    assert not pm.ban_manager.is_banned("198.51.100.7")
+    assert pm.ban_manager.is_discouraged("198.51.100.7:40000")
+    assert not pm.ban_manager.is_banned("198.51.100.7:40000")
+    assert pm.ban_manager.is_discouraged("198.51.100.7:51234")
+    assert not pm.ban_manager.is_banned("198.51.100.7:51234")
 
 
 def test_ban_by_host_port_is_seen_by_the_dial_path(pm):
@@ -62,8 +65,10 @@ def test_ban_by_host_port_is_seen_by_the_dial_path(pm):
 
 def test_bracketed_ipv6_host_port_bans_the_address(pm):
     assert pm.misbehaving("[2001:db8::7]:8333", 100, "invalid block")
-    assert pm.ban_manager.is_banned_or_discouraged("2001:db8::7")
-    assert pm.ban_manager.is_banned_or_discouraged("[2001:db8::7]:9999")
+    assert pm.ban_manager.is_discouraged("2001:db8::7")
+    assert not pm.ban_manager.is_banned("2001:db8::7")
+    assert pm.ban_manager.is_discouraged("[2001:db8::7]:9999")
+    assert not pm.ban_manager.is_banned("[2001:db8::7]:9999")
 
 
 @pytest.mark.asyncio
@@ -73,8 +78,10 @@ async def test_unbracketed_ipv6_connection_key_bans_the_peer_host(pm):
     resolved through the connected peer that owns it."""
     _inbound_peer(pm, "2001:db8::9", 8333)
     assert pm.misbehaving("2001:db8::9:8333", 100, "invalid block")
-    assert pm.ban_manager.is_banned_or_discouraged("2001:db8::9")
-    assert pm.ban_manager.is_banned_or_discouraged("[2001:db8::9]:41000")
+    assert pm.ban_manager.is_discouraged("2001:db8::9")
+    assert not pm.ban_manager.is_banned("2001:db8::9")
+    assert pm.ban_manager.is_discouraged("[2001:db8::9]:41000")
+    assert not pm.ban_manager.is_banned("[2001:db8::9]:41000")
     await _settle()
 
 
@@ -220,7 +227,8 @@ async def test_control_ordinary_peer_next_to_noban_peer_is_still_banned(pm):
     exempt.noban = True
     assert pm.misbehaving("203.0.113.5:40000", 100, "invalid block")
     await _settle()
-    assert pm.ban_manager.is_banned_or_discouraged("203.0.113.5")
+    assert pm.ban_manager.is_discouraged("203.0.113.5")
+    assert not pm.ban_manager.is_banned("203.0.113.5")
     assert plain.state != PeerState.READY
     # _on_peer_banned keeps its existing noban skip for the other connection
     assert exempt.state == PeerState.READY

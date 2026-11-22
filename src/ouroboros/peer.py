@@ -459,6 +459,10 @@ class Peer:
         # Reference: net_processing.cpp MaybeDiscourageAndDisconnect @5083.
         self.noban: bool = False
         self.is_manual: bool = False
+        # prefer_evict: inbound accepted while its address was discouraged
+        # (Core CNode::m_prefer_evict, net.cpp AcceptConnection); eviction
+        # considers only such peers once the protections have run.
+        self.prefer_evict: bool = False
         self.relay_type = (
             RelayType.FULL_RELAY if relay_txs else RelayType.BLOCK_RELAY_ONLY
         )

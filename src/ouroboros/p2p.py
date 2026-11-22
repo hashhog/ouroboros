@@ -1289,6 +1289,15 @@ class PeerManager:
         if not candidates:
             return None
 
+        # Core SelectNodeToEvict: after every protection, if any remaining
+        # candidate is prefer_evict (accepted while discouraged), consider
+        # only those.
+        if any(getattr(p, "prefer_evict", False) for _a, p in candidates):
+            candidates = [
+                (a, p) for a, p in candidates
+                if getattr(p, "prefer_evict", False)
+            ]
+
         # Step 7 — From remaining, evict the one connected longest
         candidates.sort(key=lambda ap: ap[1].connected_at)
         return candidates[0][0]
@@ -1534,9 +1543,22 @@ class PeerManager:
         host, port = peername[0], peername[1]
         addr = f"{host}:{port}"
 
-        # Check ban list
-        if self.ban_manager.is_banned_or_discouraged(host) or self.ban_manager.is_banned_or_discouraged(addr):
+        # Core net.cpp AcceptConnection: a banned address is always dropped.
+        if self.ban_manager.is_banned(host) or self.ban_manager.is_banned(addr):
             logger.debug(f"Rejected banned inbound peer {addr}")
+            writer.close()
+            return
+
+        # A discouraged address is dropped only when inbound is (almost)
+        # full (``nInbound + 1 >= m_max_inbound``); otherwise it is accepted
+        # and marked prefer_evict, so eviction takes it first.
+        discouraged = (self.ban_manager.is_discouraged(host)
+                       or self.ban_manager.is_discouraged(addr))
+        if discouraged and (
+            len(self.inbound_peers) + self._pending_inbound + 1
+            >= self.max_inbound
+        ):
+            logger.debug(f"Rejected discouraged inbound peer {addr}: inbound almost full")
             writer.close()
             return
 
@@ -1583,6 +1605,7 @@ class PeerManager:
                     node_compact_filters=self.node_compact_filters,
                     node_network_limited=self.node_network_limited,
                     on_disconnect=self._handle_peer_disconnected)
+        peer.prefer_evict = discouraged
         # Reserve the slot before the first read; give it back however the
         # handshake ends (success moves it into inbound_peers below).
         self._pending_inbound += 1

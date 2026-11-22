@@ -575,12 +575,6 @@ def test_w128_g20_eviction_protect_8_block_relay_only_time() -> None:
     )
 
 
-@pytest.mark.xfail(
-    reason="W128 BUG-18 (P2): Peer has no prefer_evict field; Core's "
-           "eviction collapses candidates to prefer_evict-only when "
-           "any present (eviction.cpp:212-215).",
-    strict=True,
-)
 def test_w128_g21_eviction_prefer_evict_reduce() -> None:
     """G21: Peer has prefer_evict field and eviction collapses to it.
 
@@ -778,8 +772,12 @@ def test_w128_g28_banman_discouragement_filter_separate() -> None:
     accept-flow rejects banned peers unconditionally but only
     rejects discouraged peers when inbound is (almost) full.
 
-    ouroboros: ONE `banned: dict[str, float]`. Every discouragement
-    event calls the same `ban()` that writes to disk.
+    ouroboros: automatic punishment calls `discourage()` (bounded,
+    in-memory, never written to bans.json); `setban` still calls `ban()`.
+    The inbound gate refuses a banned address always and a discouraged
+    one only when `len(inbound_peers) + pending + 1 >= max_inbound`,
+    marking an accepted discouraged inbound `prefer_evict` (asserted in
+    tests/test_cffix_autoban_bounded.py).
     """
     # Core-parity APIs that should exist on BanManager.
     expected = ["discourage", "is_discouraged"]
