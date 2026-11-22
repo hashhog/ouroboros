@@ -762,6 +762,105 @@ _PY_ERROR_PREFIXES: tuple[tuple[str, str], ...] = (
 )
 
 
+class PrecomputedTransactionData:
+    """Per-transaction sighash aggregates, computed at most once.
+
+    Port of Bitcoin Core's ``PrecomputedTransactionData``
+    (src/script/interpreter.cpp, ``Init``).  BIP143 (``hashPrevouts``,
+    ``hashSequence``, ``hashOutputs``) and BIP341 (``sha_prevouts``,
+    ``sha_amounts``, ``sha_scriptpubkeys``, ``sha_sequences``,
+    ``sha_outputs``) commit to the whole transaction, not to the input or the
+    signature being checked, so Core hashes them once per transaction and
+    every ``SignatureHash`` / ``SignatureHashSchnorr`` call reads the cached
+    value.  Rebuilding them per signature check costs
+    O(signatures x (inputs + outputs)).
+
+    Unlike Core, the fields are filled lazily on first use, so a transaction
+    with only legacy inputs pays nothing.  The object describes ``tx`` as it
+    was when first used: it must not outlive a verification of that
+    transaction (``ScriptInterpreter.verify_python`` builds one per call
+    unless the caller passes one shared across the inputs of one tx).
+    """
+
+    __slots__ = ("tx", "input_amounts", "input_script_pubkeys",
+                 "_single", "_amounts", "_spks", "_bip143")
+
+    def __init__(
+        self,
+        tx: Transaction,
+        input_amounts: list[int] | None = None,
+        input_script_pubkeys: list[bytes] | None = None,
+    ) -> None:
+        self.tx = tx
+        self.input_amounts = input_amounts
+        self.input_script_pubkeys = input_script_pubkeys
+        self._single: tuple[bytes, bytes, bytes] | None = None
+        self._amounts: bytes | None = None
+        self._spks: bytes | None = None
+        self._bip143: tuple[bytes, bytes, bytes] | None = None
+
+    @staticmethod
+    def _compact_size(n: int) -> bytes:
+        if n < 0xFD:
+            return struct.pack('<B', n)
+        if n <= 0xFFFF:
+            return b'\xfd' + struct.pack('<H', n)
+        if n <= 0xFFFFFFFF:
+            return b'\xfe' + struct.pack('<I', n)
+        return b'\xff' + struct.pack('<Q', n)
+
+    def single_sha(self) -> tuple[bytes, bytes, bytes]:
+        """SHA256 of (prevouts, sequences, outputs): BIP341 ``sha_*``."""
+        if self._single is None:
+            tx = self.tx
+            prevouts = bytearray()
+            seqs = bytearray()
+            for inp in tx.inputs:
+                prevouts.extend(inp.prev_txid)
+                prevouts.extend(struct.pack('<I', inp.prev_vout))
+                seqs.extend(struct.pack('<I', inp.sequence))
+            outs = bytearray()
+            for out in tx.outputs:
+                outs.extend(struct.pack('<q', out.value))
+                outs.extend(self._compact_size(len(out.script_pubkey)))
+                outs.extend(out.script_pubkey)
+            self._single = (
+                hashlib.sha256(bytes(prevouts)).digest(),
+                hashlib.sha256(bytes(seqs)).digest(),
+                hashlib.sha256(bytes(outs)).digest(),
+            )
+        return self._single
+
+    def bip143(self) -> tuple[bytes, bytes, bytes]:
+        """(hashPrevouts, hashSequence, hashOutputs): SHA256d, as Core derives
+        them from the single-SHA256 values (``SHA256Uint256``)."""
+        if self._bip143 is None:
+            p, s, o = self.single_sha()
+            self._bip143 = (
+                hashlib.sha256(p).digest(),
+                hashlib.sha256(s).digest(),
+                hashlib.sha256(o).digest(),
+            )
+        return self._bip143
+
+    def sha_amounts(self) -> bytes:
+        if self._amounts is None:
+            amounts = bytearray()
+            for amt in self.input_amounts or ():
+                amounts.extend(struct.pack('<q', amt))
+            self._amounts = hashlib.sha256(bytes(amounts)).digest()
+        return self._amounts
+
+    def sha_scriptpubkeys(self) -> bytes:
+        if self._spks is None:
+            spks = bytearray()
+            for spk in self.input_script_pubkeys or ():
+                spks.extend(self._compact_size(len(spk)))
+                spks.extend(spk)
+            self._spks = hashlib.sha256(bytes(spks)).digest()
+        return self._spks
+
+
 class ConditionStack:
     """The IF/NOTIF/ELSE/ENDIF execution stack, with O(1) operations.
 
@@ -847,6 +946,15 @@ class ScriptInterpreter:
             tls = self._error_tls = threading.local()
         tls.value = value
 
+    def _active_txdata(self, tx: Transaction) -> PrecomputedTransactionData | None:
+        """The precomputed data of the ``verify_python`` call running on this
+        thread, if it describes ``tx``; else ``None`` (compute directly)."""
+        tls = self.__dict__.get("_txdata_tls")
+        txdata = getattr(tls, "value", None) if tls is not None else None
+        if txdata is not None and txdata.tx is tx:
+            return txdata
+        return None
+
     def verify(
         self,
         script_sig: bytes,
@@ -857,11 +965,14 @@ class ScriptInterpreter:
         amount: int = 0,
         input_amounts: list[int] | None = None,
         input_script_pubkeys: list[bytes] | None = None,
+        txdata: PrecomputedTransactionData | None = None,
     ) -> bool:
         """Verify one input (Core ``VerifyScript``), Python or native.
 
         Dispatches on ``NATIVE_SCRIPT_ENABLED`` (``OUROBOROS_NATIVE_SCRIPT``);
         both paths share this signature and return only the decision.
+        ``txdata`` is used by the Python path only (the native path builds
+        its own per-tx context).
         """
         if NATIVE_SCRIPT_ENABLED:
             return self.verify_native(
@@ -875,6 +986,7 @@ class ScriptInterpreter:
             flags=flags, amount=amount,
             input_amounts=input_amounts,
             input_script_pubkeys=input_script_pubkeys,
+            txdata=txdata,
         )
 
     def verify_native(
@@ -926,6 +1038,7 @@ class ScriptInterpreter:
         amount: int = 0,
         input_amounts: list[int] | None = None,
         input_script_pubkeys: list[bytes] | None = None,
+        txdata: PrecomputedTransactionData | None = None,
     ) -> bool:
         """
         Verify a script against the consensus rules indicated by *flags*.
@@ -939,11 +1052,31 @@ class ScriptInterpreter:
         6. If P2SH, deserialize and execute redeem script
         7. If witness program detected, verify witness
         8. Enforce clean stack
+
+        ``txdata`` (Core ``PrecomputedTransactionData``) holds the BIP143 /
+        BIP341 per-tx hashes.  Pass one object, built from the same ``tx``,
+        ``input_amounts`` and ``input_script_pubkeys``, for every input of a
+        transaction to hash them once per tx; when omitted, one is built for
+        this call, so they are hashed once per input instead of once per
+        signature check.
         """
         self.last_error = None
-        ok = self._verify_python_inner(
-            script_sig, script_pubkey, tx, input_index, flags, amount,
-            input_amounts, input_script_pubkeys)
+        if (txdata is None or txdata.tx is not tx
+                or txdata.input_amounts is not input_amounts
+                or txdata.input_script_pubkeys is not input_script_pubkeys):
+            txdata = PrecomputedTransactionData(
+                tx, input_amounts, input_script_pubkeys)
+        tls = self.__dict__.get("_txdata_tls")
+        if tls is None:
+            tls = self._txdata_tls = threading.local()
+        prev = getattr(tls, "value", None)
+        tls.value = txdata
+        try:
+            ok = self._verify_python_inner(
+                script_sig, script_pubkey, tx, input_index, flags, amount,
+                input_amounts, input_script_pubkeys)
+        finally:
+            tls.value = prev
         if ok:
             self.last_error = None
         return ok
@@ -1200,33 +1333,27 @@ class ScriptInterpreter:
         if base_type == 0:
             base_type = 0x01
 
+        # hashPrevouts / hashSequence / hashOutputs commit to the whole tx;
+        # they come from the per-tx precompute (Core
+        # PrecomputedTransactionData) when this runs under verify_python.
+        pre = self._active_txdata(tx) or PrecomputedTransactionData(tx)
+        all_prevouts, all_sequences, all_outputs = pre.bip143()
+
         # hashPrevouts
         if not anyone_can_pay:
-            prevouts = bytearray()
-            for inp in tx.inputs:
-                prevouts.extend(inp.prev_txid)
-                prevouts.extend(struct.pack('<I', inp.prev_vout))
-            hash_prevouts = hashlib.sha256(hashlib.sha256(bytes(prevouts)).digest()).digest()
+            hash_prevouts = all_prevouts
         else:
             hash_prevouts = b'\x00' * 32
 
         # hashSequence
         if not anyone_can_pay and base_type not in (0x02, 0x03):
-            seqs = bytearray()
-            for inp in tx.inputs:
-                seqs.extend(struct.pack('<I', inp.sequence))
-            hash_sequence = hashlib.sha256(hashlib.sha256(bytes(seqs)).digest()).digest()
+            hash_sequence = all_sequences
         else:
             hash_sequence = b'\x00' * 32
 
         # hashOutputs
         if base_type not in (0x02, 0x03):
-            outs = bytearray()
-            for out in tx.outputs:
-                outs.extend(struct.pack('<q', out.value))
-                outs.extend(self._encode_varint(len(out.script_pubkey)))
-                outs.extend(out.script_pubkey)
-            hash_outputs = hashlib.sha256(hashlib.sha256(bytes(outs)).digest()).digest()
+            hash_outputs = all_outputs
         elif base_type == 0x03 and input_index < len(tx.outputs):
             out = tx.outputs[input_index]
             single_out = struct.pack('<q', out.value)
@@ -3219,47 +3346,38 @@ class ScriptInterpreter:
         data.extend(struct.pack('<I', tx.version & 0xFFFFFFFF))
         data.extend(struct.pack('<I', tx.locktime))
 
+        # sha_* commit to the whole tx; they come from the per-tx precompute
+        # (Core PrecomputedTransactionData) when this runs under
+        # verify_python with the same amounts/scriptPubKeys lists.
+        pre = self._active_txdata(tx)
+        if (pre is None or pre.input_amounts is not input_amounts
+                or pre.input_script_pubkeys is not input_script_pubkeys):
+            pre = PrecomputedTransactionData(
+                tx, input_amounts, input_script_pubkeys)
+
         if not anyone_can_pay:
+            sha_prevouts, sha_sequences, _ = pre.single_sha()
             # sha_prevouts: SHA256 of all outpoints
-            prevouts = bytearray()
-            for inp in tx.inputs:
-                prevouts.extend(inp.prev_txid)
-                prevouts.extend(struct.pack('<I', inp.prev_vout))
-            data.extend(hashlib.sha256(bytes(prevouts)).digest())
+            data.extend(sha_prevouts)
 
             # sha_amounts: SHA256 of all input amounts
             if input_amounts:
-                amounts = bytearray()
-                for amt in input_amounts:
-                    amounts.extend(struct.pack('<q', amt))
-                data.extend(hashlib.sha256(bytes(amounts)).digest())
+                data.extend(pre.sha_amounts())
             else:
                 data.extend(b'\x00' * 32)
 
             # sha_scriptpubkeys: SHA256 of all input scriptPubKeys (compact-size prefixed)
             if input_script_pubkeys:
-                spks = bytearray()
-                for spk in input_script_pubkeys:
-                    spks.extend(self._ser_script_size(spk))
-                    spks.extend(spk)
-                data.extend(hashlib.sha256(bytes(spks)).digest())
+                data.extend(pre.sha_scriptpubkeys())
             else:
                 data.extend(b'\x00' * 32)
 
             # sha_sequences: SHA256 of all sequences
-            seqs = bytearray()
-            for inp in tx.inputs:
-                seqs.extend(struct.pack('<I', inp.sequence))
-            data.extend(hashlib.sha256(bytes(seqs)).digest())
+            data.extend(sha_sequences)
 
         if base_type not in (2, 3):  # not NONE and not SINGLE
             # sha_outputs: SHA256 of all outputs
-            outs = bytearray()
-            for out in tx.outputs:
-                outs.extend(struct.pack('<q', out.value))
-                outs.extend(self._ser_script_size(out.script_pubkey))
-                outs.extend(out.script_pubkey)
-            data.extend(hashlib.sha256(bytes(outs)).digest())
+            data.extend(pre.single_sha()[2])
 
         # Spend type: (ext_flag << 1) | annex_present
         annex_present = 1 if annex else 0
