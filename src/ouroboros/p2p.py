@@ -4998,11 +4998,12 @@ class PeerManager:
              ("since that would discourage all peers on the same local
              address").
           4. Otherwise Discourage(addr) + DisconnectNode(addr) -- here
-             ``BanManager.ban`` and its ``_on_peer_banned`` callback.
+             ``BanManager.discourage`` and its ``_on_peer_banned`` callback.
 
-        Bans are keyed by address, so cases 1-3 must never reach ``ban()``:
-        a stored ban for the address would make the inbound gate (which
-        checks ``is_banned(host)`` before any noban flag is known) refuse the
+        Discouragement is keyed by address, so cases 1-3 must never reach
+        ``discourage()``: a recorded address would make the inbound gate
+        (which checks ``is_banned_or_discouraged(host)`` before any noban
+        flag is known) refuse the
         next connection from it.  For a bare address naming several
         connections, the exemption holds only if every one is exempt.
         """

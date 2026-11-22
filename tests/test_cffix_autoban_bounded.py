@@ -131,3 +131,21 @@ def test_inbound_gate_refuses_discouraged_address_on_a_new_port(tmp_path, monkey
     assert w.closed
     assert handshakes == ["198.51.100.41"], (
         "discouraged address must be refused at the inbound gate, before the handshake")
+
+
+def test_clearbanned_clears_bans_but_not_discouragement(tmp_path):
+    """Core BanMan::ClearBanned clears m_banned only (banman.cpp); the
+    discouraged filter survives, so a discouraged address stays refused."""
+    import asyncio
+    from types import SimpleNamespace
+
+    from ouroboros.rpc import RPCServer
+
+    bm = BanManager(data_dir=str(tmp_path))
+    bm.setban("198.51.100.50", "add")
+    bm.record_misbehavior("198.51.100.51:4000", 100, "invalid block")
+    fake = SimpleNamespace(node=SimpleNamespace(
+        peer_manager=SimpleNamespace(ban_manager=bm)))
+    asyncio.run(RPCServer.rpc_clearbanned(fake))
+    assert not bm.is_banned("198.51.100.50")
+    assert getattr(bm, "is_discouraged", lambda _ip: False)("198.51.100.51")
