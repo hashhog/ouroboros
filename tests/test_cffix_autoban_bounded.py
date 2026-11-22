@@ -87,3 +87,47 @@ def test_control_below_threshold_neither_bans_nor_discourages(tmp_path):
     assert bm.record_misbehavior("203.0.113.10", 10, "minor") is False
     assert not bm.is_banned("203.0.113.10")
     assert not getattr(bm, "is_discouraged", lambda _ip: False)("203.0.113.10")
+
+
+class _FakeWriter:
+    def __init__(self, host: str, port: int):
+        self._peername = (host, port)
+        self.closed = False
+
+    def get_extra_info(self, name, default=None):
+        return self._peername if name == "peername" else default
+
+    def close(self):
+        self.closed = True
+
+
+def test_inbound_gate_refuses_discouraged_address_on_a_new_port(tmp_path, monkeypatch):
+    """The gate must still see an automatically punished address: it moved
+    from ``banned`` to ``discouraged``, so a gate that only consulted
+    ``is_banned`` would let it straight back in."""
+    import asyncio
+
+    from ouroboros.p2p import PeerManager
+
+    from ouroboros import p2p as p2p_mod
+
+    handshakes = []
+
+    async def fake_accept(self, reader, writer, start_height):
+        handshakes.append(self.host)
+        return False
+
+    monkeypatch.setattr(p2p_mod.Peer, "accept_inbound", fake_accept)
+
+    pm = PeerManager(network="regtest", data_dir=str(tmp_path), listen=False)
+    # Control: an unpunished address does reach the handshake.
+    asyncio.run(pm._handle_inbound_connection(None, _FakeWriter("198.51.100.41", 1)))
+    assert handshakes == ["198.51.100.41"]
+
+    assert pm.misbehaving("198.51.100.40:51000", 100, "invalid block")
+    assert not (tmp_path / "bans.json").exists()
+    w = _FakeWriter("198.51.100.40", 52000)
+    asyncio.run(pm._handle_inbound_connection(None, w))
+    assert w.closed
+    assert handshakes == ["198.51.100.41"], (
+        "discouraged address must be refused at the inbound gate, before the handshake")

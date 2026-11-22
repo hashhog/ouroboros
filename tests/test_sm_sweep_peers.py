@@ -49,7 +49,7 @@ def test_sm_sweep_misbehaving_host_port_bans_the_address(pm):
     banned = pm.misbehaving("198.51.100.7:51234", 100, "invalid block")
     assert banned, "precondition: score 100 triggers a ban"
     # Same IP, next inbound connection from a fresh ephemeral port.
-    assert pm.ban_manager.is_banned("198.51.100.7"), (
+    assert pm.ban_manager.is_discouraged("198.51.100.7"), (
         "a ban for 198.51.100.7:51234 must cover 198.51.100.7"
     )
 
@@ -58,7 +58,7 @@ def test_sm_sweep_control_misbehaving_host_bans_the_address(pm):
     """Control: the one caller that passes a bare host (p2p.py oversized
     addr) does produce an address-level ban."""
     assert pm.misbehaving("198.51.100.8", 100, "addr message size")
-    assert pm.ban_manager.is_banned("198.51.100.8")
+    assert pm.ban_manager.is_discouraged("198.51.100.8")
 
 
 # --------------------------------------------------------------------------- #

@@ -48,9 +48,9 @@ async def _settle():
 def test_ban_by_host_port_blocks_same_ip_on_a_new_port(pm):
     """Inbound gate checks ``host`` and ``host:newport``; both must be banned."""
     assert pm.misbehaving("198.51.100.7:51234", 100, "invalid block")
-    assert pm.ban_manager.is_banned("198.51.100.7")
-    assert pm.ban_manager.is_banned("198.51.100.7:40000")
-    assert pm.ban_manager.is_banned("198.51.100.7:51234")
+    assert pm.ban_manager.is_banned_or_discouraged("198.51.100.7")
+    assert pm.ban_manager.is_banned_or_discouraged("198.51.100.7:40000")
+    assert pm.ban_manager.is_banned_or_discouraged("198.51.100.7:51234")
 
 
 def test_ban_by_host_port_is_seen_by_the_dial_path(pm):
@@ -62,8 +62,8 @@ def test_ban_by_host_port_is_seen_by_the_dial_path(pm):
 
 def test_bracketed_ipv6_host_port_bans_the_address(pm):
     assert pm.misbehaving("[2001:db8::7]:8333", 100, "invalid block")
-    assert pm.ban_manager.is_banned("2001:db8::7")
-    assert pm.ban_manager.is_banned("[2001:db8::7]:9999")
+    assert pm.ban_manager.is_banned_or_discouraged("2001:db8::7")
+    assert pm.ban_manager.is_banned_or_discouraged("[2001:db8::7]:9999")
 
 
 @pytest.mark.asyncio
@@ -73,8 +73,8 @@ async def test_unbracketed_ipv6_connection_key_bans_the_peer_host(pm):
     resolved through the connected peer that owns it."""
     _inbound_peer(pm, "2001:db8::9", 8333)
     assert pm.misbehaving("2001:db8::9:8333", 100, "invalid block")
-    assert pm.ban_manager.is_banned("2001:db8::9")
-    assert pm.ban_manager.is_banned("[2001:db8::9]:41000")
+    assert pm.ban_manager.is_banned_or_discouraged("2001:db8::9")
+    assert pm.ban_manager.is_banned_or_discouraged("[2001:db8::9]:41000")
     await _settle()
 
 
@@ -83,7 +83,7 @@ def test_scores_accumulate_per_address_across_ports(pm):
     assert not pm.misbehaving("198.51.100.13:40001", 20, "bad headers")
     assert not pm.misbehaving("198.51.100.13:40002", 20, "bad headers")
     assert pm.ban_manager.get_score("198.51.100.13") == 40
-    assert not pm.ban_manager.is_banned("198.51.100.13")
+    assert not pm.ban_manager.is_banned_or_discouraged("198.51.100.13")
 
 
 @pytest.mark.asyncio
@@ -127,7 +127,7 @@ def test_control_subnet_and_bare_host_keys_unchanged():
 
 def test_control_below_threshold_does_not_ban(pm):
     assert not pm.misbehaving("198.51.100.16:40000", 10, "invalid tx")
-    assert not pm.ban_manager.is_banned("198.51.100.16")
+    assert not pm.ban_manager.is_banned_or_discouraged("198.51.100.16")
 
 
 # --- Warden review of #186: Core's MaybeDiscourageAndDisconnect exemptions ---
@@ -158,8 +158,8 @@ async def test_local_peer_is_disconnected_but_not_discouraged(pm):
     assert pm.misbehaving("127.0.0.1:18444", 100, "invalid block")
     await _settle()
     assert pm.ban_manager.list_banned() == {}
-    assert not pm.ban_manager.is_banned("127.0.0.1")
-    assert not pm.ban_manager.is_banned("127.0.0.1:18446")
+    assert not pm.ban_manager.is_banned_or_discouraged("127.0.0.1")
+    assert not pm.ban_manager.is_banned_or_discouraged("127.0.0.1:18446")
     # only the peer that misbehaved goes
     assert bad.state != PeerState.READY
     assert "127.0.0.1:18444" not in pm.inbound_peers
@@ -170,8 +170,8 @@ async def test_local_peer_is_disconnected_but_not_discouraged(pm):
 def test_local_address_without_a_connected_peer_is_not_discouraged(pm):
     pm.misbehaving("127.0.0.1:18444", 100, "invalid block")
     pm.misbehaving("[::1]:18444", 100, "invalid block")
-    assert not pm.ban_manager.is_banned("127.0.0.1")
-    assert not pm.ban_manager.is_banned("::1")
+    assert not pm.ban_manager.is_banned_or_discouraged("127.0.0.1")
+    assert not pm.ban_manager.is_banned_or_discouraged("::1")
 
 
 @pytest.mark.asyncio
@@ -180,7 +180,7 @@ async def test_noban_peer_is_neither_banned_nor_disconnected(pm):
     peer.noban = True
     assert not pm.misbehaving("198.51.100.9:8333", 100, "invalid block")
     await _settle()
-    assert not pm.ban_manager.is_banned("198.51.100.9")
+    assert not pm.ban_manager.is_banned_or_discouraged("198.51.100.9")
     assert pm.ban_manager.list_banned() == {}
     assert peer.state == PeerState.READY
     assert "198.51.100.9:8333" in pm.inbound_peers
@@ -192,7 +192,7 @@ async def test_manual_peer_is_neither_banned_nor_disconnected(pm):
     peer.is_manual = True
     assert not pm.misbehaving("198.51.100.8:8333", 100, "invalid block")
     await _settle()
-    assert not pm.ban_manager.is_banned("198.51.100.8")
+    assert not pm.ban_manager.is_banned_or_discouraged("198.51.100.8")
     assert pm.ban_manager.list_banned() == {}
     assert peer.state == PeerState.READY
     assert "198.51.100.8:8333" in pm.peers
@@ -208,7 +208,7 @@ async def test_oversize_addr_from_noban_peer_is_not_banned(pm):
     peer.noban = True
     pm._misbehave_oversize_addr(peer, AddrCountExceeded("addr", 1001))
     await _settle()
-    assert not pm.ban_manager.is_banned("198.51.100.10")
+    assert not pm.ban_manager.is_banned_or_discouraged("198.51.100.10")
     assert peer.state == PeerState.READY
 
 
@@ -220,7 +220,7 @@ async def test_control_ordinary_peer_next_to_noban_peer_is_still_banned(pm):
     exempt.noban = True
     assert pm.misbehaving("203.0.113.5:40000", 100, "invalid block")
     await _settle()
-    assert pm.ban_manager.is_banned("203.0.113.5")
+    assert pm.ban_manager.is_banned_or_discouraged("203.0.113.5")
     assert plain.state != PeerState.READY
     # _on_peer_banned keeps its existing noban skip for the other connection
     assert exempt.state == PeerState.READY

@@ -770,14 +770,6 @@ def test_w128_g27_anchors_dat_binary_format() -> None:
 # ===========================================================================
 
 
-@pytest.mark.xfail(
-    reason="W128 BUG-25 (P0): BanManager conflates ban and discouragement; "
-           "Core has m_banned (persistent CSubNet map) and m_discouraged "
-           "(CRollingBloomFilter[50000, 1e-6]) — separate APIs and "
-           "different accept-time semantics (banman.h:96-98, "
-           "net.cpp:1804-1818).",
-    strict=True,
-)
 def test_w128_g28_banman_discouragement_filter_separate() -> None:
     """G28: BanManager has separate ban + discourage paths.
 

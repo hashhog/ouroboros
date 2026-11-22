@@ -79,7 +79,7 @@ class TestG1SingleEventDiscourage(unittest.TestCase):
         bm = BanManager(ban_threshold=100)
         result = bm.misbehaving("1.2.3.4", 100, "invalid block")
         self.assertTrue(result, "score=100 event should return True (banned)")
-        self.assertTrue(bm.is_banned("1.2.3.4"))
+        self.assertTrue(bm.is_discouraged("1.2.3.4"))
 
     def test_single_large_score_discourages_even_below_ban_threshold(self):
         """Core 2022: a single score >= DISCOURAGEMENT_THRESHOLD discourages.
@@ -95,8 +95,8 @@ class TestG1SingleEventDiscourage(unittest.TestCase):
         # Score 50 in one event — equals DISCOURAGEMENT_THRESHOLD → instant ban
         result = bm.misbehaving("1.2.3.5", 50, "headers dont connect")
         self.assertTrue(result, "score=50 event SHOULD trigger discourage (Core 2022)")
-        self.assertTrue(bm.is_banned("1.2.3.5"),
-                        "peer should be in banned set after single-event discourage")
+        self.assertTrue(bm.is_discouraged("1.2.3.5"),
+                        "peer should be in discouraged set after single-event discourage")
 
 
 # ---------------------------------------------------------------------------
@@ -1020,7 +1020,7 @@ class TestMisbehavingScoreAccumulation(unittest.TestCase):
         bm.misbehaving("14.14.14.14", 100, "instant ban")
         # Score is cleared on ban
         self.assertEqual(bm.get_score("14.14.14.14"), 0)
-        self.assertTrue(bm.is_banned("14.14.14.14"))
+        self.assertTrue(bm.is_discouraged("14.14.14.14"))
 
 
 if __name__ == "__main__":

@@ -44,13 +44,13 @@ def test_adjust_score_clamps_and_bans_after_threshold():
     for _ in range(99):
         peer.adjust_score(-1)
         assert peer.score > 0
-        assert peer.host not in bm.banned
+        assert peer.host not in bm.discouraged
         assert fired == []
 
     # The 100th -1 lands at zero and must trigger the ban.
     peer.adjust_score(-1)
     assert peer.score == 0
-    assert peer.host in bm.banned, "host must be in BanManager.banned set"
+    assert peer.host in bm.discouraged, "host must be in BanManager.discouraged set"
     assert fired == [peer.host], "on_ban callback must fire exactly once"
 
 
@@ -75,7 +75,7 @@ def test_adjust_score_repeated_calls_at_zero_do_not_re_ban():
     )
     # And the ban entry should still be present (not removed by the
     # repeated calls).
-    assert peer.host in bm.banned
+    assert peer.host in bm.discouraged
 
 
 def test_adjust_score_without_ban_manager_is_log_only():
@@ -94,4 +94,4 @@ def test_adjust_score_positive_delta_does_not_trigger_ban():
     peer.adjust_score(+5)
     assert peer.score == 100  # already at ceiling
     assert fired == []
-    assert peer.host not in bm.banned
+    assert peer.host not in bm.discouraged
