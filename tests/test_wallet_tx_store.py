@@ -420,8 +420,7 @@ def test_unlock_catches_up_blocks_connected_and_lost_while_locked(tmp_path):
     chain.connect(via_mgr, 102, [_coinbase(102, FOREIGN_SPK), stale], tag="A")
     assert 3 * COIN in {c["value"] for c in w.wallet_coins()}
 
-    w.encrypt("pw")
-    w.lock()
+    w.encrypt("pw")  # ends locked, as Core's EncryptWallet
     # Reorg while locked: 102A is replaced by 102B, then 103 pays the wallet.
     chain.utxos.pop((stale.txid, 0), None)
     chain.connect(via_mgr, 102, [_coinbase(102, FOREIGN_SPK)], tag="B")
@@ -511,8 +510,7 @@ def test_block_connected_through_the_rpc_path_while_locked_is_found_on_unlock(tm
     wallet directly, locked or not.  A locked wallet (no scripts in memory)
     must not record that block as processed, or unlock would skip it."""
     w, chain, _addr, spk = _funded_wallet(tmp_path, blocks=101)
-    w.encrypt("pw")
-    w.lock()
+    w.encrypt("pw")  # ends locked, as Core's EncryptWallet
     pay = _spend(_h("foreign"), 0, [(spk, 7 * COIN)], tag="pay")
     chain.connect(w, 102, [_coinbase(102, FOREIGN_SPK), pay])   # RPC path
 

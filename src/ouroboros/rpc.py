@@ -16,6 +16,7 @@ import re as _re
 import statistics
 import struct as _struct
 import time
+import weakref
 from collections import defaultdict
 from typing import Any
 
@@ -1739,6 +1740,23 @@ class JSONRPCRequest(BaseModel):
     method: str
     params: list[Any] | dict[str, Any] = []
     id: int | str | None = None
+
+
+# Core wallet/rpc/encrypt.cpp walletpassphrase MAX_SLEEP_TIME.
+_WALLET_MAX_SLEEP_TIME = 100000000
+
+
+def _relock_wallet(wallet_ref: "weakref.ReferenceType[Any]", relock_time: float) -> None:
+    """walletpassphrase's scheduled relock (Core's scheduler callback)."""
+    wallet = wallet_ref()
+    if wallet is None or wallet._relock_time != relock_time:
+        return
+    wallet._relock_time = 0
+    if wallet.is_encrypted and not wallet.is_locked:
+        try:
+            wallet.lock()
+        except Exception as e:
+            logger.error("wallet '%s': timed relock failed: %s", wallet.name, e)
 
 
 class JSONRPCResponse(BaseModel):
@@ -6557,6 +6575,14 @@ class RPCServer:
                 },
                 id=None,
             )
+        # Core encrypt.cpp: a negative timeout would relock at once; larger
+        # than MAX_SLEEP_TIME is clamped.
+        if timeout < 0:
+            return JSONRPCResponse(
+                error={"code": -8, "message": "Timeout cannot be negative."},
+                id=None,
+            )
+        timeout = min(timeout, _WALLET_MAX_SLEEP_TIME)
         try:
             wallet.unlock(passphrase)
         except ValueError:
@@ -6567,6 +6593,14 @@ class RPCServer:
                 },
                 id=None,
             )
+        # Core: nRelockTime = GetTime() + nSleepTime, then a scheduler
+        # callback after nSleepTime seconds locks the wallet unless a newer
+        # walletpassphrase or a walletlock replaced nRelockTime.
+        relock_time = time.time() + timeout
+        wallet._relock_time = relock_time
+        asyncio.get_running_loop().call_later(
+            timeout, _relock_wallet, weakref.ref(wallet), relock_time
+        )
         return True
 
     async def rpc_walletlock(self) -> bool:
@@ -6597,6 +6631,8 @@ class RPCServer:
                 },
                 id=None,
             )
+        # Core walletlock: nRelockTime = 0, so a pending relock is a no-op.
+        wallet._relock_time = 0
         return True
 
     async def rpc_walletpassphrasechange(
@@ -6619,11 +6655,20 @@ class RPCServer:
                 },
                 id=None,
             )
+        if not old_passphrase or not new_passphrase:
+            return JSONRPCResponse(
+                error={"code": -8, "message": "passphrase cannot be empty"},
+                id=None,
+            )
         try:
             wallet.change_passphrase(old_passphrase, new_passphrase)
-        except ValueError as exc:
+        except ValueError:
             return JSONRPCResponse(
-                error={"code": -14, "message": str(exc)}, id=None
+                error={
+                    "code": -14,
+                    "message": "Error: The wallet passphrase entered was incorrect.",
+                },
+                id=None,
             )
         return True
 

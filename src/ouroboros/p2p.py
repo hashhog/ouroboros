@@ -14,6 +14,7 @@ Reference: Bitcoin Core net.cpp, net_processing.cpp
 
 import asyncio
 import base64
+import copy
 import gc
 import json
 import logging
@@ -835,8 +836,14 @@ class PeerManager:
         self._erlay_peers: dict[str, ReconciliationSet] = {}  # addr -> recon set
         self._erlay_local_salts: dict[str, int] = {}  # addr -> our salt
         self._erlay_pending_recon: dict[str, bool] = {}  # addr -> recon in progress
+        # addr -> monotonic time we sent reqtxrcncl (pending rounds only)
+        self._erlay_recon_started: dict[str, float] = {}
         self._reconciliation_task: asyncio.Task | None = None
         self._reconciliation_interval: float = 2.0  # seconds between rounds
+        # A peer that has not answered our reqtxrcncl within this many
+        # seconds is given up on for the round: its pending set is flooded
+        # via INV (the BIP 330 fallback) and it becomes eligible again.
+        self._reconciliation_timeout: float = 30.0
 
         # BIP 331 package relay state.
         # ``package_relay_enabled`` is the local advertisement flag — when
@@ -927,6 +934,10 @@ class PeerManager:
         self._discover: bool = bool(discover)
         self._is_ibd_func = is_ibd
         self._local_addr_task: asyncio.Task | None = None
+        # getaddr response cache, keyed by the local bind of the requesting
+        # inbound connection: key -> [addresses, expiry_unix_time].  Core
+        # ``CConnman::m_addr_response_caches`` (net.cpp:3702-3737).
+        self._addr_response_caches: dict = {}
 
         # -connect mode: a non-empty pin list disables DNS-seed resolution
         # and all addrman/auto-outbound dialing.  Latched once at construction
@@ -1617,6 +1628,9 @@ class PeerManager:
                     node_network_limited=self.node_network_limited,
                     on_disconnect=self._handle_peer_disconnected)
         peer.prefer_evict = discouraged
+        sockname = writer.get_extra_info("sockname")
+        if sockname:
+            peer.addr_bind = (str(sockname[0]), int(sockname[1]))
         # Reserve the slot before the first read; give it back however the
         # handshake ends (success moves it into inbound_peers below).
         self._pending_inbound += 1
@@ -2896,6 +2910,7 @@ class PeerManager:
         self._erlay_peers.pop(addr, None)
         self._erlay_local_salts.pop(addr, None)
         self._erlay_pending_recon.pop(addr, None)
+        self._erlay_recon_started.pop(addr, None)
         self.cmpct_peers.discard(addr)
         self._package_peers.discard(addr)
         self._addr_relay_counts.pop(addr, None)
@@ -4086,10 +4101,9 @@ class PeerManager:
                     return
                 peer.getaddr_recvd = True
                 # (b) 23%-cap: min(1000, floor(23 * size / 100)).  Core
-                # net_processing.cpp:4842/4844 -> addrman GetAddr_ (addrman.cpp:797).
-                infos = self.addrman.get_addresses_for_sharing(
-                    max_addresses=1000, max_pct=23,
-                )
+                # net_processing.cpp:4842/4844 -> addrman GetAddr_ (addrman.cpp:797),
+                # served from the per-network response cache (net.cpp:3702).
+                infos = self._get_addr_response(peer)
                 if not infos:
                     return
                 from ouroboros.p2p_messages import NetworkAddress
@@ -4116,6 +4130,33 @@ class PeerManager:
         peer.register_handler("addr", on_addr)
         peer.register_handler("addrv2", on_addrv2)
         peer.register_handler("getaddr", on_getaddr)
+
+    def _get_addr_response(self, peer: Peer) -> list:
+        """Addresses to answer *peer*'s getaddr with, from a per-network cache.
+
+        Core ``CConnman::GetAddresses(CNode& requestor, ...)`` (net.cpp:3702-3737):
+        one cached reply per ``m_network_key`` (derived from the local address the
+        connection was accepted on), redrawn only after 21 h + rand(6 h).  Without
+        it every reconnect yields a fresh 23% sample, so a peer can enumerate the
+        whole addrman and correlate the timestamps it sees across our onion and
+        clearnet listeners.
+        """
+        key = peer.addr_bind
+        now = time.time()
+        entry = self._addr_response_caches.get(key)
+        if entry is None or entry[1] < now:
+            # Snapshot the entries (Core caches CAddress values): later addrman
+            # updates to last_seen/services must not show through the cache.
+            addrs = [
+                copy.copy(info)
+                for info in self.addrman.get_addresses_for_sharing(
+                    max_addresses=1000, max_pct=23,
+                )
+            ]
+            expiry = now + 21 * 3600 + random.uniform(0, 6 * 3600)
+            entry = [addrs, expiry]
+            self._addr_response_caches[key] = entry
+        return entry[0]
 
     async def _send_getaddr(self, peer: Peer) -> None:
         try:
@@ -4753,16 +4794,35 @@ class PeerManager:
                     # Skip peers with no pending transactions
                     if recon.set_size == 0:
                         continue
-                    # Skip if reconciliation already in progress
+                    peer = self.get_peer_by_addr(addr)
+
+                    # Skip if reconciliation already in progress, unless
+                    # the peer has sat on our reqtxrcncl past the timeout:
+                    # then flood its pending set and stop waiting.
                     if self._erlay_pending_recon.get(addr, False):
+                        started = self._erlay_recon_started.get(addr)
+                        if (
+                            started is None
+                            or time.monotonic() - started
+                            < self._reconciliation_timeout
+                        ):
+                            continue
+                        logger.debug(
+                            f"Reconciliation with {addr} timed out, "
+                            "flooding pending txs"
+                        )
+                        self._erlay_pending_recon[addr] = False
+                        self._erlay_recon_started.pop(addr, None)
+                        if peer is not None and peer.is_connected():
+                            await self._flood_pending_invs(peer, addr)
                         continue
 
-                    peer = self.get_peer_by_addr(addr)
                     if peer is None or not peer.is_connected():
                         continue
 
                     try:
                         self._erlay_pending_recon[addr] = True
+                        self._erlay_recon_started[addr] = time.monotonic()
                         # Send reqtxrcncl to initiate
                         q_coeff = 1  # q = 1/2^15 ≈ minimal estimate
                         req = ReqTxRcnclMessage(
@@ -4805,6 +4865,18 @@ class PeerManager:
             if addr == exclude_addr:
                 continue
             recon.add_tx(txid)
+
+    def _erlay_try_reconcile(self, addr: str, txid: bytes) -> bool:
+        """Add *txid* to *addr*'s reconciliation set.
+
+        Returns False when the set is full (``MAX_RECONSET_SIZE``); the
+        caller then floods the txid through the normal trickle queue, the
+        BIP 330 fallback for a full set.
+        """
+        recon = self._erlay_peers.get(addr)
+        if recon is None:
+            return False
+        return recon.add_tx(txid)
 
     def is_erlay_peer(self, addr: str) -> bool:
         """Check if a peer has Erlay negotiated."""
@@ -5277,9 +5349,9 @@ class PeerManager:
             if not peer.is_connected() or not peer.relay_txs:
                 continue
 
-            # For Erlay peers, add to reconciliation set instead
-            if self.is_erlay_peer(addr):
-                self.erlay_add_tx_to_reconcile(txid, exclude_addr=exclude_addr)
+            # For Erlay peers, add to reconciliation set instead; when the
+            # set is full, fall through and flood via the trickle queue.
+            if self.is_erlay_peer(addr) and self._erlay_try_reconcile(addr, txid):
                 continue
 
             # Get or create trickle queue

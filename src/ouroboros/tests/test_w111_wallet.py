@@ -1328,6 +1328,8 @@ class TestG25WalletEncryption:
         w, _ = _new_wallet()
         w.init_hd(seed=os.urandom(32), pool_size=5)
         w.encrypt("pw")
+        assert w.is_locked  # Core EncryptWallet ends with Lock()
+        w.unlock("pw")
         w.lock()
         assert w.is_locked
 

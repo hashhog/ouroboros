@@ -54,7 +54,7 @@ def _locked_wallet(tmp_path, mode):
         wallet, _ = mgr.load_wallet("w")
     else:
         wallet = mgr.get_wallet("w")
-        wallet.lock()
+        # encrypt() already locked it (Core EncryptWallet).
         wallet.unlock(PASS)
         wallet.lock()
         # lock() re-encrypts with a fresh salt and nonce; that file is the
@@ -175,6 +175,7 @@ def test_lock_released_while_locked_stays_released(tmp_path):
     not come back from the ciphertext on unlock or on reload."""
     mgr, _ = _make_encrypted(tmp_path)
     wallet = mgr.get_wallet("w")
+    wallet.unlock(PASS)  # encrypt() leaves it locked (Core EncryptWallet)
     wallet.lock_coin(TXID, 3, persistent=True)
     wallet.lock()
     ct = json.loads(wallet.wallet_path.read_text())["ciphertext"]

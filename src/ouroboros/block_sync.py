@@ -1019,6 +1019,7 @@ class BlockSync:
         self._blk_perm_rejected_dropped: int = 0
         # Unrequested bodies whose header was not queued (never buffered).
         self._blk_unrequested_unknown_header: int = 0
+        self._blk_unrequested_lowwork_fork: int = 0
         # Track which peer (as "host:port" string) delivered each buffered block
         # so the drain loop can score Misbehaving(100) against the right peer when
         # it finds BLOCK_MUTATED or BLOCK_INVALID_HEADER.  Entry cleared on
@@ -2709,6 +2710,17 @@ class BlockSync:
             # body never landed in ``_ibd_block_buffer``).
             if block_hash in self._fork_headers:
                 if not self._is_ibd_wanted(block_hash):
+                    # Core AcceptBlock: an UNREQUESTED body is kept only if
+                    # its header has fHasMoreOrSameWork.  Bodies we asked for
+                    # (GAP2 _request_fork_blocks only asks for heavier forks)
+                    # are kept as before.
+                    if not (
+                        was_requested
+                        or self._recently_requested(block_hash)
+                        or self._fork_body_has_more_or_same_work(block_hash)
+                    ):
+                        self._drop_unrequested_lowwork_fork_body(block_hash, peer)
+                        return
                     self._fork_block_bytes[block_hash] = payload
                     # mapBlockSource: who to punish if the reorg engine finds
                     # this body consensus-invalid (_complete_fork_bridge).
@@ -2974,6 +2986,47 @@ class BlockSync:
             # (Core ProcessMessages logs a caught exception, never punishes).
             if not is_system_error(e):
                 peer.adjust_score(-5)
+
+    def _fork_body_has_more_or_same_work(self, block_hash: bytes) -> bool:
+        """Core ``fHasMoreOrSameWork`` for a fork-store header: True iff the
+        cumulative chainwork AT ``block_hash`` (not at a fork tip above it)
+        is >= the active tip's.  No anchored work basis counts as False: an
+        unrequested body is only worth RAM when we can show it may matter,
+        and the GAP2 download path requests it once its fork is heavier."""
+        fork_cw = self._fork_tip_chainwork(block_hash)
+        if fork_cw is None:
+            return False
+        try:
+            _, active_height = self.db.get_best_block()
+            active_cw = (
+                self.db.get_chainwork_by_height(active_height)
+                if active_height >= 0 else 0
+            )
+        except Exception:
+            return False
+        if not active_cw:
+            return False
+        return fork_cw >= active_cw
+
+    def _drop_unrequested_lowwork_fork_body(
+        self, block_hash: bytes, peer: Peer
+    ) -> None:
+        """Drop an unrequested body for a fork header with less work than the
+        tip, as Core's AcceptBlock does (``if (!fHasMoreOrSameWork) return
+        true;`` for an unrequested block).  Not a misbehaviour: a peer may
+        legitimately relay a stale block.  Without this every body for a
+        "stored only" fork header sat in ``_fork_block_bytes`` until the
+        header was evicted — up to the fork-store cap x 4 MB on regtest or
+        testnet4, where low-work siblings are free to mine."""
+        self._blk_unrequested_lowwork_fork += 1
+        _now = time.time()
+        if _now - getattr(self, "_last_lowwork_fork_drop_log", 0.0) > 30.0:
+            self._last_lowwork_fork_drop_log = _now
+            logger.info(
+                f"Dropping unrequested fork body {block_hash.hex()[:16]}... "
+                f"from {peer.host}:{peer.port}: less work than the active tip "
+                f"(total {self._blk_unrequested_lowwork_fork})"
+            )
 
     def _recently_requested(self, block_hash: bytes) -> bool:
         """True if we sent a getdata for *block_hash* within
