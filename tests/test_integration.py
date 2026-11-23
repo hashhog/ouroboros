@@ -1444,6 +1444,8 @@ class TestEncryptedWallet:
         w = Wallet(temp_data_dir, "mainnet", name="enc2")
         await w.generate_new_address()
         w.encrypt("pass123")
+        # encrypt() ends locked (Core EncryptWallet); unlock to have keys.
+        w.unlock("pass123")
         assert len(w.keys) == 1
 
         w.lock()
