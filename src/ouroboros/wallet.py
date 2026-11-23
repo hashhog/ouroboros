@@ -1288,6 +1288,10 @@ class Wallet:
         # restart (written to disk); non-persistent locks are memory-only and
         # cleared on _load_or_create().
         self._locked_coins: dict[tuple[str, int], bool] = {}
+        # True once the encrypted wallet file keeps its locks outside the
+        # ciphertext (see _save); then unlock() must not re-read the stale
+        # copy an older file may still carry inside the ciphertext.
+        self._locks_outside_ciphertext: bool = False
         # --- Wallet transaction history (Core CWallet::mapWallet) -------------
         # Populated by the block-connect scan (scan_block_connect) as each
         # connected block is walked: every tx that credits a wallet script
@@ -1371,6 +1375,15 @@ class Wallet:
             validate_mnemonic as _bip39_validate_mnemonic,
         )
 
+        if self.is_locked:
+            # A locked wallet cannot take a new seed: it would only live in
+            # memory, the save keeps the old ciphertext, and unlock() then
+            # brings back the old seed.  Core's sethdseed called
+            # EnsureWalletIsUnlocked first.
+            raise ValueError(
+                "Error: Please enter the wallet passphrase with "
+                "walletpassphrase first."
+            )
         if (seed is None) == (mnemonic is None):
             raise ValueError("init_hd requires exactly one of seed= or mnemonic=")
 
@@ -1566,6 +1579,10 @@ class Wallet:
             self._encrypted_blob = bytes.fromhex(data["ciphertext"])
             self.keys = []
             self.descriptors = []
+            self._locks_outside_ciphertext = bool(
+                data.get("locks_outside_ciphertext")
+            )
+            self._load_locked_coins(data)
             logger.info(
                 f"Loaded encrypted wallet '{self.name}' — "
                 "call unlock(passphrase) to decrypt"
@@ -1599,6 +1616,15 @@ class Wallet:
             self._key_pool.top_up()
         # Load wallet flags
         self._disable_private_keys = data.get("disable_private_keys", False)
+        self._load_locked_coins(data)
+        logger.info(
+            f"Loaded wallet '{self.name}' with {len(self.keys)} keys, "
+            f"{len(self.descriptors)} descriptors"
+            + (" (HD)" if self._hd_seed else "")
+            + (" (watch-only)" if self._disable_private_keys else "")
+        )
+
+    def _load_locked_coins(self, data: dict) -> None:
         # Load persistent lockunspent entries (memory-only locks are dropped
         # by virtue of process exit; see Core wallet.cpp LockCoin docs).
         for entry in data.get("locked_coins", []):
@@ -1608,12 +1634,6 @@ class Wallet:
                 self._locked_coins[(txid, vout)] = True
             except (KeyError, ValueError, TypeError):
                 continue
-        logger.info(
-            f"Loaded wallet '{self.name}' with {len(self.keys)} keys, "
-            f"{len(self.descriptors)} descriptors"
-            + (" (HD)" if self._hd_seed else "")
-            + (" (watch-only)" if self._disable_private_keys else "")
-        )
 
     def _save(self) -> None:
         inner: dict = {
@@ -1647,10 +1667,24 @@ class Wallet:
             for (txid, vout), persistent in self._locked_coins.items()
             if persistent
         ]
-        if persistent_locks:
+        if persistent_locks and not self.is_encrypted:
             inner["locked_coins"] = persistent_locks
 
-        if self._passphrase is not None:
+        if self.is_locked:
+            # Encrypted and locked: nothing secret is in memory (keys, seed and
+            # descriptors were wiped by lock() or never decrypted), so there is
+            # nothing to re-encrypt and no passphrase to do it with.  Write the
+            # ciphertext back unchanged.  Saving ``inner`` as plaintext here
+            # would replace the only copy of the seed with an empty key list.
+            # Core never rewrites crypted keys in plaintext (wallet.cpp
+            # EncryptWallet / walletdb.cpp WriteCryptedKey).
+            outer = {
+                "version": 1,
+                "network": self.network,
+                "encrypted": True,
+                "ciphertext": self._encrypted_blob.hex(),
+            }
+        elif self._passphrase is not None:
             plaintext = json.dumps(inner).encode("utf-8")
             blob = encrypt_wallet_data(plaintext, self._passphrase)
             outer: dict = {
@@ -1661,6 +1695,21 @@ class Wallet:
             }
         else:
             outer = {"version": 1, "network": self.network, **inner}
+        if outer.get("encrypted"):
+            # Locked outpoints are not secret: Core keeps them as plaintext
+            # "lockedutxo" records next to the crypted keys (walletdb.cpp
+            # WriteLockedUTXO), and lockunspent works on a locked wallet.  An
+            # encrypted wallet keeps them here only, outside the ciphertext,
+            # so a lock taken or released while locked is saved and every
+            # encrypted wallet reloads its locks.
+            outer["locked_coins"] = persistent_locks
+            # The marker says this list is the complete set, so unlock() must
+            # not merge the copy an older file holds inside the ciphertext.
+            # Only an unlocked save knows the complete set; a locked save of
+            # an older file keeps the marker off so those locks are merged on
+            # unlock.
+            if not self.is_locked or self._locks_outside_ciphertext:
+                outer["locks_outside_ciphertext"] = True
 
         # Durable atomic write (mirror snapshot.py:1574-1584 and Bitcoin
         # Core wallet DB flush semantics): write the full serialization to a
@@ -1694,6 +1743,8 @@ class Wallet:
             except OSError:
                 pass
             raise
+        if outer.get("locks_outside_ciphertext"):
+            self._locks_outside_ciphertext = True
 
     # --- encryption / decryption ---
 
@@ -1745,6 +1796,10 @@ class Wallet:
         elif self._hd_seed is not None:
             self._key_pool = KeyPool(self._hd_seed, self.network)
             self._key_pool.top_up()
+        # Wallets saved before locks were kept outside the ciphertext hold
+        # them only in here.
+        if not self._locks_outside_ciphertext:
+            self._load_locked_coins(data)
         # Read the scan marker BEFORE the wallet reads as unlocked: from the
         # next line on, live block notifications reach this wallet again and
         # advance the marker past the blocks it missed while locked.
