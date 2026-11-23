@@ -3195,19 +3195,29 @@ class Mempool:
         # signature which uses it to avoid double-counting a sibling that is
         # already going to be replaced by the incoming RBF tx.
         # Reference: bitcoin-core/src/policy/truc_policy.cpp:171-261
-        truc_ok, truc_err, sibling_txid = self._check_truc_policy(
-            tx, sigop_cost=tx_sigop_cost, direct_conflicts=set()
-        )
-        if not truc_ok:
-            if sibling_txid is not None:
-                # Sibling eviction mutates the pool — in dry-run mode report the
-                # TRUC violation without performing the eviction.
-                if test_accept:
+        #
+        # Core skips SingleTRUCChecks entirely under m_bypass_limits (the
+        # reorg refill): ``if (!args.m_bypass_limits) { SingleTRUCChecks ... }``
+        # (validation.cpp PreChecks), so a refilled tx neither fails TRUC nor
+        # evicts a sibling.
+        #
+        # A sibling the TRUC check names is only *staged* for eviction here
+        # (Core ``ws.m_conflicts.insert(sibling)``, ``m_sibling_eviction``).
+        # Every remaining check runs with it still in the pool; it is removed
+        # just before the insert, once nothing can refuse the tx any more
+        # (Core FinalizeSubpackage).  A rejection leaves the pool untouched.
+        sibling_to_evict: bytes | None = None
+        if not bypass_limits:
+            truc_ok, truc_err, sibling_txid = self._check_truc_policy(
+                tx, sigop_cost=tx_sigop_cost, direct_conflicts=set()
+            )
+            if not truc_ok:
+                # In dry-run mode report the TRUC violation (pre-existing
+                # testmempoolaccept behaviour; Core allows sibling eviction
+                # there too).
+                if sibling_txid is None or test_accept:
                     return False, truc_err
-                # Sibling eviction: try to replace the existing child
-                return self._try_sibling_eviction(
-                    tx, sibling_txid, height, package_member=in_package)
-            return False, truc_err
+                sibling_to_evict = sibling_txid
 
         # Ancestor set — bookkeeping only.  As of Bitcoin Core v31 (cluster
         # mempool) there is NO generic ancestor/descendant count or size
@@ -3247,9 +3257,12 @@ class Mempool:
         # sigop cost so the incoming transaction contributes the same
         # sigop-adjusted weight that TxGraph would store for it.
         # Reference: bitcoin-core/src/validation.cpp:1341-1344.
-        cluster_ok, cluster_err = self._check_cluster_limit(tx, sigop_cost=tx_sigop_cost)
-        if not cluster_ok:
-            return False, cluster_err
+        # With a staged sibling eviction the cluster limit is checked on the
+        # post-eviction graph, in ReplacementChecks (below), as Core does.
+        if sibling_to_evict is None:
+            cluster_ok, cluster_err = self._check_cluster_limit(tx, sigop_cost=tx_sigop_cost)
+            if not cluster_ok:
+                return False, cluster_err
 
         # The size limit is NOT applied here.  Core checks the fee against the
         # CURRENT pool minimum (below), inserts, and only then trims with
@@ -3331,11 +3344,36 @@ class Mempool:
                 # "min relay fee not met" above.
                 return False, "mempool min fee not met"
 
+        # ReplacementChecks + CheckEphemeralSpends for a staged sibling
+        # eviction, after CheckFeeRate (above) as in Core.  Nothing has been
+        # removed yet, so a rejection here leaves the sibling where it was.
+        if sibling_to_evict is not None:
+            sib_ok, sib_err = self._check_sibling_eviction(
+                tx, sibling_to_evict, fee, tx_vsize, tx_sigop_cost)
+            if not sib_ok:
+                return False, sib_err
+
         # Dry-run (testmempoolaccept): every relay/standardness/consensus gate
         # above has passed (including min-relay fee, ephemeral dust, version,
         # and IsStandardTx). Report would-accept without mutating the pool.
         if test_accept:
             return True, ""
+
+        # Every check has passed: apply the staged sibling eviction (Core
+        # FinalizeSubpackage removes the conflicts, then adds the tx).  The
+        # sibling's parents stay: they are this tx's parents too, so an
+        # ephemeral-dust parent is not orphaned by the swap (Core's
+        # RemoveStaged removes the staged set only).  The recount drops the
+        # parents' descendant_count / descendant_size before the insert below
+        # adds this tx to them.
+        if sibling_to_evict is not None:
+            logger.info(
+                f"TRUC sibling eviction: replacing {sibling_to_evict.hex()[:16]}... "
+                f"with {txid.hex()[:16]}..."
+            )
+            self._remove_transaction_inner(
+                sibling_to_evict, _reason="sibling-evicted",
+                _evict_ephemeral_parents=False)
 
         # Compute direct parents (mempool txs this tx spends from)
         direct_parents: set[bytes] = set()
@@ -3964,83 +4002,105 @@ class Mempool:
             return []
         return list(parent_entry.children)
 
-    def _try_sibling_eviction(
-        self, new_tx: Transaction, sibling_txid: bytes, height: int,
-        package_member: bool = False,
+    def _check_sibling_eviction(
+        self, new_tx: Transaction, sibling_txid: bytes, fee: int,
+        vsize: int, sigop_cost: int,
     ) -> tuple[bool, str]:
-        """Attempt TRUC sibling eviction.
+        """Core ``ReplacementChecks`` for a TRUC sibling eviction, plus the
+        single-tx ``CheckEphemeralSpends``; read-only.
 
-        When a TRUC parent already has one child, a new child can replace
-        the existing sibling if it pays a higher fee rate. This is a special
-        form of RBF specific to TRUC transactions.
+        The sibling is the only conflict (``consider_sibling_eviction``
+        requires it to have no descendants, so the conflict set is the
+        sibling alone and touches one cluster: Rule #5 cannot fail).  In
+        Core's order:
 
-        Reference: Bitcoin Core policy/truc_policy.cpp (sibling eviction logic)
+        * ``PaysForRBF`` on modified fees and the sigop-adjusted vsize,
+          TX_RECONSIDERABLE "insufficient fee (including sibling eviction)";
+        * ``CheckMemPoolPolicyLimits`` on the graph without the sibling,
+          "too-large-cluster";
+        * ``ImprovesFeerateDiagram``: the affected clusters' chunks before,
+          against the same clusters without the sibling and with *new_tx*,
+          "replacement-failed" / "insufficient feerate: does not improve
+          feerate diagram";
+        * ``CheckEphemeralSpends`` (``!m_bypass_limits && require_standard``):
+          an in-pool parent's ephemeral dust must be spent by *new_tx*.
+
+        Reference: bitcoin-core/src/validation.cpp PreChecks
+        (m_sibling_eviction), ReplacementChecks, AcceptSingleTransaction;
+        policy/rbf.cpp PaysForRBF, ImprovesFeerateDiagram;
+        policy/ephemeral_policy.cpp CheckEphemeralSpends.
         """
         sibling_entry = self.transactions.get(sibling_txid)
         if sibling_entry is None:
             return False, "Sibling transaction not found"
+        new_txid = new_tx.get_txid()
+        to_evict = self._collect_descendants(sibling_txid) & set(self.transactions)
 
-        # Calculate new tx fee
-        new_size = len(new_tx.serialize())
-        total_input = 0
-        for inp in new_tx.inputs:
-            utxo = self.validator.db.get_utxo(inp.prev_txid, inp.prev_vout)
-            if utxo:
-                total_input += utxo['value']
-            else:
-                # Check mempool parent output
-                parent_entry = self.transactions.get(inp.prev_txid)
-                if parent_entry and inp.prev_vout < len(parent_entry.tx.outputs):
-                    total_input += parent_entry.tx.outputs[inp.prev_vout].value
-                else:
-                    return False, f"UTXO not found: {inp.prev_txid.hex()[:16]}...:{inp.prev_vout}"
+        new_fee_modified = fee + int(self.map_deltas.get(new_txid, 0))
+        conflicting_fees = sum(self.get_modified_fee(t) for t in to_evict)
+        pays_err = pays_for_rbf(conflicting_fees, new_fee_modified, vsize,
+                                self.INCREMENTAL_RELAY_FEE, new_txid)
+        if pays_err is not None:
+            return False, f"insufficient fee (including sibling eviction), {pays_err}"
 
-        total_output = sum(out.value for out in new_tx.outputs)
-        new_fee = total_input - total_output
+        cluster_ok, cluster_err = self._check_cluster_limit_after_replacement(
+            new_tx, sigop_cost, to_evict)
+        if not cluster_ok:
+            return False, cluster_err
 
-        if new_fee < 0:
-            return False, "Negative fee"
+        # Feerate diagram: every cluster the evictees or the new tx's in-pool
+        # parents are in, before and after.  The after state is linearized
+        # over a staged copy of those entries with the evictees dropped and a
+        # provisional entry for new_tx, so the pool itself is not touched.
+        in_pool_parents = {
+            inp.prev_txid for inp in new_tx.inputs
+            if inp.prev_txid in self.transactions and inp.prev_txid not in to_evict
+        }
+        affected: set[bytes] = set()
+        for t in to_evict | in_pool_parents:
+            cid = self._cluster_manager.get_cluster_id(t)
+            cluster = self._cluster_manager._clusters.get(cid) if cid is not None else None
+            affected |= set(cluster.txids) if cluster is not None else {t}
+        affected &= set(self.transactions)
+        old_chunks = self._fee_vsize_chunks(affected)
 
-        # Sibling eviction requires:
-        # 1. New fee > sibling fee (strictly higher)
-        # 2. New fee covers incremental relay fee for new tx size
-        sibling_fee = sibling_entry.fee
-
-        if new_fee <= sibling_fee:
-            return False, (
-                f"Sibling eviction requires higher fee: {new_fee} <= {sibling_fee}"
-            )
-
-        # Check incremental relay fee
-        incremental_fee_needed = (new_size * self.INCREMENTAL_RELAY_FEE) // 1000
-        additional_fee = new_fee - sibling_fee
-        if additional_fee < incremental_fee_needed:
-            return False, (
-                f"Sibling eviction does not cover incremental relay fee: "
-                f"additional {additional_fee} < required {incremental_fee_needed}"
-            )
-
-        # All checks passed - evict sibling and add new tx
-        logger.info(
-            f"TRUC sibling eviction: replacing {sibling_txid.hex()[:16]}... "
-            f"with {new_tx.get_txid().hex()[:16]}..."
+        staged = {t: self.transactions[t] for t in affected - to_evict}
+        staged[new_txid] = MempoolEntry(
+            # Base fee and stripped size, as the pool entries carry: the
+            # linearizer orders on entry.fee / entry.size; the chunk sums
+            # below use modified fees and sigop-adjusted vsize.
+            tx=new_tx, fee=fee,
+            fee_rate=fee / vsize if vsize > 0 else 0,
+            size=len(new_tx.serialize()), time_added=0.0, height_added=0,
+            sigop_cost=sigop_cost,
+            parents=set(in_pool_parents),
         )
+        _, chunks = ClusterLinearizer(staged).linearize(set(staged))
+        new_chunks = [
+            (sum(new_fee_modified if t == new_txid else self.get_modified_fee(t)
+                 for t in c.txids),
+             sum(vsize if t == new_txid else self.transactions[t].vsize
+                 for t in c.txids))
+            for c in chunks
+        ]
+        if not improves_feerate_diagram(old_chunks, new_chunks):
+            return False, (
+                "replacement-failed: "
+                "insufficient feerate: does not improve feerate diagram"
+            )
 
-        # Remove sibling
-        self.remove_transaction(sibling_txid, _skip_recount=True, _reason="sibling-evicted")
-
-        # Now add the new transaction (it should pass all checks)
-        # We need to be careful to avoid infinite recursion - the sibling
-        # is already removed so the parent no longer has a child.
-        # Re-enter with the caller's package context, so a package member is
-        # not size-trimmed on its own insert (the package trims at its end).
-        ok, err = self._add_transaction_inner(
-            new_tx, height, package_member=package_member)
-        if not ok:
-            # This shouldn't happen if our checks are correct
-            logger.warning(f"Failed to add tx after sibling eviction: {err}")
-            return False, f"Failed after sibling eviction: {err}"
-
+        if self.require_standard:
+            spent_by_new = {(inp.prev_txid, inp.prev_vout) for inp in new_tx.inputs}
+            for parent_txid in in_pool_parents:
+                parent_tx = self.transactions[parent_txid].tx
+                for dust_vout in _has_ephemeral_dust(parent_tx):
+                    if (parent_txid, dust_vout) not in spent_by_new:
+                        wtxid = self._tx_wtxid(new_tx)
+                        return False, (
+                            "missing-ephemeral-spends: tx "
+                            f"{new_txid[::-1].hex()} (wtxid={wtxid[::-1].hex()}) "
+                            "did not spend parent's ephemeral dust"
+                        )
         return True, ""
 
     def _recalculate_ancestors(self, txid: bytes) -> None:
@@ -4228,7 +4288,8 @@ class Mempool:
             self._remove_transaction_inner(txid, _skip_recount, _reason)
 
     def _remove_transaction_inner(
-        self, txid: bytes, _skip_recount: bool = False, _reason: str = "unknown"
+        self, txid: bytes, _skip_recount: bool = False, _reason: str = "unknown",
+        _evict_ephemeral_parents: bool = True,
     ):
         if txid not in self.transactions:
             return
@@ -4245,7 +4306,7 @@ class Mempool:
         # ephemeral dust parent's output, the parent must also be evicted.
         # Reference: Bitcoin Core policy/ephemeral_policy.cpp
         ephemeral_parents_to_evict: list[bytes] = []
-        for parent_txid in entry.parents:
+        for parent_txid in (entry.parents if _evict_ephemeral_parents else ()):
             parent_entry = self.transactions.get(parent_txid)
             if parent_entry and parent_entry.has_ephemeral_dust:
                 if parent_entry.ephemeral_child == txid:
