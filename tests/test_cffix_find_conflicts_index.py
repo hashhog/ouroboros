@@ -152,7 +152,7 @@ def test_find_conflicts_none_for_non_conflicting_tx():
     assert pool.transactions.full_iterations == 0
 
 
-def test_find_conflicts_after_real_replacement_and_removal():
+def test_find_conflicts_after_remove_transaction():
     """The index stays exact across remove_transaction: a removed entry's
     outpoints are no longer reported as conflicts."""
     pool, coins = _populated_pool()
