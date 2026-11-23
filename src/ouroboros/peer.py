@@ -113,6 +113,23 @@ MAX_PROTOCOL_MESSAGE_LENGTH = 4_000_000
 # above any plausible honest interleave of decoys with real messages.
 MAX_CONSECUTIVE_V2_SKIP = 256
 
+# Message types that get their own key in ``Peer.bytes_recv_per_msg``
+# (Core src/protocol.h ``ALL_NET_MESSAGE_TYPES``).  Any other type a peer sends
+# is charged to ``NET_MESSAGE_TYPE_OTHER``, as in Core's
+# ``CNode::ReceiveMsgBytes`` ("To prevent a memory DOS, only allow known
+# message types"): keying by the peer-chosen command let one peer add a
+# permanent dict entry per 24-byte v1 frame.
+ALL_NET_MESSAGE_TYPES = frozenset({
+    "version", "verack", "addr", "addrv2", "sendaddrv2", "inv", "getdata",
+    "merkleblock", "getblocks", "getheaders", "tx", "headers", "block",
+    "getaddr", "mempool", "ping", "pong", "notfound", "filterload",
+    "filteradd", "filterclear", "sendheaders", "feefilter", "sendcmpct",
+    "cmpctblock", "getblocktxn", "blocktxn", "getcfilters", "cfilter",
+    "getcfheaders", "cfheaders", "getcfcheckpt", "cfcheckpt", "wtxidrelay",
+    "sendtxrcncl",
+})
+NET_MESSAGE_TYPE_OTHER = "*other*"
+
 # How often the message-receive hot path yields control back to the event loop
 # (``await asyncio.sleep(0)``).  This is the LOAD-BEARING fix for the at-tip
 # RSS burst (tracemalloc 2026-06-09 burst #2): every ``asyncio.wait_for`` /
@@ -657,7 +674,8 @@ class Peer:
         self.bytes_recv: int = 0
         # Core CNode::mapSendBytesPerMsgType / mapRecvBytesPerMsgType, surfaced
         # as getpeerinfo bytessent_per_msg / bytesrecv_per_msg (wire bytes,
-        # keyed by message command).
+        # keyed by message command; received unknown types under ``*other*``,
+        # see ``_count_recv_bytes``).
         self.bytes_sent_per_msg: dict[str, int] = {}
         self.bytes_recv_per_msg: dict[str, int] = {}
         self.last_send: float = 0.0
@@ -805,66 +823,84 @@ class Peer:
 
                 self.state = PeerState.CONNECTED
 
-                # BIP 324 v2 transport negotiation (before version handshake)
-                if self.transport_version == 2:
-                    try:
-                        await self._negotiate_v2()
-                    except V2NegotiationFailed as v2_err:
-                        # Socket has 64 bytes of v2 garbage written to it
-                        # already; v1 cannot be retried on the same stream.
-                        # Set the flag, close cleanly, and stop retrying —
-                        # PeerManager will inspect ``v2_negotiation_failed``
-                        # and reconnect with transport_version=1 on a
-                        # fresh socket.  Mirrors Bitcoin Core's
-                        # m_reconnections queue (net.cpp ~1949).
-                        logger.info(
-                            f"v2 transport negotiation failed with "
-                            f"{self.host}:{self.port} ({v2_err}); "
-                            "flagging peer v1-only for fresh-socket retry"
-                        )
-                        self._v2_transport = None
-                        self.v2_negotiation_failed = True
-                        await self.disconnect()
-                        return False
-                    except Exception as v2_err:  # pragma: no cover
-                        # Defensive: any other failure path should be
-                        # treated as a v2 negotiation failure to avoid a
-                        # half-encrypted v1 handshake on a corrupt stream.
-                        logger.warning(
-                            f"v2 transport negotiation raised unexpected "
-                            f"{type(v2_err).__name__} from "
-                            f"{self.host}:{self.port}: {v2_err}"
-                        )
-                        self._v2_transport = None
-                        self.v2_negotiation_failed = True
-                        await self.disconnect()
-                        return False
-
-                # Perform handshake under a SINGLE per-connection deadline.
+                # ONE deadline for the whole attempt after TCP connect: the
+                # BIP 324 v2 negotiation AND the version/verack exchange.
+                #
+                # Core drops any peer not fully connected within
+                # -peertimeout (CConnman::InactivityCheck: "V2 handshake
+                # timeout" while the transport is still negotiating, "version
+                # handshake timeout" after), whatever its transport or
+                # direction.  The v2 reads used to run before this window,
+                # each with only its own 5-10 s ``wait_for``; the
+                # garbage-terminator scan reads one byte at a time for up to
+                # MAX_GARBAGE_LEN+16 bytes and the decoy drain allows 1024
+                # packets, so a peer dripping a byte every few seconds held
+                # the dial ~11 h.  Dials are awaited inline in
+                # PeerManager.maintain_connections, so that stalled all
+                # outbound maintenance.  The inbound path is bounded the same
+                # way in ``accept_inbound``.
                 #
                 # The version/verack reads inside ``_handshake`` go through
-                # ``receive_message`` -> ``_read_exactly``, which (attempt-5,
-                # Core parity) is a PLAIN ``await readexactly`` arming ZERO
-                # per-read ``asyncio.timeout`` timers.  The coarse inactivity
-                # sweeper (PeerManager.maintain_connections) only iterates
-                # REGISTERED peers, and a peer is registered ONLY AFTER this
-                # call returns — so a peer that completes TCP connect (and any
-                # v2 negotiation) then hangs mid version/verack would await
-                # forever here, leaking a slot/coroutine/fd.  Bound the whole
-                # version handshake with ONE ``asyncio.timeout`` (one timer per
-                # connection ATTEMPT, cancelled on success — O(connections),
-                # NOT O(messages), so it does NOT reintroduce the per-read
-                # TimerHandle churn the leak fix removed).  On timeout the
-                # context raises ``TimeoutError``, which the ``except
-                # TimeoutError`` arm below turns into the normal connect-failure
-                # cleanup (disconnect, slot freed) — mirroring the pre-attempt-5
-                # behaviour where the per-read ``asyncio.timeout`` self-bounded
-                # these handshake reads.  (The 5 s TCP connect above and the v2
-                # negotiation reads are already individually bounded via
-                # ``asyncio.wait_for`` and are intentionally left outside this
-                # window.)
+                # ``receive_message`` -> ``_read_exactly``, a PLAIN ``await
+                # readexactly`` arming ZERO per-read timers (attempt-5 leak
+                # fix), and the peer is registered with the inactivity
+                # sweeper only after this returns, so this timeout is the only
+                # bound on them too.  One timer per connection ATTEMPT,
+                # cancelled on success: O(connections), not O(messages).
+                #
+                # On expiry the context cancels the in-flight read and raises
+                # ``TimeoutError`` here (CancelledError is not caught by the
+                # v2 ``except`` arms below), which the ``except TimeoutError``
+                # arm turns into the normal connect-failure cleanup.
+                # ``v2_negotiation_failed`` is deliberately NOT set on that
+                # path: a peer that sent us bytes is not v1-only (Core's
+                # V2Transport::ShouldReconnectV1 requires an empty receive
+                # buffer).  The 5 s TCP connect above stays outside.
+                v2_failed = False
                 async with asyncio.timeout(HANDSHAKE_TIMEOUT):
-                    await self._handshake(start_height)
+                    # BIP 324 v2 transport negotiation (before version handshake)
+                    if self.transport_version == 2:
+                        # A failed negotiation only records the failure here;
+                        # the disconnect runs after this block so the deadline
+                        # cannot cancel that cleanup half-way and turn a
+                        # flagged v1-retry into a plain timeout.
+                        try:
+                            await self._negotiate_v2()
+                        except V2NegotiationFailed as v2_err:
+                            # Socket has 64 bytes of v2 garbage written to it
+                            # already; v1 cannot be retried on the same stream.
+                            # Set the flag, close cleanly, and stop retrying —
+                            # PeerManager will inspect ``v2_negotiation_failed``
+                            # and reconnect with transport_version=1 on a
+                            # fresh socket.  Mirrors Bitcoin Core's
+                            # m_reconnections queue (net.cpp ~1949).
+                            logger.info(
+                                f"v2 transport negotiation failed with "
+                                f"{self.host}:{self.port} ({v2_err}); "
+                                "flagging peer v1-only for fresh-socket retry"
+                            )
+                            self._v2_transport = None
+                            self.v2_negotiation_failed = True
+                            v2_failed = True
+                        except Exception as v2_err:  # pragma: no cover
+                            # Defensive: any other failure path should be
+                            # treated as a v2 negotiation failure to avoid a
+                            # half-encrypted v1 handshake on a corrupt stream.
+                            logger.warning(
+                                f"v2 transport negotiation raised unexpected "
+                                f"{type(v2_err).__name__} from "
+                                f"{self.host}:{self.port}: {v2_err}"
+                            )
+                            self._v2_transport = None
+                            self.v2_negotiation_failed = True
+                            v2_failed = True
+
+                    if not v2_failed:
+                        await self._handshake(start_height)
+
+                if v2_failed:
+                    await self.disconnect()
+                    return False
 
                 self.state = PeerState.READY
                 self._retry_count = 0
@@ -1890,6 +1926,14 @@ class Peer:
             return False
         return (time.monotonic() - self._last_recv_monotonic) > stall_timeout
 
+    def _count_recv_bytes(self, command: str, nbytes: int) -> None:
+        """Add ``nbytes`` to the per-type receive counter (Core
+        ``CNode::ReceiveMsgBytes``): known types keep their own key, every
+        other type goes to ``*other*`` so the dict stays bounded."""
+        key = (command if command in ALL_NET_MESSAGE_TYPES
+               else NET_MESSAGE_TYPE_OTHER)
+        self.bytes_recv_per_msg[key] = self.bytes_recv_per_msg.get(key, 0) + nbytes
+
     async def receive_message(self, timeout: float = 30.0) -> NetworkMessage:
         """Read and parse the next message from the peer (v1 or BIP 324 v2); raises on timeout or bad format."""
         if not self.reader:
@@ -1984,8 +2028,7 @@ class Peer:
         logger.debug(f"Received {command} from {self.host}:{self.port} ({len(payload)} bytes)")
 
         self.bytes_recv += 24 + len(payload)
-        self.bytes_recv_per_msg[command] = (
-            self.bytes_recv_per_msg.get(command, 0) + 24 + len(payload))
+        self._count_recv_bytes(command, 24 + len(payload))
         NET_TOTALS["recv"] += 24 + len(payload)
         self.last_recv = time.time()
 
@@ -2129,8 +2172,7 @@ class Peer:
                 continue
 
             command, payload = decoded
-            self.bytes_recv_per_msg[command] = (
-                self.bytes_recv_per_msg.get(command, 0) + wire_bytes_this_call)
+            self._count_recv_bytes(command, wire_bytes_this_call)
             # RSS-leak mitigation (2026-07-06, ouroboros OOM-loop root-cause):
             # the v2 receive path was retaining ~1 coroutine frame + its byte
             # buffers per inbound message (tracemalloc soaks 2026-06-21), climbing

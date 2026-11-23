@@ -283,8 +283,10 @@ class TestRoundTrip:
         proposal = PSBT.from_base64(body_out.decode("ascii"))
 
         # Receiver subtracts exactly maxadditionalfeecontribution (=500).
-        # Payment output unchanged.
-        assert proposal.tx.outputs[0].value == original.tx.outputs[0].value
+        # Payment output grows by the receiver's contributed coin (the
+        # default 50,000-sat UTXO) -- BIP-78: the receiver's input funds
+        # its own output.
+        assert proposal.tx.outputs[0].value == original.tx.outputs[0].value + 50_000
         # Change reduced by the cap.
         assert proposal.tx.outputs[1].value == original_change - 500
 
@@ -517,6 +519,10 @@ class _MockMempool:
     @property
     def max_size(self):
         return 300_000_000
+
+    def accept_to_memory_pool(self, tx, height, test_accept=False):
+        # The /payjoin route test-accepts the Original before signing.
+        return {"accepted": True, "fee": 0, "vsize": 0}
 
 
 class _MockDB:
