@@ -2079,7 +2079,13 @@ class BitcoinNode:
                         # TX_CONSENSUS; the reference tree (post-v28
                         # ProcessInvalidTx) punishes no tx at all.
                         reject_class = classify_mempool_reject(error)
-                        recent_rejects.record(tx_wtxid, error, tx.has_witness)
+                        # ATMP ran off the event loop: a block may have
+                        # connected meanwhile.  Re-read the tip so a verdict
+                        # computed at the old tip is not stamped with the new.
+                        recent_rejects.tip_changed(self.db.get_best_block()[0])
+                        recent_rejects.record(
+                            tx_wtxid, error, tx.has_witness, tip=tip_hash,
+                        )
                         logger.debug(
                             f"Rejected transaction ({reject_class.value}): "
                             f"{error}"

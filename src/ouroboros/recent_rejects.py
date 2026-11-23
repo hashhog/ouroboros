@@ -115,12 +115,21 @@ class RecentRejects:
         """Core ``ReceivedTx``: skip a tx in either filter."""
         return wtxid in self.rejects or wtxid in self.reconsiderable
 
-    def record(self, wtxid: bytes, reason: str | None, has_witness: bool) -> bool:
+    def record(self, wtxid: bytes, reason: str | None, has_witness: bool,
+               tip: bytes | None = None) -> bool:
         """Record a mempool rejection (Core ``MempoolRejectedTx``).
+
+        *tip* is the best-block hash the verdict was computed at.  When it is
+        not the tip the filters now hold (a block connected while the tx was
+        being validated), the verdict is stale and is not recorded: Core runs
+        ATMP and MempoolRejectedTx under one cs_main hold, so a reset can
+        never land between them.
 
         Returns True when the wtxid was recorded.
         """
         if not reason:
+            return False
+        if tip is not None and tip != self._tip:
             return False
         if reason in _RECONSIDERABLE_EXACT:
             self.reconsiderable.insert(wtxid)

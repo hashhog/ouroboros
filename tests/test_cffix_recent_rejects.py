@@ -328,3 +328,54 @@ def test_filter_is_bounded():
         assert rr.record(k, "non-final", True)
     assert not rr.contains(keys[0]) and not rr.contains(keys[1])
     assert all(rr.contains(k) for k in keys[2:])
+
+
+class _TipMovingMempool(_CountingMempool):
+    """A block connects while this tx is in ATMP (the handler runs ATMP in a
+    worker thread, so other peers' handlers and block connection interleave)."""
+
+    def __init__(self, reason, tip):
+        super().__init__(reason)
+        self.tip = tip
+        self.node = None
+
+    def add_transaction(self, tx, height, peer=None):
+        self.calls += 1
+        if self.calls == 1:
+            # Block B connects, and another peer's tx reaches the handler
+            # first: the filter is reset and re-stamped with B.
+            self.tip["hash"] = TIP_HASH_B
+            self.node.recent_rejects.tip_changed(TIP_HASH_B)
+        return False, self.reason
+
+
+def test_verdict_from_an_old_tip_is_not_recorded_under_the_new_tip():
+    """X is refused 'non-final' at tip A, but block B connects before the
+    verdict is recorded.  X may be final at B, so it must be validated again,
+    not dropped until the next block."""
+    tip = {"hash": TIP_HASH_A}
+    mp = _TipMovingMempool("non-final", tip)
+    from ouroboros.node import BitcoinNode
+
+    peer = _FakePeer()
+    fake = SimpleNamespace(
+        peer_manager=SimpleNamespace(
+            get_all_ready_peers=lambda: [peer],
+            set_inbound_peer_handler=lambda fn: None,
+            misbehaving=lambda *a: None,
+        ),
+        block_filter_index=None,
+        mempool=mp,
+        db=SimpleNamespace(get_best_block=lambda: (tip["hash"], TIP)),
+        pruner=None,
+        zmq_notifier=None,
+        network="mainnet",
+    )
+    BitcoinNode._register_handlers(fake)
+    mp.node = fake
+    tx = _tx(90_000, witness=[b"\x01"])
+    msg = TxMessage(transaction=tx).to_network_message("mainnet")
+    asyncio.run(peer.handlers["tx"](msg))   # verdict at A, tip now B
+    asyncio.run(peer.handlers["tx"](msg))   # validated at B, recorded
+    asyncio.run(peer.handlers["tx"](msg))   # filtered
+    assert mp.calls == 2
