@@ -805,66 +805,84 @@ class Peer:
 
                 self.state = PeerState.CONNECTED
 
-                # BIP 324 v2 transport negotiation (before version handshake)
-                if self.transport_version == 2:
-                    try:
-                        await self._negotiate_v2()
-                    except V2NegotiationFailed as v2_err:
-                        # Socket has 64 bytes of v2 garbage written to it
-                        # already; v1 cannot be retried on the same stream.
-                        # Set the flag, close cleanly, and stop retrying —
-                        # PeerManager will inspect ``v2_negotiation_failed``
-                        # and reconnect with transport_version=1 on a
-                        # fresh socket.  Mirrors Bitcoin Core's
-                        # m_reconnections queue (net.cpp ~1949).
-                        logger.info(
-                            f"v2 transport negotiation failed with "
-                            f"{self.host}:{self.port} ({v2_err}); "
-                            "flagging peer v1-only for fresh-socket retry"
-                        )
-                        self._v2_transport = None
-                        self.v2_negotiation_failed = True
-                        await self.disconnect()
-                        return False
-                    except Exception as v2_err:  # pragma: no cover
-                        # Defensive: any other failure path should be
-                        # treated as a v2 negotiation failure to avoid a
-                        # half-encrypted v1 handshake on a corrupt stream.
-                        logger.warning(
-                            f"v2 transport negotiation raised unexpected "
-                            f"{type(v2_err).__name__} from "
-                            f"{self.host}:{self.port}: {v2_err}"
-                        )
-                        self._v2_transport = None
-                        self.v2_negotiation_failed = True
-                        await self.disconnect()
-                        return False
-
-                # Perform handshake under a SINGLE per-connection deadline.
+                # ONE deadline for the whole attempt after TCP connect: the
+                # BIP 324 v2 negotiation AND the version/verack exchange.
+                #
+                # Core drops any peer not fully connected within
+                # -peertimeout (CConnman::InactivityCheck: "V2 handshake
+                # timeout" while the transport is still negotiating, "version
+                # handshake timeout" after), whatever its transport or
+                # direction.  The v2 reads used to run before this window,
+                # each with only its own 5-10 s ``wait_for``; the
+                # garbage-terminator scan reads one byte at a time for up to
+                # MAX_GARBAGE_LEN+16 bytes and the decoy drain allows 1024
+                # packets, so a peer dripping a byte every few seconds held
+                # the dial ~11 h.  Dials are awaited inline in
+                # PeerManager.maintain_connections, so that stalled all
+                # outbound maintenance.  The inbound path is bounded the same
+                # way in ``accept_inbound``.
                 #
                 # The version/verack reads inside ``_handshake`` go through
-                # ``receive_message`` -> ``_read_exactly``, which (attempt-5,
-                # Core parity) is a PLAIN ``await readexactly`` arming ZERO
-                # per-read ``asyncio.timeout`` timers.  The coarse inactivity
-                # sweeper (PeerManager.maintain_connections) only iterates
-                # REGISTERED peers, and a peer is registered ONLY AFTER this
-                # call returns — so a peer that completes TCP connect (and any
-                # v2 negotiation) then hangs mid version/verack would await
-                # forever here, leaking a slot/coroutine/fd.  Bound the whole
-                # version handshake with ONE ``asyncio.timeout`` (one timer per
-                # connection ATTEMPT, cancelled on success — O(connections),
-                # NOT O(messages), so it does NOT reintroduce the per-read
-                # TimerHandle churn the leak fix removed).  On timeout the
-                # context raises ``TimeoutError``, which the ``except
-                # TimeoutError`` arm below turns into the normal connect-failure
-                # cleanup (disconnect, slot freed) — mirroring the pre-attempt-5
-                # behaviour where the per-read ``asyncio.timeout`` self-bounded
-                # these handshake reads.  (The 5 s TCP connect above and the v2
-                # negotiation reads are already individually bounded via
-                # ``asyncio.wait_for`` and are intentionally left outside this
-                # window.)
+                # ``receive_message`` -> ``_read_exactly``, a PLAIN ``await
+                # readexactly`` arming ZERO per-read timers (attempt-5 leak
+                # fix), and the peer is registered with the inactivity
+                # sweeper only after this returns, so this timeout is the only
+                # bound on them too.  One timer per connection ATTEMPT,
+                # cancelled on success: O(connections), not O(messages).
+                #
+                # On expiry the context cancels the in-flight read and raises
+                # ``TimeoutError`` here (CancelledError is not caught by the
+                # v2 ``except`` arms below), which the ``except TimeoutError``
+                # arm turns into the normal connect-failure cleanup.
+                # ``v2_negotiation_failed`` is deliberately NOT set on that
+                # path: a peer that sent us bytes is not v1-only (Core's
+                # V2Transport::ShouldReconnectV1 requires an empty receive
+                # buffer).  The 5 s TCP connect above stays outside.
+                v2_failed = False
                 async with asyncio.timeout(HANDSHAKE_TIMEOUT):
-                    await self._handshake(start_height)
+                    # BIP 324 v2 transport negotiation (before version handshake)
+                    if self.transport_version == 2:
+                        # A failed negotiation only records the failure here;
+                        # the disconnect runs after this block so the deadline
+                        # cannot cancel that cleanup half-way and turn a
+                        # flagged v1-retry into a plain timeout.
+                        try:
+                            await self._negotiate_v2()
+                        except V2NegotiationFailed as v2_err:
+                            # Socket has 64 bytes of v2 garbage written to it
+                            # already; v1 cannot be retried on the same stream.
+                            # Set the flag, close cleanly, and stop retrying —
+                            # PeerManager will inspect ``v2_negotiation_failed``
+                            # and reconnect with transport_version=1 on a
+                            # fresh socket.  Mirrors Bitcoin Core's
+                            # m_reconnections queue (net.cpp ~1949).
+                            logger.info(
+                                f"v2 transport negotiation failed with "
+                                f"{self.host}:{self.port} ({v2_err}); "
+                                "flagging peer v1-only for fresh-socket retry"
+                            )
+                            self._v2_transport = None
+                            self.v2_negotiation_failed = True
+                            v2_failed = True
+                        except Exception as v2_err:  # pragma: no cover
+                            # Defensive: any other failure path should be
+                            # treated as a v2 negotiation failure to avoid a
+                            # half-encrypted v1 handshake on a corrupt stream.
+                            logger.warning(
+                                f"v2 transport negotiation raised unexpected "
+                                f"{type(v2_err).__name__} from "
+                                f"{self.host}:{self.port}: {v2_err}"
+                            )
+                            self._v2_transport = None
+                            self.v2_negotiation_failed = True
+                            v2_failed = True
+
+                    if not v2_failed:
+                        await self._handshake(start_height)
+
+                if v2_failed:
+                    await self.disconnect()
+                    return False
 
                 self.state = PeerState.READY
                 self._retry_count = 0
