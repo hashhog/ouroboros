@@ -652,6 +652,11 @@ class Peer:
         # FIRST getaddr per connection is answered; later ones are ignored to
         # discourage addr stamping / addrman-draining DoS.
         self.getaddr_recvd: bool = False
+        # Local (host, port) the connection was accepted on, for inbound peers.
+        # Keys the getaddr response cache the way Core's ``m_network_key`` does
+        # (net.cpp CreateNodeFromAcceptedSocket: derived from addr_bind), so an
+        # onion listener and a clearnet listener never share one cached reply.
+        self.addr_bind: tuple[str, int] | None = None
         # INBOUND-addr token bucket (Core ``peer.m_addr_token_bucket``, init 1.0,
         # net_processing.cpp:380).  Refilled by ``elapsed * MAX_ADDR_RATE_PER_SECOND``
         # (0.1 tok/s), soft-capped at ``MAX_ADDR_PROCESSING_TOKEN_BUCKET`` (1000);
