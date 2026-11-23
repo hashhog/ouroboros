@@ -14,6 +14,7 @@ Reference: Bitcoin Core net.cpp, net_processing.cpp
 
 import asyncio
 import base64
+import copy
 import gc
 import json
 import logging
@@ -927,6 +928,10 @@ class PeerManager:
         self._discover: bool = bool(discover)
         self._is_ibd_func = is_ibd
         self._local_addr_task: asyncio.Task | None = None
+        # getaddr response cache, keyed by the local bind of the requesting
+        # inbound connection: key -> [addresses, expiry_unix_time].  Core
+        # ``CConnman::m_addr_response_caches`` (net.cpp:3702-3737).
+        self._addr_response_caches: dict = {}
 
         # -connect mode: a non-empty pin list disables DNS-seed resolution
         # and all addrman/auto-outbound dialing.  Latched once at construction
@@ -1617,6 +1622,9 @@ class PeerManager:
                     node_network_limited=self.node_network_limited,
                     on_disconnect=self._handle_peer_disconnected)
         peer.prefer_evict = discouraged
+        sockname = writer.get_extra_info("sockname")
+        if sockname:
+            peer.addr_bind = (str(sockname[0]), int(sockname[1]))
         # Reserve the slot before the first read; give it back however the
         # handshake ends (success moves it into inbound_peers below).
         self._pending_inbound += 1
@@ -4086,10 +4094,9 @@ class PeerManager:
                     return
                 peer.getaddr_recvd = True
                 # (b) 23%-cap: min(1000, floor(23 * size / 100)).  Core
-                # net_processing.cpp:4842/4844 -> addrman GetAddr_ (addrman.cpp:797).
-                infos = self.addrman.get_addresses_for_sharing(
-                    max_addresses=1000, max_pct=23,
-                )
+                # net_processing.cpp:4842/4844 -> addrman GetAddr_ (addrman.cpp:797),
+                # served from the per-network response cache (net.cpp:3702).
+                infos = self._get_addr_response(peer)
                 if not infos:
                     return
                 from ouroboros.p2p_messages import NetworkAddress
@@ -4116,6 +4123,33 @@ class PeerManager:
         peer.register_handler("addr", on_addr)
         peer.register_handler("addrv2", on_addrv2)
         peer.register_handler("getaddr", on_getaddr)
+
+    def _get_addr_response(self, peer: Peer) -> list:
+        """Addresses to answer *peer*'s getaddr with, from a per-network cache.
+
+        Core ``CConnman::GetAddresses(CNode& requestor, ...)`` (net.cpp:3702-3737):
+        one cached reply per ``m_network_key`` (derived from the local address the
+        connection was accepted on), redrawn only after 21 h + rand(6 h).  Without
+        it every reconnect yields a fresh 23% sample, so a peer can enumerate the
+        whole addrman and correlate the timestamps it sees across our onion and
+        clearnet listeners.
+        """
+        key = peer.addr_bind
+        now = time.time()
+        entry = self._addr_response_caches.get(key)
+        if entry is None or entry[1] < now:
+            # Snapshot the entries (Core caches CAddress values): later addrman
+            # updates to last_seen/services must not show through the cache.
+            addrs = [
+                copy.copy(info)
+                for info in self.addrman.get_addresses_for_sharing(
+                    max_addresses=1000, max_pct=23,
+                )
+            ]
+            expiry = now + 21 * 3600 + random.uniform(0, 6 * 3600)
+            entry = [addrs, expiry]
+            self._addr_response_caches[key] = entry
+        return entry[0]
 
     async def _send_getaddr(self, peer: Peer) -> None:
         try:
