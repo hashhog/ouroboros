@@ -251,7 +251,7 @@ class Chunk:
 
     txids: set[bytes]
     total_fee: int
-    total_size: int
+    total_size: int  # sigop-adjusted vsize of the members, witness included
 
     @property
     def fee_rate(self) -> float:
@@ -330,7 +330,8 @@ class ClusterLinearizer:
         """Compute the ancestor set feerate for a transaction.
 
         The ancestor set is the transaction plus all its ancestors (within remaining).
-        The ancestor set feerate is the total fee divided by total size.
+        The ancestor set feerate is the total fee divided by total
+        sigop-adjusted vsize (witness included), in sat/vB.
         """
         entry = self.transactions.get(txid)
         if entry is None:
@@ -356,7 +357,7 @@ class ClusterLinearizer:
             anc_entry = self.transactions.get(anc_txid)
             if anc_entry:
                 total_fee += anc_entry.fee
-                total_size += anc_entry.size
+                total_size += anc_entry.vsize
 
         return total_fee / total_size if total_size > 0 else 0.0
 
@@ -423,7 +424,13 @@ class ClusterLinearizer:
                 entry = self.transactions.get(txid)
                 if entry:
                     total_fee += entry.fee
-                    total_size += entry.size
+                    # Sigop-adjusted vsize (Core GetTxSize), NOT entry.size:
+                    # that is the stripped size, which leaves the witness out,
+                    # so a witness-heavy low-feerate chunk would look like a
+                    # high-feerate one and outlive honest chunks in
+                    # TrimToSize.  Core's TxGraph chunk feerates are fee over
+                    # sigop-adjusted weight (txmempool.cpp:1017).
+                    total_size += entry.vsize
 
             chunk = Chunk(
                 txids=ancestor_set,
@@ -4570,8 +4577,9 @@ class Mempool:
             left = {t: len(ps) for t, ps in parents_of.items()}
 
             def _key(t):
+                # Same unit as the snapshot's chunk sizes: vsize, witness in.
                 fee, size, _ = pre.get(t, (self.transactions[t].fee,
-                                           self.transactions[t].size, None))
+                                           self.transactions[t].vsize, None))
                 return -Fraction(fee, size if size > 0 else 1)
 
             heap: list = []
@@ -4995,7 +5003,8 @@ class Mempool:
     MAX_REPLACEMENT_EVICTIONS = 100
 
     def _check_cluster_rbf(
-        self, new_tx: Transaction, to_evict: set[bytes], new_fee: int
+        self, new_tx: Transaction, to_evict: set[bytes], new_fee: int,
+        new_vsize: int | None = None,
     ) -> tuple[bool, str]:
         """Check if replacement improves the cluster linearization.
 
@@ -5005,8 +5014,16 @@ class Mempool:
         The feerate diagram is a cumulative plot of (size, fee) for each chunk
         in order. A diagram A is better than B if A is always above B.
 
+        Sizes are sigop-adjusted vsize (Core GetTxSize), witness included,
+        on both sides: *new_vsize* is the replacement's, computed by the
+        caller with its sigop cost (falls back to the plain vsize).  The
+        stripped size would make a witness-heavy transaction look far
+        higher-feerate than it is, in either role.
+
         Reference: Bitcoin Core txgraph.h - GetMainStagingDiagrams()
         """
+        if new_vsize is None:
+            new_vsize = new_tx.get_vsize()
         # Find clusters affected by the eviction
         affected_cluster_ids: set[int] = set()
         for txid in to_evict:
@@ -5035,7 +5052,7 @@ class Mempool:
 
         # Compute what the new diagram would look like after replacement
         # This is approximate: we simulate adding the new tx after eviction
-        new_size = len(new_tx.serialize())
+        new_size = new_vsize
 
         # Calculate total old MODIFIED fee/size from affected clusters
         # (FIX-72) — diagram comparisons must honour prioritisetransaction so
@@ -5049,7 +5066,7 @@ class Mempool:
                     entry = self.transactions.get(txid)
                     if entry:
                         old_total_fee += self.get_modified_fee(entry)
-                        old_total_size += entry.size
+                        old_total_size += entry.vsize
 
         # Calculate new total after eviction + addition (use MODIFIED fee on
         # the evicted side; new_fee already includes the replacement's delta).
@@ -5058,7 +5075,7 @@ class Mempool:
             for t in to_evict
             if t in self.transactions
         )
-        evicted_size = sum(self.transactions[t].size for t in to_evict if t in self.transactions)
+        evicted_size = sum(self.transactions[t].vsize for t in to_evict if t in self.transactions)
 
         new_total_fee = old_total_fee - evicted_fee + new_fee
         new_total_size = old_total_size - evicted_size + new_size
@@ -5079,8 +5096,9 @@ class Mempool:
             )
 
         # Additional check: the new tx's feerate should be at least as good as
-        # the worst chunk it would displace
-        new_tx_rate = new_fee / new_size if new_size > 0 else 0
+        # the worst chunk it would displace.  Chunk feerates are over vsize
+        # (witness included), so this side is too.
+        new_tx_rate = new_fee / new_vsize if new_vsize > 0 else 0
         for cid in affected_cluster_ids:
             cluster = self._cluster_manager._clusters.get(cid)
             if cluster:
@@ -5429,7 +5447,7 @@ class Mempool:
         # Reference: Bitcoin Core txgraph.h - GetMainStagingDiagrams()
         # Pass the MODIFIED fee so diagram comparisons honour prioritisation.
         cluster_ok, cluster_err = self._check_cluster_rbf(
-            new_tx, to_evict, new_fee_modified
+            new_tx, to_evict, new_fee_modified, new_vsize
         )
         if not cluster_ok:
             return False, cluster_err
@@ -5604,7 +5622,7 @@ class Mempool:
         (ToFeePerVSize: ceil(weight / 4)) and ``+=`` adds GetFeePerK() values,
         i.e. floor(fee * 1000 / vsize) (policy/feerate.h).
 
-        Returns (txs removed, stripped bytes freed, removed sat/kvB), or None
+        Returns (txs removed, vbytes freed, removed sat/kvB), or None
         when the pool has no chunk.
         """
         worst = self._cluster_manager.get_worst_chunk()
@@ -5646,7 +5664,7 @@ class Mempool:
             )
 
     def _evict_low_fee_txs(self, needed_space: int):
-        """Evict lowest-feerate chunks until *needed_space* stripped bytes
+        """Evict lowest-feerate chunks until *needed_space* vbytes
         are freed.  No node path calls this any more (the -maxmempool limit
         is enforced by _trim_to_size, on Core's DynamicMemoryUsage()); it is
         the chunk-eviction entry point tests/test_mempool_eviction.py drives
