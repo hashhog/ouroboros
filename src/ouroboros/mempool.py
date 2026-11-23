@@ -5118,14 +5118,20 @@ class Mempool:
         return True, ""
 
     def _find_conflicts(self, tx: Transaction) -> set[bytes]:
+        """Txids of in-mempool transactions that spend any of *tx*'s inputs.
+
+        Mirrors Core's PreChecks loop over ``m_pool.GetConflictTx(prevout)``
+        (src/validation.cpp, src/txmempool.cpp): one lookup per input in the
+        reverse spend-index (``mapNextTx`` there, ``spender_by_outpoint``
+        here), not a walk over every mempool entry per conflicting input.
+        """
         conflicts: set[bytes] = set()
         for tx_in in tx.inputs:
-            op: OutPoint = (tx_in.prev_txid, tx_in.prev_vout)
-            if op in self.spent_outputs:
-                for txid, entry in self.transactions.items():
-                    for existing_in in entry.tx.inputs:
-                        if (existing_in.prev_txid, existing_in.prev_vout) == op:
-                            conflicts.add(txid)
+            spender = self.spender_by_outpoint.get(
+                (tx_in.prev_txid, tx_in.prev_vout)
+            )
+            if spender is not None and spender in self.transactions:
+                conflicts.add(spender)
         return conflicts
 
     def _collect_descendants(self, txid: bytes) -> set[bytes]:

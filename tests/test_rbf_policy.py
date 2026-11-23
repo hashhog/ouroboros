@@ -99,6 +99,9 @@ def _inject(pool: Mempool, tx: Transaction, fee: int) -> None:
     pool.current_size += size
     for inp in tx.inputs:
         pool.spent_outputs.add((inp.prev_txid, inp.prev_vout))
+        # Keep the reverse spend-index in step, as every production insert
+        # site does; _find_conflicts reads it (Core GetConflictTx / mapNextTx).
+        pool.spender_by_outpoint[(inp.prev_txid, inp.prev_vout)] = txid
 
 
 # ---------------------------------------------------------------------------
@@ -304,6 +307,7 @@ class TestMaxReplacementCandidates:
             pool.current_size += 250
             for inp in child.inputs:
                 pool.spent_outputs.add((inp.prev_txid, inp.prev_vout))
+                pool.spender_by_outpoint[(inp.prev_txid, inp.prev_vout)] = child_txid
             parent_entry = pool.transactions.get(prev)
             if parent_entry is not None:
                 parent_entry.children.add(child_txid)
@@ -346,6 +350,7 @@ class TestMaxReplacementCandidates:
             pool.current_size += 250
             for inp in child.inputs:
                 pool.spent_outputs.add((inp.prev_txid, inp.prev_vout))
+                pool.spender_by_outpoint[(inp.prev_txid, inp.prev_vout)] = child_txid
             parent_entry = pool.transactions.get(prev)
             if parent_entry is not None:
                 parent_entry.children.add(child_txid)
