@@ -19,7 +19,33 @@ import ipaddress
 
 import pytest
 
+from ouroboros.addrman import AddrInfo, get_network_group
 from ouroboros.p2p import FIXED_SEEDS_MAINNET, PeerManager
+
+# addrman's bucket key is random per AddressManager (Core nKey), so how many
+# of the 40 seeds share a new-table slot varies run to run.  Core's
+# AddrMan::Add -> AddSingle drops a newcomer whose slot holds a healthy
+# incumbent (addrman.cpp "fInsert"), and fixed seeds take that same path
+# (net.cpp ThreadOpenConnections: addrman.Add(seed_addrs, local)), so the
+# count returned is "seeds that got a slot", not "seeds offered".  Tests that
+# assert an exact count pin the key: with KEY_NO_COLLISION all 40 seeds get
+# distinct slots; with KEY_ONE_COLLISION exactly one pair collides.
+KEY_NO_COLLISION = bytes(32)
+KEY_ONE_COLLISION = bytes([1]) * 32
+
+
+def _pin_key(pm: PeerManager, key: bytes) -> None:
+    assert pm.addrman.new_count() == 0  # only safe on an empty table
+    pm.addrman._key = key
+
+
+def _seed_slot(pm: PeerManager, entry: str) -> tuple[int, int]:
+    """The new-table (bucket, position) addrman.add computes for a seed."""
+    ip, _, port = entry.rpartition(":")
+    info = AddrInfo(host=ip, port=int(port))
+    group = get_network_group("fixedseeds")
+    bucket = pm.addrman._get_new_bucket(info, group)
+    return bucket, pm.addrman._get_bucket_position(info, is_new=True, bucket=bucket)
 
 
 def _pm(**kw) -> PeerManager:
@@ -59,10 +85,13 @@ def test_fixed_seeds_are_40_routable_ipv4_8333():
 @pytest.mark.asyncio
 async def test_add_fixed_seeds_populates_book():
     pm = _pm()
+    _pin_key(pm, KEY_NO_COLLISION)
     assert len(pm.known_addrs) == 0
     added = await pm.add_fixed_seeds()
-    # All 40 are routable public IPv4, so all 40 land in addrman.
+    # All 40 are routable public IPv4 and, under this key, hash to 40
+    # distinct new-table slots, so all 40 land in addrman.
     assert added == 40
+    assert pm.addrman.new_count() == 40
     assert len(pm.known_addrs) == 40
     # Tagged with the "fixedseeds" internal source.
     for entry in FIXED_SEEDS_MAINNET:
@@ -185,6 +214,46 @@ async def test_banned_fixed_seed_filtered(monkeypatch):
 
     monkeypatch.setattr(pm.ban_manager, "is_banned", fake_is_banned)
 
+    _pin_key(pm, KEY_NO_COLLISION)
     added = await pm.add_fixed_seeds()
     assert added == 39
     assert banned_entry not in pm.known_addrs
+
+
+# ---------------------------------------------------------------------------
+# (G) A seed whose new-table slot is already held by an earlier (healthy)
+#     seed is dropped and the incumbent kept -- Core AddSingle collision rule.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_colliding_fixed_seed_dropped_incumbent_kept():
+    pm = _pm()
+    _pin_key(pm, KEY_ONE_COLLISION)
+    added = await pm.add_fixed_seeds()
+    assert added == 39
+    assert pm.addrman.new_count() == 39
+    dropped = [e for e in FIXED_SEEDS_MAINNET if e not in pm.addrman._addrs]
+    assert len(dropped) == 1
+    (loser,) = dropped
+    bucket, pos = _seed_slot(pm, loser)
+    incumbent = pm.addrman._new_buckets[bucket][pos]
+    # The slot is held by a seed offered earlier, not left empty or evicted.
+    assert incumbent in FIXED_SEEDS_MAINNET
+    assert FIXED_SEEDS_MAINNET.index(incumbent) < FIXED_SEEDS_MAINNET.index(loser)
+    assert _seed_slot(pm, incumbent) == (bucket, pos)
+    # The loser is still a known address; it is only absent from addrman.
+    assert loser in pm.known_addrs
+
+
+@pytest.mark.asyncio
+async def test_fixed_seed_count_follows_slot_rule_under_random_key():
+    """Unpinned key: the count is whatever the slot rule says, every run."""
+    pm = _pm()
+    slots = [_seed_slot(pm, e) for e in FIXED_SEEDS_MAINNET]
+    added = await pm.add_fixed_seeds()
+    assert added == len(set(slots))
+    assert added == pm.addrman.new_count()
+    for entry, slot in zip(FIXED_SEEDS_MAINNET, slots):
+        first = FIXED_SEEDS_MAINNET[slots.index(slot)]
+        assert (entry in pm.addrman._addrs) == (entry == first)
