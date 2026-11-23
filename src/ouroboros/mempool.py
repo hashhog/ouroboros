@@ -3113,6 +3113,15 @@ class Mempool:
             return self.validator.validate_transaction(
                 tx, next_height, mempool_mtp, **kwargs)
 
+        def _script_reject(error: str) -> tuple[bool, str]:
+            if workspace is not None and self._is_script_failure(error):
+                # Core names the script error (SCRIPT_ERR_*) in the reject
+                # reason; the validator's interpreter recorded it for this
+                # thread's verify call, the one that just failed.
+                interp = getattr(self.validator, "script_interpreter", None)
+                workspace["script_error"] = getattr(interp, "last_error", None)
+            return False, error
+
         # PreChecks without the scripts: structure, finality, input
         # resolution and values, coinbase maturity, BIP68 (Core
         # CheckFinalTxAtTip / CheckSequenceLocks / CheckTxInputs).  The fee
@@ -3131,7 +3140,8 @@ class Mempool:
             # these checks together with the scripts.
             valid, error = True, ""
         if not valid:
-            return False, error
+            # A validator that ignores skip_scripts can fail a script here.
+            return _script_reject(error)
 
         # tx_sigop_cost was computed above (in the require_standard block); it is
         # 0 when standardness checks are disabled.  Derive the sigop-adjusted
@@ -3234,13 +3244,7 @@ class Mempool:
                     tx, next_height,
                 )
         if not valid:
-            if workspace is not None and self._is_script_failure(error):
-                # Core names the script error (SCRIPT_ERR_*) in the reject
-                # reason; the validator's interpreter recorded it for this
-                # thread's verify call, the one that just failed.
-                interp = getattr(self.validator, "script_interpreter", None)
-                workspace["script_error"] = getattr(interp, "last_error", None)
-            return False, error
+            return _script_reject(error)
 
         # Check for conflicts (double spends) — attempt BIP 125 RBF
         has_conflict = any(
