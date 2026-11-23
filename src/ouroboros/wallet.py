@@ -1279,6 +1279,11 @@ class Wallet:
         self._hd_base_path: str = self.HD_BASE_PATH
         self._passphrase: str | None = None
         self._encrypted_blob: bytes | None = None
+        # Core nRelockTime: wall-clock time the pending walletpassphrase
+        # relock is for, 0 when none is pending.  A relock callback whose
+        # time no longer matches (a newer walletpassphrase, a walletlock, an
+        # unload) does nothing.
+        self._relock_time: float = 0
         self._key_pool: KeyPool | None = None  # BIP84 key pool
         self._disable_private_keys: bool = False  # watch-only mode
         self._blank: bool = False
@@ -1765,6 +1770,9 @@ class Wallet:
         self._passphrase = passphrase
         self._encrypted_blob = None
         self._save()
+        # Core CWallet::EncryptWallet ends with Lock(): the new passphrase
+        # must be given (walletpassphrase) before keys are usable again.
+        self.lock()
         logger.info(f"Wallet '{self.name}' encrypted")
 
     def unlock(self, passphrase: str) -> None:
@@ -1772,7 +1780,16 @@ class Wallet:
         from ouroboros.descriptors import DescriptorEntry
 
         if self._encrypted_blob is None:
-            raise ValueError("Wallet is not encrypted")
+            if self._passphrase is None:
+                raise ValueError("Wallet is not encrypted")
+            # Already unlocked: Core's Unlock still succeeds for the right
+            # passphrase (so walletpassphrase can renew its timeout) and
+            # fails for a wrong one.
+            if not hmac.compare_digest(
+                passphrase.encode("utf-8"), self._passphrase.encode("utf-8")
+            ):
+                raise ValueError("Decryption failed (wrong passphrase or corrupt data)")
+            return
         plaintext = decrypt_wallet_data(self._encrypted_blob, passphrase)
         data = json.loads(plaintext.decode("utf-8"))
         self.keys = data.get("keys", [])
@@ -1917,13 +1934,23 @@ class Wallet:
         return None
 
     def change_passphrase(self, old_passphrase: str, new_passphrase: str) -> None:
-        """Re-encrypt the wallet with a new passphrase."""
+        """Re-encrypt the wallet with a new passphrase.
+
+        Core CWallet::ChangeWalletPassphrase: lock first, then decrypt with
+        the OLD passphrase, so an unlocked wallet cannot be re-keyed without
+        it (a wrong one raises ValueError and leaves the wallet locked).  On
+        success the wallet is back in the lock state it was found in.
+        """
         if not new_passphrase:
             raise ValueError("New passphrase must not be empty")
-        if self._passphrase is None and self._encrypted_blob is not None:
-            self.unlock(old_passphrase)
+        was_locked = self.is_locked
+        if not was_locked:
+            self.lock()
+        self.unlock(old_passphrase)
         self._passphrase = new_passphrase
         self._save()
+        if was_locked:
+            self.lock()
         logger.info(f"Wallet '{self.name}' passphrase changed")
 
     def set_database(self, db) -> None:
@@ -4420,6 +4447,10 @@ class WalletManager:
             raise WalletRpcError(-18, f"Wallet {name} not found.")
 
         wallet = self._wallets[name]
+
+        # A pending walletpassphrase relock must not touch an unloaded wallet
+        # (Core holds only a weak_ptr to it); a later reload is a new object.
+        wallet._relock_time = 0
 
         # Save wallet state before unloading
         wallet._save()
