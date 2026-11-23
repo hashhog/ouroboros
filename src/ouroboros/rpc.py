@@ -6478,6 +6478,12 @@ class RPCServer:
             return JSONRPCResponse(
                 error={"code": -18, "message": "No wallet loaded"}, id=None
             )
+        if wallet.is_locked:
+            # Core sethdseed: EnsureWalletIsUnlocked (wallet/rpc/util.cpp).
+            raise RpcError(
+                -13,
+                "Error: Please enter the wallet passphrase with walletpassphrase first.",
+            )
 
         if seed_hex is not None:
             try:
@@ -16343,6 +16349,13 @@ class RPCServer:
             wallet = getattr(self.node, "wallet", None)
         if wallet is None:
             raise ValueError("No wallet loaded")
+        if getattr(wallet, "is_locked", False):
+            # Core importprivkey: EnsureWalletIsUnlocked before the key is
+            # decoded or written (wallet/rpc/backup.cpp, wallet/rpc/util.cpp).
+            raise RpcError(
+                -13,
+                "Error: Please enter the wallet passphrase with walletpassphrase first.",
+            )
 
         from ouroboros.wallet import WalletKey
         try:
