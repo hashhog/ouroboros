@@ -3199,7 +3199,8 @@ class Mempool:
                     return False, truc_err
                 # Sibling eviction: try to replace the existing child
                 return self._try_sibling_eviction(
-                    tx, sibling_txid, height, package_member=in_package)
+                    tx, sibling_txid, height, package_member=in_package,
+                    sigop_cost=tx_sigop_cost)
             return False, truc_err
 
         # Ancestor set — bookkeeping only.  As of Bitcoin Core v31 (cluster
@@ -3959,22 +3960,31 @@ class Mempool:
 
     def _try_sibling_eviction(
         self, new_tx: Transaction, sibling_txid: bytes, height: int,
-        package_member: bool = False,
+        package_member: bool = False, sigop_cost: int = 0,
     ) -> tuple[bool, str]:
         """Attempt TRUC sibling eviction.
 
         When a TRUC parent already has one child, a new child can replace
-        the existing sibling if it pays a higher fee rate. This is a special
-        form of RBF specific to TRUC transactions.
+        the existing sibling if it pays for it as an RBF replacement would.
 
-        Reference: Bitcoin Core policy/truc_policy.cpp (sibling eviction logic)
+        Core decides everything before anything leaves the pool: PreChecks
+        runs ``CheckFeeRate`` (min relay fee, rolling mempool minimum) before
+        ``SingleTRUCChecks``; the sibling then joins ``ws.m_conflicts`` and
+        ``ReplacementChecks`` applies ``PaysForRBF`` on the sigop-adjusted
+        vsize, rejecting "insufficient fee (including sibling eviction)".
+        Only ``FinalizeSubpackage`` removes the sibling.  So the fee floors
+        and PaysForRBF run here first, and if the re-admission of *new_tx*
+        still fails before it is inserted, the sibling is put back.
+
+        Reference: bitcoin-core/src/validation.cpp PreChecks (CheckFeeRate,
+        SingleTRUCChecks, m_sibling_eviction) and ReplacementChecks;
+        policy/rbf.cpp PaysForRBF; policy/truc_policy.cpp.
         """
         sibling_entry = self.transactions.get(sibling_txid)
         if sibling_entry is None:
             return False, "Sibling transaction not found"
 
         # Calculate new tx fee
-        new_size = len(new_tx.serialize())
         total_input = 0
         for inp in new_tx.inputs:
             utxo = self.validator.db.get_utxo(inp.prev_txid, inp.prev_vout)
@@ -3994,24 +4004,32 @@ class Mempool:
         if new_fee < 0:
             return False, "Negative fee"
 
-        # Sibling eviction requires:
-        # 1. New fee > sibling fee (strictly higher)
-        # 2. New fee covers incremental relay fee for new tx size
-        sibling_fee = sibling_entry.fee
+        new_vsize = get_virtual_transaction_size(
+            new_tx.get_weight(), sigop_cost, DEFAULT_BYTES_PER_SIGOP
+        )
 
-        if new_fee <= sibling_fee:
-            return False, (
-                f"Sibling eviction requires higher fee: {new_fee} <= {sibling_fee}"
-            )
+        # CheckFeeRate, before the sibling is touched.  The same floors the
+        # re-admission below applies (_add_transaction_inner), with the same
+        # tokens; checked here so a tx that cannot enter never evicts.
+        if new_fee < (new_vsize * DEFAULT_MIN_RELAY_TX_FEE) // 1000:
+            return False, "min relay fee not met"
+        rolling_min_kvb = self._get_min_fee_inner()
+        if (rolling_min_kvb > DEFAULT_MIN_RELAY_TX_FEE
+                and new_fee < (new_vsize * rolling_min_kvb) // 1000):
+            return False, "mempool min fee not met"
 
-        # Check incremental relay fee
-        incremental_fee_needed = (new_size * self.INCREMENTAL_RELAY_FEE) // 1000
-        additional_fee = new_fee - sibling_fee
-        if additional_fee < incremental_fee_needed:
-            return False, (
-                f"Sibling eviction does not cover incremental relay fee: "
-                f"additional {additional_fee} < required {incremental_fee_needed}"
-            )
+        # ReplacementChecks with the sibling as the conflict.  The sibling has
+        # no descendants (consider_sibling_eviction requires it), so the
+        # conflict set is the sibling alone.  PaysForRBF: modified fees,
+        # incremental relay fee on the sigop-adjusted vsize, rounded up.
+        new_fee_modified = new_fee + int(self.map_deltas.get(new_tx.get_txid(), 0))
+        conflicting_fees = sum(
+            self.get_modified_fee(t) for t in self._collect_descendants(sibling_txid)
+        )
+        pays_err = pays_for_rbf(conflicting_fees, new_fee_modified, new_vsize,
+                                self.INCREMENTAL_RELAY_FEE, new_tx.get_txid())
+        if pays_err is not None:
+            return False, f"insufficient fee (including sibling eviction), {pays_err}"
 
         # All checks passed - evict sibling and add new tx
         logger.info(
@@ -4019,20 +4037,33 @@ class Mempool:
             f"with {new_tx.get_txid().hex()[:16]}..."
         )
 
-        # Remove sibling
-        self.remove_transaction(sibling_txid, _skip_recount=True, _reason="sibling-evicted")
+        # Remove the sibling with the normal recount, so the parent's
+        # descendant_count / descendant_size drop before the re-admission adds
+        # the new child (a _skip_recount removal left them one too high).
+        sibling_tx = sibling_entry.tx
+        self._remove_transaction_inner(sibling_txid, _reason="sibling-evicted")
 
-        # Now add the new transaction (it should pass all checks)
-        # We need to be careful to avoid infinite recursion - the sibling
-        # is already removed so the parent no longer has a child.
         # Re-enter with the caller's package context, so a package member is
         # not size-trimmed on its own insert (the package trims at its end).
         ok, err = self._add_transaction_inner(
             new_tx, height, package_member=package_member)
         if not ok:
-            # This shouldn't happen if our checks are correct
             logger.warning(f"Failed to add tx after sibling eviction: {err}")
-            return False, f"Failed after sibling eviction: {err}"
+            # Rejected before insertion: nothing replaced the sibling, so put
+            # it back (it was in the pool a moment ago, so the fee floors and
+            # trimming are bypassed).  "mempool full" means new_tx was
+            # inserted and then trimmed, which Core reports after the
+            # sibling has already been removed, so that case is left alone.
+            if (new_tx.get_txid() not in self.transactions
+                    and err != "mempool full"
+                    and sibling_txid not in self.transactions):
+                r_ok, r_err = self._add_transaction_inner(
+                    sibling_tx, height, bypass_limits=True, package_member=True)
+                if not r_ok:
+                    logger.warning(
+                        f"Could not restore sibling {sibling_txid.hex()[:16]}... "
+                        f"after failed eviction: {r_err}")
+            return False, err
 
         return True, ""
 
