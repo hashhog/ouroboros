@@ -310,6 +310,120 @@ def validate_original_psbt(psbt: PSBT) -> None:
             )
 
 
+# 21M BTC in satoshis -- the MoneyRange bound (consensus/amount.h).
+_MAX_MONEY = 21_000_000 * 100_000_000
+
+
+def _original_input_value(psbt: PSBT, idx: int) -> int:
+    """Value of the prevout spent by Original input ``idx``.
+
+    A ``non_witness_utxo`` is preferred and must hash to the prevout txid
+    the unsigned tx names, so the sender cannot attach an unrelated
+    transaction.  Otherwise the ``witness_utxo`` amount is used (segwit
+    signatures commit to it, so a wrong amount makes the Original
+    unbroadcastable, which the test-accept hook then catches).
+    """
+    from ouroboros.psbt import _deserialize_tx_full
+
+    assert psbt.tx is not None
+    inp = psbt.inputs[idx]
+    txin = psbt.tx.inputs[idx]
+    if inp.non_witness_utxo is not None:
+        try:
+            prev = _deserialize_tx_full(inp.non_witness_utxo)
+        except Exception as exc:
+            raise err_original_psbt_rejected(
+                f"Original PSBT input {idx} non_witness_utxo does not parse"
+            ) from exc
+        if prev.get_txid() != txin.prev_txid:
+            raise err_original_psbt_rejected(
+                f"Original PSBT input {idx} non_witness_utxo is not the "
+                "transaction its prevout names"
+            )
+        if txin.prev_vout >= len(prev.outputs):
+            raise err_original_psbt_rejected(
+                f"Original PSBT input {idx} prevout index out of range"
+            )
+        return int(prev.outputs[txin.prev_vout].value)
+    if inp.witness_utxo is not None:
+        return int(inp.witness_utxo[0])
+    raise err_original_psbt_rejected(
+        f"Original PSBT input {idx} missing witness_utxo / non_witness_utxo"
+    )
+
+
+def validate_original_balance(psbt: PSBT) -> int:
+    """Reject an Original whose outputs exceed its inputs.
+
+    BIP-78 receiver checklist: the Original must be a transaction the
+    sender could broadcast on its own.  One that spends more than it
+    holds is not, and signing a receiver input into it would make the
+    receiver's coin pay for the sender's outputs.  Every amount must also
+    be in MoneyRange (Core CheckTransaction ``bad-txns-vout-negative`` /
+    ``-toolarge`` / ``-txouttotal-toolarge``).  Returns the fee.
+    """
+    if psbt.tx is None:
+        raise err_original_psbt_rejected("Original PSBT has no unsigned tx")
+    if len(psbt.inputs) != len(psbt.tx.inputs):
+        raise err_original_psbt_rejected(
+            "Original PSBT input map count does not match its tx"
+        )
+    total_out = 0
+    for i, out in enumerate(psbt.tx.outputs):
+        if out.value < 0 or out.value > _MAX_MONEY:
+            raise err_original_psbt_rejected(
+                f"Original PSBT output {i} amount out of range"
+            )
+        total_out += out.value
+        if total_out > _MAX_MONEY:
+            raise err_original_psbt_rejected(
+                "Original PSBT output total out of range"
+            )
+    total_in = 0
+    for i in range(len(psbt.tx.inputs)):
+        v = _original_input_value(psbt, i)
+        if v < 0 or v > _MAX_MONEY:
+            raise err_original_psbt_rejected(
+                f"Original PSBT input {i} amount out of range"
+            )
+        total_in += v
+        if total_in > _MAX_MONEY:
+            raise err_original_psbt_rejected(
+                "Original PSBT input total out of range"
+            )
+    if total_in < total_out:
+        raise err_original_psbt_rejected(
+            f"Original PSBT spends {total_out} sat but its inputs hold "
+            f"only {total_in} sat (not broadcastable)"
+        )
+    return total_in - total_out
+
+
+def credit_receiver_output(
+    psbt: PSBT, payment_idx: int, contributed_value: int
+) -> None:
+    """Add the receiver's contributed input value to its payment output.
+
+    BIP-78: the receiver's input funds the receiver's own output.  Without
+    this the contributed coin is unaccounted for, and since the receiver
+    signs SIGHASH_ALL over the sender's outputs, the whole coin goes to
+    whatever the sender put in them (or to fees).
+    """
+    if psbt.tx is None:
+        raise err_unavailable("PSBT lost its tx during contribution")
+    target = psbt.tx.outputs[payment_idx]
+    new_value = target.value + int(contributed_value)
+    if new_value > _MAX_MONEY:
+        raise err_original_psbt_rejected("receiver output would exceed MAX_MONEY")
+    target.value = new_value
+    if (
+        psbt.version != PSBT_VERSION_0
+        and payment_idx < len(psbt.outputs)
+        and psbt.outputs[payment_idx].amount is not None
+    ):
+        psbt.outputs[payment_idx].amount = new_value
+
+
 def find_payment_output(
     psbt: PSBT, receiver_script: bytes, min_amount: int
 ) -> int:
@@ -500,6 +614,13 @@ class ReceiverContext:
     receiver_script: bytes
     # Minimum amount the receiver expects (sender's output must be ≥ this).
     min_amount: int
+    # BIP-78 "verify the Original is broadcastable (testmempoolaccept)".
+    # Called with a copy of the Original PSBT; returns None when the node's
+    # mempool would accept it, else the reject reason.  May raise
+    # PayJoinError (e.g. ``unavailable`` when the mempool is not ready).
+    # None skips the check (unit tests whose Originals carry placeholder
+    # signatures); the HTTP endpoint always supplies it.
+    check_broadcastable: Any = None
 
 
 def process_payjoin_request(
@@ -518,6 +639,15 @@ def process_payjoin_request(
     # 2. Deserialize + validate the Original PSBT.
     psbt = decode_original_psbt(body)
     validate_original_psbt(psbt)
+    # 2b. The Original must balance, and (when the node can tell) be
+    #     accepted by our mempool, before we put a receiver coin in it.
+    validate_original_balance(psbt)
+    if ctx.check_broadcastable is not None:
+        reason = ctx.check_broadcastable(PSBT.from_base64(psbt.to_base64()))
+        if reason is not None:
+            raise err_original_psbt_rejected(
+                f"Original PSBT is not broadcastable: {reason}"
+            )
 
     # 3. Locate the receiver's payment output.
     payment_idx = find_payment_output(psbt, ctx.receiver_script, ctx.min_amount)
@@ -541,6 +671,11 @@ def process_payjoin_request(
     # 6. Append the receiver's input.
     add_receiver_input(psbt, chosen, key)
 
+    # 6b. Credit the contributed value to the receiver's payment output,
+    #     so the signature below commits to an output that is worth at
+    #     least the original payment plus the receiver's coin.
+    credit_receiver_output(psbt, payment_idx, int(chosen["value"]))
+
     # 7. Apply fee adjustment if the sender opted in.
     #
     # The actual receiver-extra-fee value is computed in the wallet path
@@ -548,6 +683,21 @@ def process_payjoin_request(
     # the foundation pass we cap at ``maxadditionalfeecontribution`` as
     # a conservative upper bound — the wallet-managed sender bumps the
     # output by the exact delta when re-broadcasting later.
+    #
+    # The designated output is the sender's change.  Pointing it at any
+    # receiver-owned output (the payment output or another one paying the
+    # receiver script) would let the sender's chosen cap claw back the
+    # credit above or cut the payment, so refuse that.  Compared by
+    # script, not index: an Original may pay the receiver script twice.
+    fee_idx = params.additionalfeeoutputindex
+    if (
+        fee_idx is not None
+        and fee_idx < len(psbt.tx.outputs)
+        and psbt.tx.outputs[fee_idx].script_pubkey == ctx.receiver_script
+    ):
+        raise err_original_psbt_rejected(
+            "additionalfeeoutputindex names an output paying the receiver"
+        )
     apply_fee_adjustment(
         psbt,
         params.additionalfeeoutputindex,
@@ -557,14 +707,14 @@ def process_payjoin_request(
 
     # 8. Sign the receiver's input via the same code path the wallet
     #    uses for walletprocesspsbt.  The sender's inputs are left alone.
-    _sign_receiver_input(psbt, key, payment_idx)
+    _sign_receiver_input(psbt, key)
 
     # 9. Return base64-encoded PSBT body — BIP-78 §"the PSBT MUST be
     #    text/plain encoded as base64".
     return psbt.to_base64().encode("ascii")
 
 
-def _sign_receiver_input(psbt: PSBT, key: WalletKey, _payment_idx: int) -> None:
+def _sign_receiver_input(psbt: PSBT, key: WalletKey) -> None:
     """Sign the LAST input (the receiver-contributed one) in the PSBT.
 
     Sender inputs MUST NOT be re-signed by the receiver; only the
@@ -1111,12 +1261,14 @@ def validate_max_fee_contribution(
 
     if additionalfeeoutputindex is None or maxadditionalfeecontribution is None:
         # Sender did NOT opt in to fee adjustment — receiver MUST not have
-        # touched any output amount.
+        # reduced any output amount.  An output may GROW: BIP-78 has the
+        # receiver add its contributed input's value to its own payment
+        # output, and that costs the sender nothing.
         for i, (o_in, o_out) in enumerate(
             zip(original.tx.outputs, proposal.tx.outputs)
         ):
             if bytes(o_in.script_pubkey) == bytes(o_out.script_pubkey):
-                if o_in.value != o_out.value:
+                if o_out.value < o_in.value:
                     raise err_original_psbt_rejected(
                         f"G13: sender did not authorize fee adjustment but "
                         f"output[{i}] amount changed "
@@ -1163,15 +1315,16 @@ def validate_max_fee_contribution(
             f"output but cap was {maxadditionalfeecontribution}"
         )
 
-    # Other outputs MUST be unchanged — receiver can only adjust the
-    # designated output's amount.
+    # Other outputs MUST NOT shrink — only the designated output pays
+    # the receiver's extra fee.  They may grow (the receiver crediting
+    # its contribution to its own payment output, BIP-78).
     for i, (o_in, o_out) in enumerate(
         zip(original.tx.outputs, proposal.tx.outputs)
     ):
         if bytes(o_in.script_pubkey) == bytes(o_out.script_pubkey):
             if (
                 bytes(o_in.script_pubkey) != designated_script
-                and o_in.value != o_out.value
+                and o_out.value < o_in.value
             ):
                 raise err_original_psbt_rejected(
                     f"G13: receiver modified non-designated output[{i}] "

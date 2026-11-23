@@ -165,6 +165,10 @@ class _MockMempool:
     def max_size(self):
         return 300_000_000
 
+    def accept_to_memory_pool(self, tx, height, test_accept=False):
+        # The /payjoin route test-accepts the Original before signing.
+        return {"accepted": True, "fee": 0, "vsize": 0}
+
 
 class _MockDB:
     def get_best_block(self):
