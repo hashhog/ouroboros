@@ -57,6 +57,13 @@ logger = logging.getLogger(__name__)
 # per-peer dedup structures stay on the same memory budget.
 ANNOUNCED_TXIDS_MAX_ENTRIES = 50_000
 
+# Upper bound on a peer's pending reconciliation set (``local_set``).  BIP 330
+# reconciliation sets are bounded; the upstream Erlay work in Bitcoin Core uses
+# MAX_RECONSET_SIZE = 3000 and fans a transaction out (floods it) instead of
+# adding it to a full set.  Without the cap an Erlay peer that never answers
+# reqtxrcncl pins every relayed txid in memory.
+MAX_RECONSET_SIZE = 3000
+
 
 # GF(2^32) arithmetic
 
@@ -613,10 +620,22 @@ class ReconciliationSet:
     # FIFO cap; overridable per-instance for tests.
     _announced_max: int = ANNOUNCED_TXIDS_MAX_ENTRIES
 
-    def add_tx(self, txid: bytes) -> None:
-        """Add a transaction to the reconciliation set."""
-        if txid not in self.announced_txids:
-            self.local_set.add(txid)
+    # Cap on ``local_set``; overridable per-instance for tests.
+    _max_set_size: int = MAX_RECONSET_SIZE
+
+    def add_tx(self, txid: bytes) -> bool:
+        """Add a transaction to the reconciliation set.
+
+        Returns False when the set is full and *txid* was not added; the
+        caller must then flood it instead (BIP 330 fallback).  Returns True
+        when the txid is in the set or was already announced.
+        """
+        if txid in self.announced_txids or txid in self.local_set:
+            return True
+        if len(self.local_set) >= self._max_set_size:
+            return False
+        self.local_set.add(txid)
+        return True
 
     def mark_announced(self, txid: bytes) -> None:
         """Mark a transaction as successfully announced.

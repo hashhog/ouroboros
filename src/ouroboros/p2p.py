@@ -836,8 +836,14 @@ class PeerManager:
         self._erlay_peers: dict[str, ReconciliationSet] = {}  # addr -> recon set
         self._erlay_local_salts: dict[str, int] = {}  # addr -> our salt
         self._erlay_pending_recon: dict[str, bool] = {}  # addr -> recon in progress
+        # addr -> monotonic time we sent reqtxrcncl (pending rounds only)
+        self._erlay_recon_started: dict[str, float] = {}
         self._reconciliation_task: asyncio.Task | None = None
         self._reconciliation_interval: float = 2.0  # seconds between rounds
+        # A peer that has not answered our reqtxrcncl within this many
+        # seconds is given up on for the round: its pending set is flooded
+        # via INV (the BIP 330 fallback) and it becomes eligible again.
+        self._reconciliation_timeout: float = 30.0
 
         # BIP 331 package relay state.
         # ``package_relay_enabled`` is the local advertisement flag — when
@@ -2904,6 +2910,7 @@ class PeerManager:
         self._erlay_peers.pop(addr, None)
         self._erlay_local_salts.pop(addr, None)
         self._erlay_pending_recon.pop(addr, None)
+        self._erlay_recon_started.pop(addr, None)
         self.cmpct_peers.discard(addr)
         self._package_peers.discard(addr)
         self._addr_relay_counts.pop(addr, None)
@@ -4787,16 +4794,35 @@ class PeerManager:
                     # Skip peers with no pending transactions
                     if recon.set_size == 0:
                         continue
-                    # Skip if reconciliation already in progress
+                    peer = self.get_peer_by_addr(addr)
+
+                    # Skip if reconciliation already in progress, unless
+                    # the peer has sat on our reqtxrcncl past the timeout:
+                    # then flood its pending set and stop waiting.
                     if self._erlay_pending_recon.get(addr, False):
+                        started = self._erlay_recon_started.get(addr)
+                        if (
+                            started is None
+                            or time.monotonic() - started
+                            < self._reconciliation_timeout
+                        ):
+                            continue
+                        logger.debug(
+                            f"Reconciliation with {addr} timed out, "
+                            "flooding pending txs"
+                        )
+                        self._erlay_pending_recon[addr] = False
+                        self._erlay_recon_started.pop(addr, None)
+                        if peer is not None and peer.is_connected():
+                            await self._flood_pending_invs(peer, addr)
                         continue
 
-                    peer = self.get_peer_by_addr(addr)
                     if peer is None or not peer.is_connected():
                         continue
 
                     try:
                         self._erlay_pending_recon[addr] = True
+                        self._erlay_recon_started[addr] = time.monotonic()
                         # Send reqtxrcncl to initiate
                         q_coeff = 1  # q = 1/2^15 ≈ minimal estimate
                         req = ReqTxRcnclMessage(
@@ -4839,6 +4865,18 @@ class PeerManager:
             if addr == exclude_addr:
                 continue
             recon.add_tx(txid)
+
+    def _erlay_try_reconcile(self, addr: str, txid: bytes) -> bool:
+        """Add *txid* to *addr*'s reconciliation set.
+
+        Returns False when the set is full (``MAX_RECONSET_SIZE``); the
+        caller then floods the txid through the normal trickle queue, the
+        BIP 330 fallback for a full set.
+        """
+        recon = self._erlay_peers.get(addr)
+        if recon is None:
+            return False
+        return recon.add_tx(txid)
 
     def is_erlay_peer(self, addr: str) -> bool:
         """Check if a peer has Erlay negotiated."""
@@ -5311,9 +5349,9 @@ class PeerManager:
             if not peer.is_connected() or not peer.relay_txs:
                 continue
 
-            # For Erlay peers, add to reconciliation set instead
-            if self.is_erlay_peer(addr):
-                self.erlay_add_tx_to_reconcile(txid, exclude_addr=exclude_addr)
+            # For Erlay peers, add to reconciliation set instead; when the
+            # set is full, fall through and flood via the trickle queue.
+            if self.is_erlay_peer(addr) and self._erlay_try_reconcile(addr, txid):
                 continue
 
             # Get or create trickle queue
