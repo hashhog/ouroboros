@@ -4059,11 +4059,13 @@ class Mempool:
 
         staged = {t: self.transactions[t] for t in affected - to_evict}
         staged[new_txid] = MempoolEntry(
-            # Base fee, as the pool entries carry: the linearizer orders on
-            # entry.fee; the chunk sums below use modified fees.
+            # Base fee and stripped size, as the pool entries carry: the
+            # linearizer orders on entry.fee / entry.size; the chunk sums
+            # below use modified fees and sigop-adjusted vsize.
             tx=new_tx, fee=fee,
             fee_rate=fee / vsize if vsize > 0 else 0,
-            size=vsize, time_added=0.0, height_added=0, sigop_cost=sigop_cost,
+            size=len(new_tx.serialize()), time_added=0.0, height_added=0,
+            sigop_cost=sigop_cost,
             parents=set(in_pool_parents),
         )
         _, chunks = ClusterLinearizer(staged).linearize(set(staged))
