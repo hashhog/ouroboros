@@ -17,6 +17,13 @@ eviction)".  Nothing leaves the pool until every check has passed.
 
 The controls pin the other side: an eviction that pays for itself still
 happens, and leaves the parent with descendant_count 2.
+
+Rework after review (hashhog/ouroboros#211): the sibling is now only staged
+for eviction and removed after every admission check has passed, so a
+rejected N leaves S (and an ephemeral-dust parent) untouched, with no
+remove/re-add.  The eviction also has to improve the feerate diagram
+(ImprovesFeerateDiagram), and the reorg refill (bypass_limits) skips the TRUC
+checks altogether, as Core does.
 """
 
 from __future__ import annotations
@@ -158,25 +165,32 @@ def test_sibling_eviction_that_pays_still_evicts_and_recounts_parent():
 
 
 
-def test_readmission_failure_after_removal_restores_the_sibling():
-    """Any gate after the TRUC check that still refuses N puts S back.
-
-    The fee checks now run before the removal; this pins the second line of
-    defence by making a later gate (the cluster limit) refuse N only.
-    """
-    pool, parent, sibling, half, s_fee = _setup()
+def _paying_newcomer(parent, half, s_fee):
     new = _newcomer(parent, half, 0)
     needed = -((-new.get_vsize() * 100) // 1000)
-    new = _newcomer(parent, half, s_fee + needed)
+    return _newcomer(parent, half, s_fee + needed)
 
-    real = pool._check_cluster_limit
 
-    def refuse_new(tx, *a, **kw):
-        if tx.get_txid() == new.get_txid():
-            return False, "too-large-cluster"
-        return real(tx, *a, **kw)
+def _refuse_cluster_for(pool, txid):
+    """Make the cluster-limit gate refuse *txid* only, whichever form of it
+    (plain add, or on the post-eviction graph) the admission calls."""
+    for name in ("_check_cluster_limit", "_check_cluster_limit_after_replacement"):
+        real = getattr(pool, name)
 
-    pool._check_cluster_limit = refuse_new
+        def refuse(tx, *a, _real=real, **kw):
+            if tx.get_txid() == txid:
+                return False, "too-large-cluster"
+            return _real(tx, *a, **kw)
+
+        setattr(pool, name, refuse)
+
+
+def test_readmission_failure_after_removal_restores_the_sibling():
+    """A gate after the TRUC check that refuses N leaves S in the pool."""
+    pool, parent, sibling, half, s_fee = _setup()
+    new = _paying_newcomer(parent, half, s_fee)
+    _refuse_cluster_for(pool, new.get_txid())
+
     ok, err = pool.add_transaction(new, HEIGHT)
     assert not ok
     assert new.get_txid() not in pool.transactions
@@ -185,3 +199,114 @@ def test_readmission_failure_after_removal_restores_the_sibling():
     assert p.children == {sibling.get_txid()}
     assert p.descendant_count == 2
     assert err == "too-large-cluster", err
+
+
+def test_rejected_eviction_never_removes_the_sibling():
+    """Core removes the sibling only in FinalizeSubpackage, after every check.
+
+    A rejected N must leave S's entry as it was (same entry, entry time) and
+    emit no remove/re-add of S: a remove-then-restore resets S's time and
+    sequence and tells ZMQ subscribers S left the pool.
+    """
+    pool, parent, sibling, half, s_fee = _setup()
+    events = []
+    pool._on_tx_removed = lambda txid, reason, seq: events.append(("rm", txid, reason))
+    pool._on_tx_added = lambda txid, tx, seq: events.append(("add", txid))
+    s_entry = pool.transactions[sibling.get_txid()]
+    s_time = s_entry.time_added
+    new = _paying_newcomer(parent, half, s_fee)
+    _refuse_cluster_for(pool, new.get_txid())
+
+    ok, err = pool.add_transaction(new, HEIGHT)
+    assert not ok, err
+    assert pool.transactions.get(sibling.get_txid()) is s_entry
+    assert s_entry.time_added == s_time
+    assert events == [], events
+
+
+def test_rejected_eviction_keeps_an_ephemeral_dust_parent():
+    """Removing S evicts a dust parent whose ephemeral child S is.  A rejected
+    N must leave both the dust parent and S in the pool."""
+    pool, parent, sibling, half, s_fee = _setup()
+    p_entry = pool.transactions[parent.get_txid()]
+    p_entry.has_ephemeral_dust = True
+    p_entry.ephemeral_child = sibling.get_txid()
+    new = _paying_newcomer(parent, half, s_fee)
+    _refuse_cluster_for(pool, new.get_txid())
+
+    ok, err = pool.add_transaction(new, HEIGHT)
+    assert not ok, err
+    assert parent.get_txid() in pool.transactions, "dust parent evicted by a rejected N"
+    assert sibling.get_txid() in pool.transactions
+    assert pool.transactions[parent.get_txid()].ephemeral_child == sibling.get_txid()
+
+
+def test_sibling_eviction_must_improve_the_feerate_diagram():
+    """PaysForRBF passes (N pays S's fee plus the incremental fee on its own
+    vsize) but N is a large, low-feerate child replacing a small high-feerate
+    one: the diagram gets worse, so Core rejects "replacement-failed"."""
+    pool = _pool()
+    half = (COIN_VALUE - 10_000) // 2
+    parent = Transaction(
+        txid=_txid(1), version=3, locktime=0,
+        inputs=[TxIn(prev_txid=COIN, prev_vout=0, script_sig=b"", sequence=SEQ)],
+        outputs=[TxOut(value=half, script_pubkey=b"\x51"),
+                 TxOut(value=half, script_pubkey=b"\x51")],
+    )
+    ok, err = pool.add_transaction(parent, HEIGHT)
+    assert ok, err
+    s_fee = 50_000
+    sibling = Transaction(
+        txid=_txid(2), version=3, locktime=0,
+        inputs=[TxIn(prev_txid=parent.get_txid(), prev_vout=0, script_sig=b"",
+                     sequence=SEQ)],
+        outputs=[TxOut(value=half - s_fee, script_pubkey=b"\x51")],
+    )
+    ok, err = pool.add_transaction(sibling, HEIGHT)
+    assert ok, err
+    new = _paying_newcomer(parent, half, s_fee)
+    s_rate = s_fee / sibling.get_vsize()
+    n_rate = s_fee / new.get_vsize()
+    assert n_rate * 10 < s_rate  # same-ish fee, ten times the size
+
+    ok, err = pool.add_transaction(new, HEIGHT)
+    assert not ok
+    assert err == ("replacement-failed: insufficient feerate: does not "
+                   "improve feerate diagram"), err
+    assert sibling.get_txid() in pool.transactions
+    assert new.get_txid() not in pool.transactions
+
+
+def test_reorg_refill_skips_truc_checks_and_keeps_the_sibling():
+    """Core skips SingleTRUCChecks under m_bypass_limits (the reorg refill),
+    so a refilled second child is admitted next to S and evicts nothing,
+    even though it pays less than S."""
+    pool, parent, sibling, half, s_fee = _setup()
+    new = _newcomer(parent, half, 0)  # 0 fee: far below S and every floor
+
+    with pool._lock:
+        ok, err = pool._add_transaction_inner(
+            new, HEIGHT, bypass_limits=True, store_orphan=False)
+    assert ok, err
+    assert sibling.get_txid() in pool.transactions
+    assert new.get_txid() in pool.transactions
+    assert pool.transactions[parent.get_txid()].children == {
+        sibling.get_txid(), new.get_txid()}
+
+
+def test_successful_eviction_keeps_an_ephemeral_dust_parent():
+    """Control for the swap itself: S's parent is N's parent too, so a
+    successful eviction must not evict it as S's ephemeral-dust parent (Core
+    removes only the staged conflicts).  N becomes the parent's child."""
+    pool, parent, sibling, half, s_fee = _setup()
+    p_entry = pool.transactions[parent.get_txid()]
+    p_entry.has_ephemeral_dust = True
+    p_entry.ephemeral_child = sibling.get_txid()
+    new = _paying_newcomer(parent, half, s_fee)
+
+    ok, err = pool.add_transaction(new, HEIGHT)
+    assert ok, err
+    assert sibling.get_txid() not in pool.transactions
+    assert parent.get_txid() in pool.transactions, "swap evicted the shared parent"
+    assert new.get_txid() in pool.transactions
+    assert pool.transactions[parent.get_txid()].children == {new.get_txid()}
