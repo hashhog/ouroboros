@@ -164,3 +164,35 @@ def test_honest_replacement_of_witness_heavy_tx_improves_diagram():
     assert ok, f"honest replacement of a 1 sat/vB witness-heavy tx rejected: {err}"
     assert replacement.txid in pool.transactions
     assert victim.txid not in pool.transactions
+
+
+def test_block_template_orders_and_caps_witness_heavy_tx_by_vsize():
+    """get_block_template_txs picks chunks in Core's order: chunk feerate is
+    fee over vsize (BlockAssembler walks TxGraph chunks by FeePerWeight), so a
+    10 sat/vB witness-less spend comes before a 1 sat/vB witness-heavy one.
+    On stripped size the heavy spend looked ~1600 sat/B and led the template.
+
+    The chunk weight is 4 * vsize, so a max_weight between the two (10000 WU)
+    keeps the honest tx and drops the ~390 KWU heavy one.  On stripped size
+    the heavy tx weighed 4 * 61 WU and fitted under the same cap."""
+    honest = _tx(0, _fee_for(10.0, 0, False), False)
+    heavy = _tx(1, _fee_for(1.0, 1, True), True)
+    honest_fee = _VALUE - honest.outputs[0].value
+    heavy_fee = _VALUE - heavy.outputs[0].value
+    assert honest.get_vsize() * 4 < 10_000 < heavy.get_vsize() * 4
+    assert len(heavy.serialize()) * 4 + honest.get_vsize() * 4 < 10_000
+
+    pool = _pool(2, max_size=10**9)
+    for tx in (honest, heavy):
+        ok, err = pool.add_transaction(tx, 200)
+        assert ok, err
+
+    txs, fee = pool.get_block_template_txs()
+    assert [t.txid for t in txs] == [honest.txid, heavy.txid], \
+        "1 sat/vB witness-heavy tx ordered ahead of a 10 sat/vB tx"
+    assert fee == honest_fee + heavy_fee
+
+    txs, fee = pool.get_block_template_txs(max_weight=10_000)
+    assert [t.txid for t in txs] == [honest.txid], \
+        "a ~390 KWU witness-heavy tx fitted under a 10000 WU template cap"
+    assert fee == honest_fee
