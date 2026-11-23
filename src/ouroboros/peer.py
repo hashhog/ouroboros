@@ -113,6 +113,23 @@ MAX_PROTOCOL_MESSAGE_LENGTH = 4_000_000
 # above any plausible honest interleave of decoys with real messages.
 MAX_CONSECUTIVE_V2_SKIP = 256
 
+# Message types that get their own key in ``Peer.bytes_recv_per_msg``
+# (Core src/protocol.h ``ALL_NET_MESSAGE_TYPES``).  Any other type a peer sends
+# is charged to ``NET_MESSAGE_TYPE_OTHER``, as in Core's
+# ``CNode::ReceiveMsgBytes`` ("To prevent a memory DOS, only allow known
+# message types"): keying by the peer-chosen command let one peer add a
+# permanent dict entry per 24-byte v1 frame.
+ALL_NET_MESSAGE_TYPES = frozenset({
+    "version", "verack", "addr", "addrv2", "sendaddrv2", "inv", "getdata",
+    "merkleblock", "getblocks", "getheaders", "tx", "headers", "block",
+    "getaddr", "mempool", "ping", "pong", "notfound", "filterload",
+    "filteradd", "filterclear", "sendheaders", "feefilter", "sendcmpct",
+    "cmpctblock", "getblocktxn", "blocktxn", "getcfilters", "cfilter",
+    "getcfheaders", "cfheaders", "getcfcheckpt", "cfcheckpt", "wtxidrelay",
+    "sendtxrcncl",
+})
+NET_MESSAGE_TYPE_OTHER = "*other*"
+
 # How often the message-receive hot path yields control back to the event loop
 # (``await asyncio.sleep(0)``).  This is the LOAD-BEARING fix for the at-tip
 # RSS burst (tracemalloc 2026-06-09 burst #2): every ``asyncio.wait_for`` /
@@ -657,7 +674,8 @@ class Peer:
         self.bytes_recv: int = 0
         # Core CNode::mapSendBytesPerMsgType / mapRecvBytesPerMsgType, surfaced
         # as getpeerinfo bytessent_per_msg / bytesrecv_per_msg (wire bytes,
-        # keyed by message command).
+        # keyed by message command; received unknown types under ``*other*``,
+        # see ``_count_recv_bytes``).
         self.bytes_sent_per_msg: dict[str, int] = {}
         self.bytes_recv_per_msg: dict[str, int] = {}
         self.last_send: float = 0.0
@@ -1908,6 +1926,14 @@ class Peer:
             return False
         return (time.monotonic() - self._last_recv_monotonic) > stall_timeout
 
+    def _count_recv_bytes(self, command: str, nbytes: int) -> None:
+        """Add ``nbytes`` to the per-type receive counter (Core
+        ``CNode::ReceiveMsgBytes``): known types keep their own key, every
+        other type goes to ``*other*`` so the dict stays bounded."""
+        key = (command if command in ALL_NET_MESSAGE_TYPES
+               else NET_MESSAGE_TYPE_OTHER)
+        self.bytes_recv_per_msg[key] = self.bytes_recv_per_msg.get(key, 0) + nbytes
+
     async def receive_message(self, timeout: float = 30.0) -> NetworkMessage:
         """Read and parse the next message from the peer (v1 or BIP 324 v2); raises on timeout or bad format."""
         if not self.reader:
@@ -2002,8 +2028,7 @@ class Peer:
         logger.debug(f"Received {command} from {self.host}:{self.port} ({len(payload)} bytes)")
 
         self.bytes_recv += 24 + len(payload)
-        self.bytes_recv_per_msg[command] = (
-            self.bytes_recv_per_msg.get(command, 0) + 24 + len(payload))
+        self._count_recv_bytes(command, 24 + len(payload))
         NET_TOTALS["recv"] += 24 + len(payload)
         self.last_recv = time.time()
 
@@ -2147,8 +2172,7 @@ class Peer:
                 continue
 
             command, payload = decoded
-            self.bytes_recv_per_msg[command] = (
-                self.bytes_recv_per_msg.get(command, 0) + wire_bytes_this_call)
+            self._count_recv_bytes(command, wire_bytes_this_call)
             # RSS-leak mitigation (2026-07-06, ouroboros OOM-loop root-cause):
             # the v2 receive path was retaining ~1 coroutine frame + its byte
             # buffers per inbound message (tracemalloc soaks 2026-06-21), climbing
