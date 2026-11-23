@@ -869,6 +869,7 @@ class AddressManager:
         self,
         max_addresses: int = MAX_ADDR_TO_SEND,
         max_pct: int = MAX_PCT_ADDR_TO_SEND,
+        filtered: bool = True,
     ) -> list[AddrInfo]:
         """Addresses to share in a ``getaddr`` response, 23%-capped (Core parity).
 
@@ -884,6 +885,10 @@ class AddressManager:
         This prevents a single peer from draining too large a fraction of our
         addrman per getaddr (eclipse-attack amplification).  The shuffle gives a
         fresh random subset each call, matching Core's ``vRandom`` walk.
+
+        With ``filtered`` (Core's default), ``IsTerrible`` entries are skipped
+        while walking (addrman.cpp:825); the target count is still computed from
+        the whole table first, as Core does.
         """
         all_addrs = list(self._addrs.values())
         random.shuffle(all_addrs)
@@ -893,7 +898,14 @@ class AddressManager:
             n = (min(max_pct, 100) * n) // 100
         if max_addresses != 0:
             n = min(n, max_addresses)
-        return all_addrs[:n]
+        out: list[AddrInfo] = []
+        for info in all_addrs:
+            if len(out) >= n:
+                break
+            if filtered and self._is_terrible(info):
+                continue
+            out.append(info)
+        return out
 
     def select_for_connection(
         self,
