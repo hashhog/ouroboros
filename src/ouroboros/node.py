@@ -34,6 +34,7 @@ from ouroboros.snapshot import SnapshotManager, read_snapshot_metadata
 from ouroboros.sync_manager import SyncManager
 from ouroboros.tip_notifier import TipNotifier
 from ouroboros.tx_reject import classify_mempool_reject, should_punish_tx_reject
+from ouroboros.recent_rejects import RecentRejects
 from ouroboros.validation import BlockValidator, TransactionValidator, assumevalid_disabled
 from ouroboros.wallet import Wallet, WalletManager
 from ouroboros.zmq_notifier import ZMQNotifier
@@ -115,6 +116,8 @@ class BitcoinNode:
         self.validator: BlockValidator | None = None
         self.tx_validator: TransactionValidator | None = None
         self.mempool: Mempool | None = None
+        # Core m_lazy_recent_rejects: relayed txs rejected at the current tip.
+        self.recent_rejects = RecentRejects()
 
         # Fee estimator
         self.fee_estimator: FeeEstimator | None = None
@@ -1979,7 +1982,26 @@ class BitcoinNode:
                             sender_peer, (tx.get_txid(), tx.get_wtxid())
                         )
 
-                    _, height = self.db.get_best_block()
+                    tip_hash, height = self.db.get_best_block()
+
+                    # Core ReceivedTx / AlreadyHaveTx: a tx this node already
+                    # rejected at the current tip is dropped by wtxid before
+                    # it reaches the mempool, so resending it does not buy
+                    # another full validation.  Never punished: the filter
+                    # also records policy failures.
+                    recent_rejects = getattr(self, "recent_rejects", None)
+                    if recent_rejects is None:
+                        recent_rejects = RecentRejects()
+                        self.recent_rejects = recent_rejects
+                    recent_rejects.tip_changed(tip_hash)
+                    tx_wtxid = tx.get_wtxid()
+                    if recent_rejects.contains(tx_wtxid):
+                        logger.debug(
+                            f"Ignoring recently rejected tx "
+                            f"{tx_wtxid.hex()[:16]}..."
+                        )
+                        return
+
                     # Off-load ATMP to a worker thread so the asyncio event
                     # loop stays responsive while script verification + UTXO
                     # lookups + ancestor/descendant graph walks run.  Without
@@ -2057,6 +2079,7 @@ class BitcoinNode:
                         # TX_CONSENSUS; the reference tree (post-v28
                         # ProcessInvalidTx) punishes no tx at all.
                         reject_class = classify_mempool_reject(error)
+                        recent_rejects.record(tx_wtxid, error, tx.has_witness)
                         logger.debug(
                             f"Rejected transaction ({reject_class.value}): "
                             f"{error}"

@@ -3103,21 +3103,124 @@ class Mempool:
                     mempool_coins[op] = package_coins[op]
 
         from ouroboros.validation import MissingAncestorHeaderError
-        try:
+
+        def _validate(skip_scripts: bool) -> tuple[bool, str]:
+            kwargs: dict = {"extra_script_flags": extra_flags}
             if mempool_coins:
-                valid, error = self.validator.validate_transaction(
-                    tx, next_height, mempool_mtp,
-                    extra_script_flags=extra_flags,
-                    intra_block_utxos=mempool_coins,
-                )
-            else:
-                valid, error = self.validator.validate_transaction(
-                    tx, next_height, mempool_mtp,
-                    extra_script_flags=extra_flags,
-                )
+                kwargs["intra_block_utxos"] = mempool_coins
+            if skip_scripts:
+                kwargs["skip_scripts"] = True
+            return self.validator.validate_transaction(
+                tx, next_height, mempool_mtp, **kwargs)
+
+        # PreChecks without the scripts: structure, finality, input
+        # resolution and values, coinbase maturity, BIP68 (Core
+        # CheckFinalTxAtTip / CheckSequenceLocks / CheckTxInputs).  The fee
+        # floors below need resolved inputs, and in Core they run before any
+        # script is verified (MemPoolAccept::PreChecks ends with CheckFeeRate;
+        # PolicyScriptChecks comes after), so a below-floor tx never costs a
+        # signature check.
+        try:
+            valid, error = _validate(skip_scripts=True)
         except MissingAncestorHeaderError:
             # BIP68 coin MTP not computable yet (pre-snapshot headers still
             # backfilling): refuse the tx, without a consensus verdict.
+            return False, "missing-ancestor-header"
+        except TypeError:
+            # A test double without skip_scripts: its single call below runs
+            # these checks together with the scripts.
+            valid, error = True, ""
+        if not valid:
+            return False, error
+
+        # tx_sigop_cost was computed above (in the require_standard block); it is
+        # 0 when standardness checks are disabled.  Derive the sigop-adjusted
+        # vsize for fee-rate and relay-fee checks, matching Core:
+        #   ws.m_vsize = ws.m_tx_handle->GetTxSize()
+        #              = GetVirtualTransactionSize(weight, sigOpCost, nBytesPerSigOp)
+        # Reference: bitcoin-core/src/validation.cpp:932,
+        #            bitcoin-core/src/kernel/mempool_entry.h:110-113
+        tx_vsize = get_virtual_transaction_size(tx.get_weight(), tx_sigop_cost, DEFAULT_BYTES_PER_SIGOP)
+
+        # Calculate fee
+        total_input = 0
+        for tx_in in tx.inputs:
+            utxo = self.validator.db.get_utxo(tx_in.prev_txid, tx_in.prev_vout)
+            if not utxo:
+                utxo = mempool_coins.get((tx_in.prev_txid, tx_in.prev_vout))
+            if utxo:
+                total_input += utxo['value']
+            else:
+                return False, f"UTXO not found: {tx_in.prev_txid.hex()[:16]}...:{tx_in.prev_vout}"
+
+        total_output = sum(out.value for out in tx.outputs)
+        fee = total_input - total_output
+
+        if fee < 0:
+            return False, "Negative fee"
+
+        # fee and vsize are known from here on (Core Workspace m_base_fees /
+        # m_vsize); the package orchestrator needs them even when a fee
+        # floor below rejects the transaction individually.
+        if workspace is not None:
+            workspace["fee"] = fee
+            workspace["vsize"] = tx_vsize
+            workspace["sigop_cost"] = tx_sigop_cost
+
+        # PreCheckEphemeralTx — a non-zero-fee transaction may not have dust
+        # outputs (the dust output must be CPFP'd by a child in a package).
+        # Mirrors Bitcoin Core PreCheckEphemeralTx (policy/ephemeral_policy.cpp:23-31)
+        # which is called from PreChecks at validation.cpp:935-938.  Core gates
+        # this on require_standard; we match that.  Note that this is in addition
+        # to the IsStandardTx gate that already enforces MAX_DUST_OUTPUTS_PER_TX
+        # (≤ 1 dust output).  v3 txs with dust have already been rejected above.
+        if self.require_standard and fee != 0:
+            dust_indices = _has_ephemeral_dust(tx)
+            if dust_indices:
+                return False, (
+                    f"dust: tx with dust output at index(es) {dust_indices} "
+                    f"must be 0-fee (got {fee} sat)"
+                )
+
+        # fee_rate uses the sigop-adjusted vsize, matching Core's CFeeRate which
+        # calls GetTxSize() = GetVirtualTransactionSize(weight, sigopCost, nBytesPerSigOp).
+        # Reference: bitcoin-core/src/validation.cpp:993
+        #   CFeeRate newFeeRate(ws.m_modified_fees, ws.m_vsize);
+        fee_rate = fee / tx_vsize if tx_vsize > 0 else 0
+
+        # Minimum relay fee check uses vsize (same source as fee_rate).
+        # DEFAULT_MIN_RELAY_TX_FEE is in sat/kB; convert to sat for this tx.
+        min_relay = (tx_vsize * DEFAULT_MIN_RELAY_TX_FEE) // 1000
+        if workspace is not None:
+            workspace["min_relay_fee"] = min_relay
+        if fee < min_relay and not bypass_limits and not package_feerate:
+            # Bare Core token (validation.cpp:708 "min relay fee not met").
+            return False, "min relay fee not met"
+
+        # Rolling minimum fee check (txmempool.cpp GetMinFee gate).
+        # After TrimToSize evicts transactions the rolling min fee rises so
+        # that evicted txs cannot immediately re-enter.  Core checks:
+        #   if (pool.GetMinFee().GetFeePerK() > minRelayTxFee.GetFeePerK())
+        #       if (ws.m_modified_fees < pool.GetMinFee().GetFee(ws.m_vsize))
+        #           return state.Invalid(...)
+        # Reference: validation.cpp AcceptToMemoryPoolWorker (fee-filter gate).
+        rolling_min_kvb = self._get_min_fee_inner()  # sat/kvB
+        if (rolling_min_kvb > DEFAULT_MIN_RELAY_TX_FEE and not bypass_limits
+                and not package_feerate):
+            rolling_min_fee = (tx_vsize * rolling_min_kvb) // 1000
+            if workspace is not None:
+                workspace["mempool_min_fee"] = rolling_min_fee
+            if fee < rolling_min_fee:
+                # Bare Core token (validation.cpp:705 "mempool min fee not met")
+                # for the dynamic rolling-floor case, distinct from the static
+                # "min relay fee not met" above.
+                return False, "mempool min fee not met"
+
+        # PolicyScriptChecks: the scripts, with STANDARD flags, only once
+        # every cheaper gate above has passed.
+        try:
+            valid, error = _validate(skip_scripts=False)
+        except MissingAncestorHeaderError:
             return False, "missing-ancestor-header"
         except TypeError:
             # Older test doubles do not implement the extra_script_flags
@@ -3221,15 +3324,6 @@ class Mempool:
         # (mempool max_size, ancestor_size, descendant_size stored on entries).
         # These track actual RAM / disk byte consumption, not fee-rate vsize.
         tx_size = len(tx.serialize())
-        # tx_sigop_cost was computed above (in the require_standard block); it is
-        # 0 when standardness checks are disabled.  Derive the sigop-adjusted
-        # vsize for fee-rate and relay-fee checks, matching Core:
-        #   ws.m_vsize = ws.m_tx_handle->GetTxSize()
-        #              = GetVirtualTransactionSize(weight, sigOpCost, nBytesPerSigOp)
-        # Reference: bitcoin-core/src/validation.cpp:932,
-        #            bitcoin-core/src/kernel/mempool_entry.h:110-113
-        tx_vsize = get_virtual_transaction_size(tx.get_weight(), tx_sigop_cost, DEFAULT_BYTES_PER_SIGOP)
-
         # Ancestor byte total — bookkeeping for the entry's ancestor_size field.
         # No longer a gate (see the note on `ancestors` above).
         ancestor_size = sum(self.transactions[a].size for a in ancestors if a in self.transactions)
@@ -3249,80 +3343,6 @@ class Mempool:
         # LimitMempoolSize (see after the insert).  Evicting before the fee
         # check let a tx that was then rejected for the raised rolling fee push
         # out one that already fit.
-
-        # Calculate fee
-        total_input = 0
-        for tx_in in tx.inputs:
-            utxo = self.validator.db.get_utxo(tx_in.prev_txid, tx_in.prev_vout)
-            if not utxo:
-                utxo = mempool_coins.get((tx_in.prev_txid, tx_in.prev_vout))
-            if utxo:
-                total_input += utxo['value']
-            else:
-                return False, f"UTXO not found: {tx_in.prev_txid.hex()[:16]}...:{tx_in.prev_vout}"
-
-        total_output = sum(out.value for out in tx.outputs)
-        fee = total_input - total_output
-
-        if fee < 0:
-            return False, "Negative fee"
-
-        # fee and vsize are known from here on (Core Workspace m_base_fees /
-        # m_vsize); the package orchestrator needs them even when a fee
-        # floor below rejects the transaction individually.
-        if workspace is not None:
-            workspace["fee"] = fee
-            workspace["vsize"] = tx_vsize
-            workspace["sigop_cost"] = tx_sigop_cost
-
-        # PreCheckEphemeralTx — a non-zero-fee transaction may not have dust
-        # outputs (the dust output must be CPFP'd by a child in a package).
-        # Mirrors Bitcoin Core PreCheckEphemeralTx (policy/ephemeral_policy.cpp:23-31)
-        # which is called from PreChecks at validation.cpp:935-938.  Core gates
-        # this on require_standard; we match that.  Note that this is in addition
-        # to the IsStandardTx gate that already enforces MAX_DUST_OUTPUTS_PER_TX
-        # (≤ 1 dust output).  v3 txs with dust have already been rejected above.
-        if self.require_standard and fee != 0:
-            dust_indices = _has_ephemeral_dust(tx)
-            if dust_indices:
-                return False, (
-                    f"dust: tx with dust output at index(es) {dust_indices} "
-                    f"must be 0-fee (got {fee} sat)"
-                )
-
-        # fee_rate uses the sigop-adjusted vsize, matching Core's CFeeRate which
-        # calls GetTxSize() = GetVirtualTransactionSize(weight, sigopCost, nBytesPerSigOp).
-        # Reference: bitcoin-core/src/validation.cpp:993
-        #   CFeeRate newFeeRate(ws.m_modified_fees, ws.m_vsize);
-        fee_rate = fee / tx_vsize if tx_vsize > 0 else 0
-
-        # Minimum relay fee check uses vsize (same source as fee_rate).
-        # DEFAULT_MIN_RELAY_TX_FEE is in sat/kB; convert to sat for this tx.
-        min_relay = (tx_vsize * DEFAULT_MIN_RELAY_TX_FEE) // 1000
-        if workspace is not None:
-            workspace["min_relay_fee"] = min_relay
-        if fee < min_relay and not bypass_limits and not package_feerate:
-            # Bare Core token (validation.cpp:708 "min relay fee not met").
-            return False, "min relay fee not met"
-
-        # Rolling minimum fee check (txmempool.cpp GetMinFee gate).
-        # After TrimToSize evicts transactions the rolling min fee rises so
-        # that evicted txs cannot immediately re-enter.  Core checks:
-        #   if (pool.GetMinFee().GetFeePerK() > minRelayTxFee.GetFeePerK())
-        #       if (ws.m_modified_fees < pool.GetMinFee().GetFee(ws.m_vsize))
-        #           return state.Invalid(...)
-        # Reference: validation.cpp AcceptToMemoryPoolWorker (fee-filter gate).
-        rolling_min_kvb = self._get_min_fee_inner()  # sat/kvB
-        if (rolling_min_kvb > DEFAULT_MIN_RELAY_TX_FEE and not bypass_limits
-                and not package_feerate):
-            rolling_min_fee = (tx_vsize * rolling_min_kvb) // 1000
-            if workspace is not None:
-                workspace["mempool_min_fee"] = rolling_min_fee
-            if fee < rolling_min_fee:
-                # Bare Core token (validation.cpp:705 "mempool min fee not met")
-                # for the dynamic rolling-floor case, distinct from the static
-                # "min relay fee not met" above.
-                return False, "mempool min fee not met"
 
         # Dry-run (testmempoolaccept): every relay/standardness/consensus gate
         # above has passed (including min-relay fee, ephemeral dust, version,
