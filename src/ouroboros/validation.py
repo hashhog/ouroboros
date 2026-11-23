@@ -17,6 +17,7 @@ from ouroboros.script import (
     SCRIPT_VERIFY_NULLDUMMY,
     SCRIPT_VERIFY_P2SH,
     SCRIPT_VERIFY_WITNESS,
+    PrecomputedTransactionData,
     ScriptInterpreter,
     get_flags_for_height,
 )
@@ -2925,7 +2926,11 @@ class TransactionValidator:
                 input_amounts.append(utxo['value'])
                 input_script_pubkeys.append(bytes(utxo['script_pubkey']))
 
-        # Now verify each input with the COMPLETE amounts/spk lists
+        # Now verify each input with the COMPLETE amounts/spk lists.  One
+        # PrecomputedTransactionData per tx (Core CheckInputScripts builds
+        # txdata once and hands it to every input's check).
+        txdata = PrecomputedTransactionData(
+            tx, input_amounts, input_script_pubkeys)
         for i, tx_in in enumerate(tx.inputs):
             utxo = input_utxos[i]
 
@@ -2975,7 +2980,8 @@ class TransactionValidator:
                         input_amounts, input_script_pubkeys,
                     ))
                 elif not self._verify_input_signature(
-                    tx, tx_in, utxo, i, flags, input_amounts, input_script_pubkeys
+                    tx, tx_in, utxo, i, flags, input_amounts,
+                    input_script_pubkeys, txdata,
                 ):
                     return False, f"Invalid signature for input {i}"
 
@@ -3187,11 +3193,18 @@ class TransactionValidator:
         # never a reject (which would mark the block failed and punish the
         # sender), never a pass.  Any OTHER exception is an interpreter-level
         # failure on this input and stays a reject, never a pass.
+        # One PrecomputedTransactionData per tx for the length of this drain
+        # (the queue holds every tx, so id() is stable while it runs).
+        txdatas: dict[int, PrecomputedTransactionData] = {}
         for pos, tx, tx_in, utxo, i, flags, amts, spks in queue:
+            txdata = txdatas.get(id(tx))
+            if txdata is None:
+                txdata = txdatas[id(tx)] = PrecomputedTransactionData(
+                    tx, amts, spks)
             try:
                 ok = retry_once(
                     self._verify_input_signature,
-                    tx, tx_in, utxo, i, flags, amts, spks,
+                    tx, tx_in, utxo, i, flags, amts, spks, txdata,
                     where=f"script check (tx {pos} input {i})",
                 )
             except InternalValidationError:
@@ -3212,6 +3225,7 @@ class TransactionValidator:
         flags: int = SCRIPT_VERIFY_NONE,
         input_amounts: list[int] = None,
         input_script_pubkeys: list[bytes] = None,
+        txdata: PrecomputedTransactionData | None = None,
     ) -> bool:
         # Build SigCache key from a true sighash-class commitment so that
         # forged-witness spends (e.g. Taproot key-path with empty script_sig)
@@ -3295,6 +3309,7 @@ class TransactionValidator:
             amount=utxo['value'],
             input_amounts=input_amounts,
             input_script_pubkeys=input_script_pubkeys,
+            txdata=txdata,
         )
 
         # Cache successful verifications only

@@ -11,6 +11,7 @@ Reference: bitcoin/src/banman.cpp, bitcoin/src/net_processing.cpp (Misbehaving()
 import json
 import logging
 import time
+from collections import OrderedDict
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -51,6 +52,14 @@ SCORE_UNSOLICITED_BLOCK = SCORE_UNREQUESTED_DATA
 # Mirrors the spirit of Core's DEFAULT_MISBEHAVING_BANTIME (24 h).
 SCORE_RECORD_TTL = 86400.0  # seconds (24 h)
 SCORE_EVENTS_MAX = 20
+
+# Capacity of the in-memory discouragement set.  Core keeps discouraged
+# addresses in ``CRollingBloomFilter m_discouraged{50000, 0.000001}``
+# (banman.h): bounded, never written to banlist.json, oldest entries roll
+# out as new ones arrive.  Automatic misbehaviour punishment goes there
+# (net_processing.cpp MaybeDiscourageAndDisconnect -> ``Discourage``); only
+# an operator's ``setban`` reaches the persisted ban list.
+DISCOURAGED_MAX = 50_000
 
 
 def ban_key(addr: str) -> str:
@@ -128,6 +137,12 @@ class BanManager:
 
         self.scores: dict[str, MisbehaviorRecord] = {}
         self.banned: dict[str, float] = {}  # ip -> ban_until (epoch)
+        # Automatic misbehaviour discouragement: bounded, insertion-ordered,
+        # in memory only (see DISCOURAGED_MAX).  Before this, every automatic
+        # punishment was a 24 h entry in ``banned`` and rewrote all of
+        # bans.json synchronously, so N fresh source addresses cost O(N^2)
+        # bytes of disk writes on the event loop and grew without bound.
+        self.discouraged: OrderedDict[str, None] = OrderedDict()
 
         if data_dir:
             self._load_bans()
@@ -190,7 +205,8 @@ class BanManager:
                     ip, reason, score, rec.score, trigger,
                 )
                 return True
-            self.ban(ip, reason=f"{reason} (score +{score} -> {rec.score}, {trigger})")
+            self.discourage(
+                ip, reason=f"{reason} (score +{score} -> {rec.score}, {trigger})")
             return True
         return False
 
@@ -236,6 +252,38 @@ class BanManager:
             self._save_bans()
         if self._on_ban:
             self._on_ban(ip)
+
+    def discourage(self, ip: str, reason: str | None = None) -> None:
+        """Discourage *ip* after misbehaviour (Core ``BanMan::Discourage``).
+
+        Unlike ``ban`` this is not persisted and the set is capped at
+        ``DISCOURAGED_MAX`` entries (oldest evicted first), as Core's rolling
+        bloom filter is.  The ``on_ban`` callback still fires so connected
+        peers on the address are dropped.
+        """
+        ip = ban_key(ip)
+        self.discouraged[ip] = None
+        self.discouraged.move_to_end(ip)
+        while len(self.discouraged) > DISCOURAGED_MAX:
+            self.discouraged.popitem(last=False)
+        self.scores.pop(ip, None)
+        logger.warning("Discouraged %s: %s", ip,
+                       reason or "<no reason supplied by caller>")
+        if self._on_ban:
+            self._on_ban(ip)
+
+    def is_discouraged(self, ip: str) -> bool:
+        """Return True if *ip* (an address or ``host:port``) is discouraged."""
+        return ban_key(ip) in self.discouraged
+
+    def undiscourage(self, ip: str) -> None:
+        """Drop *ip* from the discouragement set (e.g. a ``-connect`` peer)."""
+        self.discouraged.pop(ban_key(ip), None)
+
+    def is_banned_or_discouraged(self, ip: str) -> bool:
+        """Connection/address gate: Core refuses both ``IsBanned`` and
+        ``IsDiscouraged`` addresses when dialling and when processing addr."""
+        return self.is_discouraged(ip) or self.is_banned(ip)
 
     def setban(
         self,

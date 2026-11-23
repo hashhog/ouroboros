@@ -87,6 +87,15 @@ def _record_cross_check(
 # the full 20s timeout window.
 MAX_BLOCKS_IN_FLIGHT_PER_PEER = 16
 
+# Global budget for blocks fetched straight from an inv (the handle_inv
+# shortcut).  Core never getdata's a block from an inv at all -- it sends
+# getheaders and lets FindNextBlocksToDownload fetch -- so these requests are
+# for hashes with no validated header.  Bounding them separately keeps a set
+# of flooding peers (each within its per-peer cap) from filling the 256-slot
+# download window: at most this many of those slots ever hold headerless
+# inv announces.
+INV_FETCH_MAX_IN_FLIGHT = 4 * MAX_BLOCKS_IN_FLIGHT_PER_PEER
+
 # Bitcoin Core protocol.h:482: MAX_GETDATA_SZ = 1000.
 # Peers reject GETDATA messages containing more than 1000 inventory items.
 MAX_GETDATA_SZ = 1000
@@ -776,6 +785,11 @@ class BlockSync:
         self._validated_headers: list[tuple[bytes, BlockHeader]] = []
         # Max blocks to have in-flight at once during headers-first sync.
         self._max_blocks_in_flight: int = 256
+        # Hashes requested by the handle_inv direct-fetch shortcut (no
+        # validated header when requested).  Bounded by
+        # INV_FETCH_MAX_IN_FLIGHT; pruned to live requests in handle_inv and
+        # abandoned (never re-routed) on their first timeout.
+        self._inv_fetched_blocks: set[bytes] = set()
 
         # assumeUTXO header-metadata backfill (#52). A snapshot-bootstrapped
         # node has no block index below the snapshot base, so
@@ -1752,6 +1766,7 @@ class BlockSync:
         self._w77_first_request_time.pop(block_hash, None)
         self._block_request_attempts.pop(block_hash, None)
         self._connecting_hashes.discard(block_hash)
+        self._inv_fetched_blocks.discard(block_hash)
 
     def _reclaim_inflight_slot(self, block_hash: bytes) -> Peer | None:
         """Free *block_hash*'s in-flight slot.  Returns the previous holder.
@@ -2405,6 +2420,12 @@ class BlockSync:
             # :2589): block fetches require NODE_WITNESS, and tx fetches only
             # carry MSG_WITNESS_FLAG for a witness-capable peer.
             _peer_can_witness = _can_serve_witness_blocks(peer)
+            # Blocks this peer already has in flight (lazily counted on the
+            # first unknown block inv).  Core never getdata's a block from an
+            # inv at all (it sends getheaders; FindNextBlocksToDownload then
+            # fetches at most MAX_BLOCKS_IN_FLIGHT_PER_PEER per peer), so the
+            # direct-fetch shortcut below must honour the same per-peer cap.
+            _peer_in_flight: int | None = None
             for inv_type, inv_hash in inv.inventory:
                 if inv_type == INV_TYPE_BLOCK:
                     if not self.db.has_block_hash(inv_hash):
@@ -2441,12 +2462,37 @@ class BlockSync:
                         # Core CanServeWitnesses: never request a block body
                         # from a peer without NODE_WITNESS (the announce still
                         # counts -- getheaders below -- just not the fetch).
+                        #
+                        # Per-peer cap (Core MAX_BLOCKS_IN_FLIGHT_PER_PEER):
+                        # the global cap alone let ONE peer announcing 256+
+                        # random hashes take every slot.  Those bodies never
+                        # come (a notfound frees nothing), so the slots stay
+                        # held until the download timeout and IBD's
+                        # ``cap_inflight`` falls to zero.
+                        #
+                        # Global inv budget (INV_FETCH_MAX_IN_FLIGHT): many
+                        # flooding peers, each under its own cap, must still
+                        # leave the download window to the header chain.
+                        if _peer_in_flight is None:
+                            _peer_in_flight = sum(
+                                1 for bh, rp in self._block_request_peer.items()
+                                if rp is peer and bh in self.requested_blocks
+                            )
+                            # Forget inv fetches that were answered, abandoned
+                            # or dropped on disconnect.
+                            self._inv_fetched_blocks.intersection_update(
+                                self.requested_blocks.keys()
+                            )
                         if (
                             _peer_can_witness
                             and inv_hash not in self.requested_blocks
                             and inv_hash not in self._perm_rejected_blocks
                             and len(self.requested_blocks) < self._max_blocks_in_flight
+                            and _peer_in_flight < MAX_BLOCKS_IN_FLIGHT_PER_PEER
+                            and len(self._inv_fetched_blocks) < INV_FETCH_MAX_IN_FLIGHT
                         ):
+                            _peer_in_flight += 1
+                            self._inv_fetched_blocks.add(inv_hash)
                             blocks_to_request.append((MSG_WITNESS_BLOCK, inv_hash))
                             self.requested_blocks[inv_hash] = now
                             self._record_first_request_time(inv_hash, now)
@@ -2547,6 +2593,7 @@ class BlockSync:
                         self.requested_blocks.pop(bh, None)
                         self._block_request_peer.pop(bh, None)
                         self._h1_last_issue.pop(bh, None)
+                        self._inv_fetched_blocks.discard(bh)
 
             if txs_to_request:
                 await self._send_tx_getdata(peer, txs_to_request, network)
@@ -8814,6 +8861,41 @@ class BlockSync:
 
         if not timed_out:
             return
+
+        # Inv-shortcut fetches (handle_inv) of a hash that still has no
+        # validated header are dropped at their FIRST timeout, not re-routed
+        # to another peer.  Core never requested them at all (an unknown
+        # block inv only triggers getheaders); re-routing let one peer's
+        # random announces migrate onto honest peers and fill their per-peer
+        # caps cycle after cycle.  If the header does arrive, the block is a
+        # queued header and the normal download path fetches it.
+        if self._inv_fetched_blocks and any(
+            h in self._inv_fetched_blocks for h in timed_out
+        ):
+            queued_hdrs = {bh for bh, _ in self._validated_headers}
+            inv_drop = [
+                h for h in timed_out
+                if h in self._inv_fetched_blocks and h not in queued_hdrs
+            ]
+            # Header arrived meanwhile: an ordinary queued block from now on.
+            for h in timed_out:
+                if h in queued_hdrs:
+                    self._inv_fetched_blocks.discard(h)
+            if inv_drop:
+                drop_set = set(inv_drop)
+                timed_out = [h for h in timed_out if h not in drop_set]
+                head_timed_out = [h for h in head_timed_out if h not in drop_set]
+                general_timed_out = [
+                    h for h in general_timed_out if h not in drop_set
+                ]
+                for h in inv_drop:
+                    self._abandon_block_request(h)
+                logger.info(
+                    "Dropped %d timed-out inv-announced block request(s) "
+                    "with no header (not re-requested)", len(inv_drop),
+                )
+            if not timed_out:
+                return
 
         # Bound the retry queue: count a re-request attempt for every timed-out
         # block and ABANDON a general-timeout block that has exceeded

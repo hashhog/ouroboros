@@ -869,6 +869,11 @@ class PeerManager:
         self._trickle_queues: dict[str, TrickleQueue] = {}
         self._trickle_task: asyncio.Task | None = None
         self._trickle_interval: float = 1.0  # check interval in seconds
+        # addr -> the in-flight trickle INV send for that peer.  Each send
+        # runs as its own task so one slow-reading peer cannot park relay
+        # for the rest (Core: SocketSendData is non-blocking, so a peer that
+        # reads slowly never holds SendMessages for the other peers).
+        self._trickle_send_tasks: dict[str, asyncio.Task] = {}
 
         # Eclipse attack mitigation state
         # Anchor connections: persistent block-relay-only peers across restarts
@@ -1108,6 +1113,12 @@ class PeerManager:
                 await self._trickle_task
             except asyncio.CancelledError:
                 pass
+        send_tasks = list(self._trickle_send_tasks.values())
+        self._trickle_send_tasks.clear()
+        for send_task in send_tasks:
+            send_task.cancel()
+        if send_tasks:
+            await asyncio.gather(*send_tasks, return_exceptions=True)
 
         # Cancel self-address announcement task
         if self._local_addr_task:
@@ -1288,6 +1299,15 @@ class PeerManager:
 
         if not candidates:
             return None
+
+        # Core SelectNodeToEvict: after every protection, if any remaining
+        # candidate is prefer_evict (accepted while discouraged), consider
+        # only those.
+        if any(getattr(p, "prefer_evict", False) for _a, p in candidates):
+            candidates = [
+                (a, p) for a, p in candidates
+                if getattr(p, "prefer_evict", False)
+            ]
 
         # Step 7 — From remaining, evict the one connected longest
         candidates.sort(key=lambda ap: ap[1].connected_at)
@@ -1534,9 +1554,22 @@ class PeerManager:
         host, port = peername[0], peername[1]
         addr = f"{host}:{port}"
 
-        # Check ban list
+        # Core net.cpp AcceptConnection: a banned address is always dropped.
         if self.ban_manager.is_banned(host) or self.ban_manager.is_banned(addr):
             logger.debug(f"Rejected banned inbound peer {addr}")
+            writer.close()
+            return
+
+        # A discouraged address is dropped only when inbound is (almost)
+        # full (``nInbound + 1 >= m_max_inbound``); otherwise it is accepted
+        # and marked prefer_evict, so eviction takes it first.
+        discouraged = (self.ban_manager.is_discouraged(host)
+                       or self.ban_manager.is_discouraged(addr))
+        if discouraged and (
+            len(self.inbound_peers) + self._pending_inbound + 1
+            >= self.max_inbound
+        ):
+            logger.debug(f"Rejected discouraged inbound peer {addr}: inbound almost full")
             writer.close()
             return
 
@@ -1583,6 +1616,7 @@ class PeerManager:
                     node_compact_filters=self.node_compact_filters,
                     node_network_limited=self.node_network_limited,
                     on_disconnect=self._handle_peer_disconnected)
+        peer.prefer_evict = discouraged
         # Reserve the slot before the first read; give it back however the
         # handshake ends (success moves it into inbound_peers below).
         self._pending_inbound += 1
@@ -1702,7 +1736,7 @@ class PeerManager:
                 break
             if addr in self._all_outbound_addrs():
                 continue
-            if self.ban_manager.is_banned(addr):
+            if self.ban_manager.is_banned_or_discouraged(addr):
                 continue
 
             try:
@@ -2115,7 +2149,7 @@ class PeerManager:
             for addr_info in addrs:
                 ip = addr_info[4][0]
                 addr = f"{ip}:{port}"
-                if not self.ban_manager.is_banned(addr):
+                if not self.ban_manager.is_banned_or_discouraged(addr):
                     self._add_known_addr(addr)
                     self.addrman.add(ip, port, source=seed)
                     count += 1
@@ -2155,7 +2189,7 @@ class PeerManager:
             except ValueError:
                 continue
             addr = f"{ip}:{port}"
-            if self.ban_manager.is_banned(addr) or self.ban_manager.is_banned(ip):
+            if self.ban_manager.is_banned_or_discouraged(addr) or self.ban_manager.is_banned_or_discouraged(ip):
                 continue
             self._add_known_addr(addr)
             # addrman.add drops non-routable + dedups; only routable entries
@@ -2427,7 +2461,7 @@ class PeerManager:
                 available = (
                     self.known_addrs
                     - self._all_outbound_addrs()
-                    - {a for a in self.known_addrs if self.ban_manager.is_banned(a)}
+                    - {a for a in self.known_addrs if self.ban_manager.is_banned_or_discouraged(a)}
                 )
                 # Filter by network group
                 available = {
@@ -2521,7 +2555,7 @@ class PeerManager:
         if addr in self.peers or addr in self.block_relay_peers:
             logger.info(f"Already connected to {addr}")
             return True
-        if self.ban_manager.is_banned(addr) or self.ban_manager.is_banned(host):
+        if self.ban_manager.is_banned_or_discouraged(addr) or self.ban_manager.is_banned_or_discouraged(host):
             logger.warning(f"Cannot connect to banned peer {addr}")
             return False
 
@@ -2595,7 +2629,7 @@ class PeerManager:
                 available = (
                     self.known_addrs
                     - self._all_outbound_addrs()
-                    - {a for a in self.known_addrs if self.ban_manager.is_banned(a)}
+                    - {a for a in self.known_addrs if self.ban_manager.is_banned_or_discouraged(a)}
                 )
                 available = {
                     a for a in available
@@ -2856,6 +2890,9 @@ class PeerManager:
             the announcing addr stored in the tuple).
         """
         self._trickle_queues.pop(addr, None)
+        send_task = self._trickle_send_tasks.pop(addr, None)
+        if send_task is not None:
+            send_task.cancel()
         self._erlay_peers.pop(addr, None)
         self._erlay_local_salts.pop(addr, None)
         self._erlay_pending_recon.pop(addr, None)
@@ -3098,6 +3135,7 @@ class PeerManager:
                                 self.ban_manager.unban(addr)
                             if self.ban_manager.is_banned(host):
                                 self.ban_manager.unban(host)
+                            self.ban_manager.undiscourage(host)
                             try:
                                 logger.info(f"Reconnecting to --connect peer {addr}")
                                 await self.connect_to_node(host, port)
@@ -3938,7 +3976,7 @@ class PeerManager:
                     if ts_f <= 100_000_000 or ts_f > _now + 600:
                         ts_f = _now - 5 * 24 * 3600
                     host_str = self._netaddr_to_host(net_addr)
-                    if host_str and not self.ban_manager.is_banned(host_str):
+                    if host_str and not self.ban_manager.is_banned_or_discouraged(host_str):
                         if self.addrman.add(
                             host_str, net_addr.port,
                             services=net_addr.services,
@@ -3995,7 +4033,7 @@ class PeerManager:
                     if ts_f <= 100_000_000 or ts_f > _now + 600:
                         ts_f = _now - 5 * 24 * 3600
                     host_str = self._addr_bytes_to_host(net_id, addr_bytes)
-                    if host_str and not self.ban_manager.is_banned(host_str):
+                    if host_str and not self.ban_manager.is_banned_or_discouraged(host_str):
                         if self.addrman.add(
                             host_str, port,
                             services=services,
@@ -4997,11 +5035,12 @@ class PeerManager:
              ("since that would discourage all peers on the same local
              address").
           4. Otherwise Discourage(addr) + DisconnectNode(addr) -- here
-             ``BanManager.ban`` and its ``_on_peer_banned`` callback.
+             ``BanManager.discourage`` and its ``_on_peer_banned`` callback.
 
-        Bans are keyed by address, so cases 1-3 must never reach ``ban()``:
-        a stored ban for the address would make the inbound gate (which
-        checks ``is_banned(host)`` before any noban flag is known) refuse the
+        Discouragement is keyed by address, so cases 1-3 must never reach
+        ``discourage()``: a recorded address would make the inbound gate
+        (which checks ``is_banned_or_discouraged(host)`` before any noban
+        flag is known) refuse the
         next connection from it.  For a bare address naming several
         connections, the exemption holds only if every one is exempt.
         """
@@ -5095,7 +5134,7 @@ class PeerManager:
         Args:
             addr: Peer address (host:port)
         """
-        if not self.ban_manager.is_banned(addr):
+        if not self.ban_manager.is_banned_or_discouraged(addr):
             self._add_known_addr(addr)
             logger.debug(f"Added peer address: {addr}")
 
@@ -5136,19 +5175,30 @@ class PeerManager:
                         queue.clear()
                         continue
 
+                    # The previous trickle send to this peer is still
+                    # draining: leave its queue due and serve it on a later
+                    # pass.  Core instead keeps appending to the peer's
+                    # vSendMsg; skipping here bounds what a stalled peer can
+                    # make us hold to one INV message.
+                    in_flight = self._trickle_send_tasks.get(addr)
+                    if in_flight is not None and not in_flight.done():
+                        continue
+
                     try:
                         # Get INVs to send, filtering by peer's feefilter (BIP133)
                         inv_items = queue.get_invs_to_send(
                             feefilter=peer.peer_feefilter
                         )
                         if inv_items:
-                            # Send INV message
+                            # Send without awaiting: send_message's bounded
+                            # drain may wait as long as a slow peer keeps
+                            # reading, and awaiting it here would hold every
+                            # peer later in this pass behind that one.
                             inv_msg = InvMessage(inv_items)
-                            await peer.send_message(
-                                inv_msg.to_network_message(self.network)
-                            )
-                            logger.debug(
-                                f"Trickled {len(inv_items)} tx INVs to {addr}"
+                            self._spawn_trickle_send(
+                                addr, peer,
+                                inv_msg.to_network_message(self.network),
+                                len(inv_items),
                             )
 
                         # Schedule next send with Poisson delay
@@ -5163,6 +5213,29 @@ class PeerManager:
             logger.debug("Trickle loop cancelled")
         except Exception as e:
             logger.error(f"Error in trickle loop: {e}")
+
+    def _spawn_trickle_send(
+        self, addr: str, peer: Peer, msg: NetworkMessage, count: int
+    ) -> None:
+        """Run one peer's trickled INV send as its own task."""
+
+        async def _send() -> None:
+            try:
+                await peer.send_message(msg)
+                logger.debug(f"Trickled {count} tx INVs to {addr}")
+            except asyncio.CancelledError:
+                raise
+            except Exception as e:
+                logger.warning(f"Failed to send trickled INVs to {addr}: {e}")
+
+        task = asyncio.ensure_future(_send())
+        self._trickle_send_tasks[addr] = task
+
+        def _done(t: asyncio.Task) -> None:
+            if self._trickle_send_tasks.get(addr) is t:
+                del self._trickle_send_tasks[addr]
+
+        task.add_done_callback(_done)
 
     def queue_tx_for_relay(
         self,

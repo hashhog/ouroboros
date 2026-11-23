@@ -1101,23 +1101,23 @@ class TestBanManager:
         # event >= 50 discourages immediately (banman.py, Core PR #25974
         # MaybeDiscourageAndDisconnect model).
         bm.record_misbehavior("1.2.3.4", 40, "bad headers")
-        assert not bm.is_banned("1.2.3.4")
+        assert not bm.is_banned_or_discouraged("1.2.3.4")
         assert bm.get_score("1.2.3.4") == 40
         bm.record_misbehavior("1.2.3.4", 40, "bad headers")
-        assert not bm.is_banned("1.2.3.4")
+        assert not bm.is_banned_or_discouraged("1.2.3.4")
         assert bm.get_score("1.2.3.4") == 80
         bm.record_misbehavior("1.2.3.4", 30, "invalid block")  # cumulative 110 >= 100
-        assert bm.is_banned("1.2.3.4")
+        assert bm.is_discouraged("1.2.3.4")
         assert bm.get_score("1.2.3.4") == 0  # score cleared on ban
         # Single-event discourage path.
         bm.record_misbehavior("2.3.4.5", 50, "bad headers")
-        assert bm.is_banned("2.3.4.5")
+        assert bm.is_discouraged("2.3.4.5")
 
     def test_instant_ban(self):
         from ouroboros.banman import BanManager
         bm = BanManager(ban_threshold=100)
         bm.record_misbehavior("5.6.7.8", 100, "invalid block header")
-        assert bm.is_banned("5.6.7.8")
+        assert bm.is_discouraged("5.6.7.8")
 
     def test_ban_expires(self):
         from ouroboros.banman import BanManager

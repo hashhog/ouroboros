@@ -3561,6 +3561,56 @@ class Mempool:
 
         return True, ""
 
+    def _check_cluster_limit_after_replacement(
+        self, tx: Transaction, sigop_cost: int, to_evict: set[bytes]
+    ) -> tuple[bool, str]:
+        """Cluster limits for a replacement, after its evictions are staged.
+
+        The replacement's cluster is the connected component it would join
+        once every tx in *to_evict* is gone: evicting a tx can split its old
+        cluster, so summing the parents' current clusters (as
+        `_check_cluster_limit` does for a plain add) would count members that
+        no longer connect to the replacement.  Removals only shrink other
+        clusters, so this one component is the only cluster that can grow —
+        the same set Core's CheckMemPoolPolicyLimits has to look at.
+
+        The walk stops as soon as either limit is exceeded, so its cost is
+        bounded by MAX_CLUSTER_COUNT members, not by the size of the clusters
+        being merged.
+
+        Reference: bitcoin-core/src/validation.cpp:1018-1024,
+                   bitcoin-core/src/txmempool.cpp CheckMemPoolPolicyLimits.
+        """
+        total_count = 1
+        total_weight = get_sigops_adjusted_weight(
+            tx.get_weight(), sigop_cost, DEFAULT_BYTES_PER_SIGOP
+        )
+        if total_weight > MAX_CLUSTER_SIZE_WEIGHT:
+            return False, CLUSTER_REJECT_TOKEN
+
+        stack = [
+            inp.prev_txid for inp in tx.inputs
+            if inp.prev_txid in self.transactions and inp.prev_txid not in to_evict
+        ]
+        seen: set[bytes] = set()
+        while stack:
+            txid = stack.pop()
+            if txid in seen:
+                continue
+            seen.add(txid)
+            entry = self.transactions[txid]
+            total_count += 1
+            total_weight += entry.sigop_adjusted_weight
+            if total_count > MAX_CLUSTER_COUNT or total_weight > MAX_CLUSTER_SIZE_WEIGHT:
+                return False, CLUSTER_REJECT_TOKEN
+            # Parents from the inputs (always exact), children from the
+            # entry's link set (maintained on every insert and removal).
+            neighbours = {i.prev_txid for i in entry.tx.inputs} | entry.children
+            for nb in neighbours:
+                if nb not in seen and nb not in to_evict and nb in self.transactions:
+                    stack.append(nb)
+        return True, ""
+
     # --- TRUC (v3) helpers ---
 
     def _is_truc(self, tx: Transaction) -> bool:
@@ -5192,45 +5242,6 @@ class Mempool:
         if not conflicts:
             return False, "No conflicts to replace"
 
-        # TRUC (v3) replacement constraints
-        if new_tx.version == 3:
-            # The replacement itself must obey v3 ancestor limits.
-            # After evicting conflicts we should end up with ≤ 1
-            # unconfirmed ancestor.  Pre-check: count unconfirmed
-            # parents that are NOT being evicted.
-            remaining_ancestors: set[bytes] = set()
-            for inp in new_tx.inputs:
-                if inp.prev_txid in self.transactions and inp.prev_txid not in conflicts:
-                    remaining_ancestors.add(inp.prev_txid)
-                    # Also walk up the ancestor chain
-                    parent_entry = self.transactions.get(inp.prev_txid)
-                    if parent_entry:
-                        for a in self._get_ancestors(parent_entry.tx):
-                            if a not in conflicts:
-                                remaining_ancestors.add(a)
-            if len(remaining_ancestors) + 1 > TX_V3_ANCESTOR_LIMIT:
-                return False, (
-                    f"TRUC (v3) replacement exceeds unconfirmed ancestor "
-                    f"limit: {len(remaining_ancestors) + 1} > "
-                    f"{TX_V3_ANCESTOR_LIMIT}"
-                )
-
-            # If replacing a child of a v3 parent, the new child vsize
-            # must still be ≤ TX_V3_MAX_VSIZE.
-            for inp in new_tx.inputs:
-                parent_entry = self.transactions.get(inp.prev_txid)
-                if parent_entry is not None and parent_entry.tx.version == 3:
-                    tx_vsize = (
-                        new_tx.get_vsize()
-                        if hasattr(new_tx, 'get_vsize')
-                        else len(new_tx.serialize())
-                    )
-                    if tx_vsize > TX_V3_MAX_VSIZE:
-                        return False, (
-                            f"TRUC (v3) replacement child vsize {tx_vsize} "
-                            f"exceeds {TX_V3_MAX_VSIZE} limit"
-                        )
-
         # Rule 1: all direct conflicts must signal replaceability
         # UNLESS full_rbf (mempoolfullrbf) is enabled
         if not self.full_rbf:
@@ -5238,6 +5249,58 @@ class Mempool:
                 self.transactions[c_txid]
                 if not self.is_rbf_opt_in(c_txid):
                     return False, "Conflicting tx does not signal replaceability (BIP125)"
+
+        # Sigop-adjusted virtual size of the replacement — this is the
+        # ``replacement_vsize`` Core feeds to SingleTRUCChecks and PaysForRBF
+        # (Rule #4). Core uses
+        # ws.m_vsize = GetVirtualTransactionSize(weight, sigOpCost, nBytesPerSigOp)
+        # (validation.cpp:932, kernel/mempool_entry.h), NOT the stripped
+        # non-witness serialized byte count. Using len(serialize()) here (the
+        # no-witness size) UNDER-charges Rule #4 for segwit txs — a replacement
+        # whose fee delta lies between the stripped-size cost and the true
+        # vsize cost would be ACCEPTED by us but REJECTED by Core (a false-
+        # accept relay-policy hole). Compute the sigop cost the same way the
+        # primary acceptance path does (see _add_transaction_inner) so the
+        # vsize matches byte-for-byte.
+        # Reference: bitcoin-core/src/policy/rbf.cpp PaysForRBF (replacement_vsize);
+        #            bitcoin-core/src/validation.cpp:1010 (passes ws.m_vsize).
+        new_sigop_cost = 0
+        if self.require_standard:
+            def _rbf_utxo_resolver(prev_txid: bytes, prev_vout: int):
+                utxo = self.validator.db.get_utxo(prev_txid, prev_vout)
+                if utxo is not None:
+                    return utxo
+                parent_entry = self.transactions.get(prev_txid)
+                if parent_entry is not None and prev_vout < len(parent_entry.tx.outputs):
+                    out = parent_entry.tx.outputs[prev_vout]
+                    return {"script_pubkey": out.script_pubkey}
+                return None
+            try:
+                new_sigop_cost = _compute_tx_sigop_cost(new_tx, _rbf_utxo_resolver)
+            except Exception:
+                new_sigop_cost = 0
+        new_vsize = get_virtual_transaction_size(
+            new_tx.get_weight(), new_sigop_cost, DEFAULT_BYTES_PER_SIGOP
+        )
+
+        # TRUC rules apply to a replacement exactly as to any other tx: Core
+        # runs SingleTRUCChecks(..., ws.m_conflicts, ws.m_vsize) in PreChecks
+        # for every single-tx accept, so a replacement must respect TRUC
+        # inheritance (v3 <-> non-v3 parents), the 10,000 vB TRUC cap, the
+        # 1,000 vB cap for a v3 child of an unconfirmed v3 parent and the
+        # ancestor/descendant limits.  The direct conflicts are passed so a
+        # child that is itself being replaced does not count as a sibling.
+        # When the parent's only other child is a sibling that can be evicted,
+        # Core adds it to the conflicts and lets the RBF rules below decide
+        # (validation.cpp:956-969; SingleAccept allows sibling eviction for
+        # testmempoolaccept too).
+        truc_ok, truc_err, sibling_txid = self._check_truc_policy(
+            new_tx, sigop_cost=new_sigop_cost, direct_conflicts=conflicts
+        )
+        if not truc_ok:
+            if sibling_txid is None:
+                return False, truc_err
+            conflicts = conflicts | {sibling_txid}
 
         # Gather full eviction set (conflicts + descendants)
         to_evict: set[bytes] = set()
@@ -5318,38 +5381,6 @@ class Mempool:
         total_output = sum(out.value for out in new_tx.outputs)
         new_fee = total_input - total_output
 
-        # Sigop-adjusted virtual size of the replacement — this is the
-        # ``replacement_vsize`` Core feeds to PaysForRBF (Rule #4). Core uses
-        # ws.m_vsize = GetVirtualTransactionSize(weight, sigOpCost, nBytesPerSigOp)
-        # (validation.cpp:932, kernel/mempool_entry.h), NOT the stripped
-        # non-witness serialized byte count. Using len(serialize()) here (the
-        # no-witness size) UNDER-charges Rule #4 for segwit txs — a replacement
-        # whose fee delta lies between the stripped-size cost and the true
-        # vsize cost would be ACCEPTED by us but REJECTED by Core (a false-
-        # accept relay-policy hole). Compute the sigop cost the same way the
-        # primary acceptance path does (see _add_transaction_inner) so the
-        # vsize matches byte-for-byte.
-        # Reference: bitcoin-core/src/policy/rbf.cpp PaysForRBF (replacement_vsize);
-        #            bitcoin-core/src/validation.cpp:1010 (passes ws.m_vsize).
-        new_sigop_cost = 0
-        if self.require_standard:
-            def _rbf_utxo_resolver(prev_txid: bytes, prev_vout: int):
-                utxo = self.validator.db.get_utxo(prev_txid, prev_vout)
-                if utxo is not None:
-                    return utxo
-                parent_entry = self.transactions.get(prev_txid)
-                if parent_entry is not None and prev_vout < len(parent_entry.tx.outputs):
-                    out = parent_entry.tx.outputs[prev_vout]
-                    return {"script_pubkey": out.script_pubkey}
-                return None
-            try:
-                new_sigop_cost = _compute_tx_sigop_cost(new_tx, _rbf_utxo_resolver)
-            except Exception:
-                new_sigop_cost = 0
-        new_vsize = get_virtual_transaction_size(
-            new_tx.get_weight(), new_sigop_cost, DEFAULT_BYTES_PER_SIGOP
-        )
-
         # Modified-fee accounting (FIX-72): Core ReplacementChecks uses
         # CTxMemPoolEntry::GetModifiedFee() = nFee + nFeeDelta everywhere
         # (rbf.cpp:74, 107-111, 117-122).  Apply pending prioritisetransaction
@@ -5398,6 +5429,18 @@ class Mempool:
         additional_fee = new_fee_modified - old_fees
         if additional_fee < incremental_fee_needed:
             return False, f"insufficient fee, {pays_err}"
+
+        # Cluster count/size limits on the post-replacement graph.  Core
+        # stages the removals and runs m_changeset->CheckMemPoolPolicyLimits()
+        # before the feerate-diagram check, rejecting "too-large-cluster" with
+        # an empty debug string (validation.cpp:1018-1024).  Without it a
+        # replacement spending the tips of many clusters merged them into one
+        # cluster of any size.
+        cluster_ok, cluster_err = self._check_cluster_limit_after_replacement(
+            new_tx, new_sigop_cost, to_evict
+        )
+        if not cluster_ok:
+            return False, cluster_err
 
         # Rule 6 (cluster mempool): new linearization must be strictly better
         # The new tx must improve the feerate diagram of the affected cluster(s).
