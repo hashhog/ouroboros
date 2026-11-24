@@ -316,7 +316,37 @@ pub struct BlockchainDB {
     /// Counts from the hash-index v2 migration `open` ran, or `None` when
     /// its marker was already present (nothing to do).
     open_index_migration: Mutex<Option<BlockIndexMigrationStats>>,
+    /// The automatic pruner's measured window: contiguous active-chain
+    /// heights ending at the tip of its last pass, with the bytes each block
+    /// holds (see `prune_to_target`).  Only an accelerator: it is
+    /// reconciled against the height index on every pass.
+    prune_window: Mutex<PruneWindow>,
 }
+
+/// `(height, hash, bytes)` per block, ascending and contiguous, plus their sum.
+#[derive(Default)]
+struct PruneWindow {
+    entries: std::collections::VecDeque<(u32, [u8; 32], u64)>,
+    sum: u64,
+}
+
+/// Most block bodies one automatic pass reads to extend its measured window
+/// downward (after a restart, or a target larger than the window so far).
+/// New blocks at the tip are always measured.
+const MAX_PRUNE_MEASURE_PER_PASS: u32 = 2_000;
+
+/// Most block bodies one prune step deletes (`prune_to_target`,
+/// `prune_to_height`): the caller holds the chain lock, so a step is
+/// bounded and the caller releases the lock between steps.
+const MAX_AUTO_PRUNE_PER_PASS: u32 = 2_000;
+
+/// Wall-clock budget of one prune step: mainnet bodies cost one SPENT_CF
+/// lookup per input to delete, so the body bound alone is not short enough.
+#[cfg(not(test))]
+const PRUNE_STEP_BUDGET: std::time::Duration = std::time::Duration::from_millis(1_000);
+/// Unit tests pin the body bound exactly; a loaded box must not trip the clock.
+#[cfg(test)]
+const PRUNE_STEP_BUDGET: std::time::Duration = std::time::Duration::from_secs(60);
 
 /// Soft cap on read-through cache entries; on overflow the cache is cleared
 /// (bounded memory, no per-entry eviction needed — the next reads repopulate).
@@ -405,6 +435,7 @@ impl BlockchainDB {
             utxo_read_cache: Mutex::new(HashMap::new()),
             cache_generation: AtomicU64::new(0),
             open_index_migration: Mutex::new(None),
+            prune_window: Mutex::new(PruneWindow::default()),
         })
     }
 
@@ -451,6 +482,7 @@ impl BlockchainDB {
             utxo_read_cache: Mutex::new(HashMap::new()),
             cache_generation: AtomicU64::new(0),
             open_index_migration: Mutex::new(None),
+            prune_window: Mutex::new(PruneWindow::default()),
         };
 
         // One-time removal of Core-sourced nTx from HEADERS_CF. Never fatal:
@@ -2172,45 +2204,103 @@ impl BlockchainDB {
 
     // ========== Pruning Methods ==========
 
-    /// Delete the raw block data for blocks at heights in [from_height, to_height].
+    /// Delete the block data and undo data of the active-chain blocks at
+    /// heights [from_height, to_height].
     ///
-    /// The block index (height -> hash + metadata) is preserved so the node
-    /// can still serve headers and knows which blocks existed.  Only the full
-    /// serialised block bytes in BLOCKS_CF are removed.
+    /// This is Core's `PruneOneBlockFile` + `UnlinkPrunedFiles`
+    /// (node/blockstorage.cpp): the block data and its rev data go, the block
+    /// index stays.  Here that is, per block:
+    /// - the body in BLOCKS_CF;
+    /// - its undo data: the SPENT_CF row of every coin it spent (what
+    ///   `connect_block_from_bytes` writes, keyed by outpoint, value
+    ///   `[spending txid][coin]`; a row is deleted only when its spending
+    ///   txid is a transaction of this block), and its UNDO_CF record if one
+    ///   was written.
+    /// BLOCK_INDEX_CF, BLOCK_INDEX_BY_HASH_CF (whose v2 entries carry the
+    /// 80-byte header) and HEADERS_CF are untouched, so headers,
+    /// `getheaders`, chainwork and the retarget ancestor keep answering.
     ///
-    /// This mirrors Bitcoin Core's `PruneOneBlockFile()` which deletes the
-    /// block body but keeps the block-index entry (CBlockIndex).
+    /// Deleting an absent key is a no-op, so the call is idempotent.  The
+    /// PRUNE_HEIGHT marker (the lowest height whose body is kept) is written
+    /// in every batch and only ever moves up, so a crash mid-prune leaves it
+    /// at or below the truth and the next pass finishes the job.
     ///
-    /// Returns the number of blocks actually pruned.
+    /// Returns the number of block bodies deleted.
     pub fn prune_blocks_range(&self, from_height: u32, to_height: u32) -> Result<u32> {
+        Ok(self.prune_blocks_range_bounded(from_height, to_height, u32::MAX, None)?.0)
+    }
+
+    /// `prune_blocks_range` that stops once `max_bodies` bodies have been
+    /// deleted or `budget` has elapsed.  Heights without a body (an assumeUTXO node below its
+    /// snapshot base) cost one index read each and do not count, so a
+    /// bounded pass always makes progress on real data.  Returns
+    /// `(bodies_deleted, last_height_processed)`; the PRUNE_HEIGHT marker
+    /// ends at `last_height_processed + 1`.
+    fn prune_blocks_range_bounded(
+        &self,
+        from_height: u32,
+        to_height: u32,
+        max_bodies: u32,
+        budget: Option<std::time::Duration>,
+    ) -> Result<(u32, u32)> {
+        let started = std::time::Instant::now();
+        if from_height > to_height {
+            return Ok((0, from_height.saturating_sub(1)));
+        }
         let blocks_cf = self.db.cf_handle(BLOCKS_CF)
             .ok_or_else(|| DbError::ColumnFamilyNotFound(BLOCKS_CF.to_string()))?;
-        let index_cf = self.db.cf_handle(BLOCK_INDEX_CF)
-            .ok_or_else(|| DbError::ColumnFamilyNotFound(BLOCK_INDEX_CF.to_string()))?;
+        let undo_cf = self.db.cf_handle(UNDO_CF)
+            .ok_or_else(|| DbError::ColumnFamilyNotFound(UNDO_CF.to_string()))?;
+        let spent_cf = self.db.cf_handle(SPENT_CF)
+            .ok_or_else(|| DbError::ColumnFamilyNotFound(SPENT_CF.to_string()))?;
+        let meta_cf = self.db.cf_handle(META_CF)
+            .ok_or_else(|| DbError::ColumnFamilyNotFound(META_CF.to_string()))?;
 
+        const FLUSH_EVERY: u32 = 1_000;
+        let old_marker = self.get_prune_height()?;
         let mut removed = 0u32;
+        let mut batch = WriteBatch::default();
+        let mut pending = 0u32;
+        let mut last = to_height;
 
         for height in from_height..=to_height {
-            let key = encode_height(height);
-            // Look up the block hash from the index
-            if let Some(data) = self.db.get_cf(index_cf, &key)? {
-                if data.len() >= 32 {
-                    let hash = &data[0..32];
-                    // Delete block body from BLOCKS_CF (if it still exists)
-                    if self.db.get_cf(blocks_cf, hash)?.is_some() {
-                        self.db.delete_cf(blocks_cf, hash)?;
-                        removed += 1;
+            if let Some(hash) = self.get_block_hash_by_height(height)? {
+                if let Some(block) = self.get_block(&hash)? {
+                    for tx in block.inner().txdata.iter().skip(1) {
+                        let spender = *tx.compute_txid().as_byte_array();
+                        for input in &tx.input {
+                            let key = encode_outpoint(
+                                input.previous_output.txid.as_byte_array(),
+                                input.previous_output.vout,
+                            );
+                            if let Some(v) = self.db.get_pinned_cf(spent_cf, key)? {
+                                if v.len() >= 32 && v[..32] == spender[..] {
+                                    batch.delete_cf(spent_cf, key);
+                                }
+                            }
+                        }
                     }
+                    batch.delete_cf(blocks_cf, hash);
+                    removed += 1;
                 }
+                batch.delete_cf(undo_cf, encode_height(height));
+            }
+            pending += 1;
+            let done = removed >= max_bodies
+                || budget.is_some_and(|b| started.elapsed() >= b);
+            if pending >= FLUSH_EVERY || height == to_height || done {
+                let marker = height.saturating_add(1).max(old_marker);
+                batch.put_cf(meta_cf, meta_keys::PRUNE_HEIGHT, marker.to_le_bytes());
+                self.db.write(std::mem::take(&mut batch))?;
+                pending = 0;
+            }
+            if done {
+                last = height;
+                break;
             }
         }
 
-        // Persist the new prune height
-        if removed > 0 {
-            self.set_prune_height(to_height + 1)?;
-        }
-
-        Ok(removed)
+        Ok((removed, last))
     }
 
     /// Delete the raw block data for a single block height.
@@ -2218,6 +2308,245 @@ impl BlockchainDB {
     pub fn prune_block_at_height(&self, height: u32) -> Result<bool> {
         let n = self.prune_blocks_range(height, height)?;
         Ok(n > 0)
+    }
+
+    /// Bytes the active-chain block `hash` at `height` holds on disk: its
+    /// body in BLOCKS_CF plus its undo data (the SPENT_CF rows of the coins
+    /// it spent, key + value, and its UNDO_CF record if any) — Core counts
+    /// `nSize + nUndoSize` per file.  0 when the body is not stored (an
+    /// assumeUTXO node below its snapshot base).
+    fn block_storage_bytes(&self, height: u32, hash: &[u8; 32]) -> Result<u64> {
+        let undo_cf = self.db.cf_handle(UNDO_CF)
+            .ok_or_else(|| DbError::ColumnFamilyNotFound(UNDO_CF.to_string()))?;
+        let spent_cf = self.db.cf_handle(SPENT_CF)
+            .ok_or_else(|| DbError::ColumnFamilyNotFound(SPENT_CF.to_string()))?;
+        let Some(block) = self.get_block(hash)? else {
+            return Ok(0);
+        };
+        let block = block.inner();
+        let mut total = block.total_size() as u64;
+        for tx in block.txdata.iter().skip(1) {
+            for input in &tx.input {
+                let key = encode_outpoint(
+                    input.previous_output.txid.as_byte_array(),
+                    input.previous_output.vout,
+                );
+                if let Some(v) = self.db.get_pinned_cf(spent_cf, key)? {
+                    total += (key.len() + v.len()) as u64;
+                }
+            }
+        }
+        if let Some(v) = self.db.get_pinned_cf(undo_cf, encode_height(height))? {
+            total += v.len() as u64;
+        }
+        Ok(total)
+    }
+
+    /// `(hash, bytes)` of the active-chain block at `height`; bytes 0 when
+    /// the index has no entry or the body is not stored.
+    fn measure_height(&self, height: u32) -> Result<([u8; 32], u64)> {
+        match self.get_block_hash_by_height(height)? {
+            Some(hash) => Ok((hash, self.block_storage_bytes(height, &hash)?)),
+            None => Ok(([0u8; 32], 0)),
+        }
+    }
+
+    /// The highest height that may be pruned with `tip_height` as the tip:
+    /// a block more than `keep_blocks` below the tip.  The block at exactly
+    /// `tip - keep_blocks` is kept: it is the fork point of a
+    /// `keep_blocks`-deep reorg, and connecting the first block of the
+    /// competing branch reads its parent.  `None` while the chain is too
+    /// short to prune anything.
+    fn last_prunable_height(tip_height: u32, keep_blocks: u32) -> Option<u32> {
+        tip_height.checked_sub(keep_blocks)?.checked_sub(1)
+    }
+
+    /// Automatic pruning to a disk target: Core's `FindFilesToPrune` for
+    /// `-prune=N` (node/blockstorage.cpp), at block rather than file
+    /// granularity.
+    ///
+    /// Usage is the bytes of block bodies + undo data still stored for the
+    /// active chain.  Counting down from the tip, the blocks that fit in
+    /// `target_bytes` are kept; everything below them is pruned, except that
+    /// the last `keep_blocks` blocks below the tip (and the tip itself) are
+    /// always kept, as Core's MIN_BLOCKS_TO_KEEP floor does.
+    ///
+    /// The sizes live in an in-memory window (`prune_window`), reconciled
+    /// with the height index every pass (a reorg drops the replaced top),
+    /// so a pass reads only the blocks connected since the last one.  Growing
+    /// the window downward (after a restart) reads at most
+    /// MAX_PRUNE_MEASURE_PER_PASS bodies per pass: the caller holds the
+    /// chain lock.  Until the window reaches past the target, nothing is
+    /// pruned; it never reads the data it prunes.
+    ///
+    /// Returns `(blocks_pruned, bytes_retained, more)`: the bytes of the
+    /// measured window after the pass (blocks a bounded delete left for the
+    /// next step are not in it), and whether the delete stopped at its
+    /// bound with prunable blocks left (call again, after releasing the
+    /// chain lock).
+    pub fn prune_to_target(
+        &self,
+        tip_height: u32,
+        target_bytes: u64,
+        keep_blocks: u32,
+    ) -> Result<(u32, u64, bool)> {
+        let floor = self.get_prune_height()?;
+        if floor > tip_height {
+            return Ok((0, 0, false));
+        }
+        let mut guard = self.prune_window.lock().unwrap_or_else(|p| p.into_inner());
+        let w = &mut *guard;
+
+        // Reconcile: drop what is already pruned, and any top that is no
+        // longer the active chain (a matching hash at the top implies the
+        // rest below it matches: a block hash commits to its ancestry).
+        while let Some(&(h, _, n)) = w.entries.front() {
+            if h >= floor {
+                break;
+            }
+            w.entries.pop_front();
+            w.sum -= n;
+        }
+        while let Some(&(h, hash, n)) = w.entries.back() {
+            if h <= tip_height && self.get_block_hash_by_height(h)? == Some(hash) {
+                break;
+            }
+            w.entries.pop_back();
+            w.sum -= n;
+        }
+        // Extend up to the tip (new blocks since the last pass).  A gap
+        // wider than the measuring budget (fast IBD between passes) starts
+        // the window over at the tip instead, so a pass stays bounded.
+        if let Some(&(h, _, _)) = w.entries.back() {
+            if tip_height - h > MAX_PRUNE_MEASURE_PER_PASS {
+                w.entries.clear();
+                w.sum = 0;
+            }
+        }
+        let first_up = match w.entries.back() {
+            Some(&(h, _, _)) => h + 1,
+            None => tip_height,
+        };
+        for h in first_up..=tip_height {
+            let (hash, n) = self.measure_height(h)?;
+            w.entries.push_back((h, hash, n));
+            w.sum += n;
+        }
+        // Extend down, bounded, until the window no longer fits.
+        let mut budget = MAX_PRUNE_MEASURE_PER_PASS;
+        while w.sum <= target_bytes && budget > 0 {
+            let lo = w.entries.front().map(|e| e.0).unwrap_or(tip_height);
+            if lo <= floor {
+                break;
+            }
+            let (hash, n) = self.measure_height(lo - 1)?;
+            w.entries.push_front((lo - 1, hash, n));
+            w.sum += n;
+            budget -= 1;
+        }
+        if w.sum <= target_bytes {
+            return Ok((0, w.sum, false)); // fits, or not measured far enough yet
+        }
+        // Drop from the bottom until the rest fits, never into the keep floor.
+        let Some(last) = Self::last_prunable_height(tip_height, keep_blocks) else {
+            return Ok((0, w.sum, false));
+        };
+        while w.sum > target_bytes {
+            let Some(&(h, _, n)) = w.entries.front() else { break };
+            if h > last {
+                break;
+            }
+            w.entries.pop_front();
+            w.sum -= n;
+        }
+        // Everything below the window that is left goes, up to the floor.
+        let bottom = w.entries.front().map(|e| e.0).unwrap_or(tip_height + 1);
+        let prune_to = bottom.saturating_sub(1).min(last);
+        if bottom == 0 || prune_to < floor {
+            return Ok((0, w.sum, false));
+        }
+        // Blocks (prune_to, bottom) are kept only by the keep floor: measure
+        // them (at most keep_blocks + 1) so the retained total is exact.
+        let mut h = bottom;
+        while h > prune_to + 1 {
+            h -= 1;
+            let (hash, n) = self.measure_height(h)?;
+            w.entries.push_front((h, hash, n));
+            w.sum += n;
+        }
+        // One step deletes at most MAX_AUTO_PRUNE_PER_PASS bodies within
+        // PRUNE_STEP_BUDGET: pruning reads each body to find its undo rows.
+        // A first prune of an archive datadir therefore takes many steps.
+        let (pruned, last_done) = self.prune_blocks_range_bounded(
+            floor, prune_to, MAX_AUTO_PRUNE_PER_PASS, Some(PRUNE_STEP_BUDGET),
+        )?;
+        Ok((pruned, w.sum, last_done < prune_to))
+    }
+
+    /// Manual pruning (the `pruneblockchain` RPC): Core's
+    /// `PruneBlockFilesManual` / `FindFilesToPruneManual`.  Prunes the active
+    /// chain up to `target_height`, capped so the last `keep_blocks` blocks
+    /// below the tip stay.
+    ///
+    /// One bounded step (same bounds as `prune_to_target`; the caller
+    /// releases the chain lock between steps).  Returns
+    /// `(heights_pruned, highest_pruned_height, more)`; the height is
+    /// `None` when no block has ever been pruned (Core's
+    /// `GetPruneHeight(...).value_or(-1)`), `more` that the step stopped
+    /// at its bound short of `target_height`.
+    pub fn prune_to_height(
+        &self,
+        target_height: u32,
+        tip_height: u32,
+        keep_blocks: u32,
+    ) -> Result<(u32, Option<u32>, bool)> {
+        let floor = self.get_prune_height()?;
+        let mut pruned = 0u32;
+        let mut more = false;
+        if let Some(last) = Self::last_prunable_height(tip_height, keep_blocks) {
+            let prune_to = target_height.min(last);
+            if prune_to >= floor {
+                let (n, last_done) = self.prune_blocks_range_bounded(
+                    floor, prune_to, MAX_AUTO_PRUNE_PER_PASS, Some(PRUNE_STEP_BUDGET),
+                )?;
+                pruned = n;
+                more = last_done < prune_to;
+            }
+        }
+        Ok((pruned, self.get_prune_height()?.checked_sub(1), more))
+    }
+
+    /// The 80-byte header of the active-chain block at `height`, whether or
+    /// not its body is still stored: Core's `CBlockIndex::GetBlockHeader()`.
+    ///
+    /// The v2 hash-index entry first (the block index; it outlives a pruned
+    /// body), then HEADERS_CF, then the body.  A candidate is returned only
+    /// if it hashes to the height index's hash for `height`, so the order
+    /// cannot change the answer.  `None` when the height index has no entry
+    /// or no store holds a matching header.
+    pub fn get_header_by_height(&self, height: u32) -> Result<Option<bitcoin::block::Header>> {
+        let Some(hash) = self.get_block_hash_by_height(height)? else {
+            return Ok(None);
+        };
+        let decode = |raw: &[u8]| -> Option<bitcoin::block::Header> {
+            if !header_hashes_to(raw, &hash) {
+                return None;
+            }
+            bitcoin::consensus::deserialize::<bitcoin::block::Header>(raw).ok()
+        };
+        if let Some(entry) = self.get_block_index_entry(&hash)? {
+            if let Some(raw) = entry.header {
+                if let Some(h) = decode(&raw) {
+                    return Ok(Some(h));
+                }
+            }
+        }
+        if let Some((raw, _n_tx)) = self.get_raw_header(&hash)? {
+            if let Some(h) = decode(&raw) {
+                return Ok(Some(h));
+            }
+        }
+        Ok(self.get_block(&hash)?.map(|b| b.inner().header))
     }
 
     /// Get the lowest height whose block data has NOT been pruned.
@@ -2231,14 +2560,6 @@ impl BlockchainDB {
             }
             _ => Ok(0),
         }
-    }
-
-    /// Set the lowest unpruned height.
-    fn set_prune_height(&self, height: u32) -> Result<()> {
-        let cf = self.db.cf_handle(META_CF)
-            .ok_or_else(|| DbError::ColumnFamilyNotFound(META_CF.to_string()))?;
-        self.db.put_cf(cf, meta_keys::PRUNE_HEIGHT, height.to_le_bytes())?;
-        Ok(())
     }
 
     /// Check whether the block body exists for a given height.
@@ -4400,5 +4721,85 @@ pub(crate) mod read_install_hook {
 
     pub(crate) fn take() -> Option<Hook> {
         HOOK.with(|h| h.borrow_mut().take())
+    }
+}
+
+#[cfg(test)]
+mod prune_tests {
+    //! fix-ouroboros-prune-noop: the automatic pass bound counts bodies.
+    use super::BlockchainDB;
+    use bitcoin::hashes::Hash;
+    use bitcoin::{blockdata::block::Header, BlockHash, TxMerkleNode};
+    use tempdir::TempDir;
+
+    /// A chain whose index covers 0..=tip but whose bodies start at
+    /// `first_body` (an assumeUTXO node: no bodies below the snapshot).
+    fn chain_with_gap(tip: u32, first_body: u32) -> (BlockchainDB, TempDir) {
+        let dir = TempDir::new("prune_gap").unwrap();
+        let db = BlockchainDB::open(dir.path().to_str().unwrap()).unwrap();
+        let mut prev = BlockHash::all_zeros();
+        for h in 0..=tip {
+            let header = Header {
+                version: bitcoin::blockdata::block::Version::ONE,
+                prev_blockhash: prev,
+                merkle_root: TxMerkleNode::all_zeros(),
+                time: 1231006505 + h * 600,
+                bits: bitcoin::CompactTarget::from_consensus(0x207fffff),
+                nonce: h,
+            };
+            let block = common::BlockWrapper::new(bitcoin::Block { header, txdata: vec![] });
+            let hash = block.block_hash().to_byte_array();
+            if h >= first_body {
+                db.store_block(&block).unwrap();
+            }
+            let meta = common::BlockMetadata::new(h, [0u8; 32], header.time);
+            db.store_block_metadata(h, &hash, &meta).unwrap();
+            prev = block.block_hash();
+        }
+        (db, dir)
+    }
+
+    #[test]
+    fn auto_prune_pass_is_bounded_by_bodies_not_heights() {
+        // 5000 body-less heights, then 400 bodies: one pass must reach the
+        // bodies (the old height bound spent its 2000 on empty heights).
+        let (db, _dir) = chain_with_gap(5400, 5000);
+        let (pruned, _, more) = db.prune_to_target(5400, 1, 288).unwrap();
+        assert!(!more);
+        assert_eq!(pruned, 5400 - 288 - 5000);
+        assert_eq!(db.get_prune_height().unwrap(), 5400 - 288);
+        assert!(db.get_block_by_height(5400 - 289).unwrap().is_none());
+        assert!(db.get_block_by_height(5400 - 288).unwrap().is_some());
+    }
+
+    #[test]
+    fn auto_prune_measuring_is_bounded_per_pass() {
+        // Every test block is an 81-byte header-only body with no undo.  A
+        // target of 2500 blocks needs the window measured 2501 deep: a first
+        // pass measures 2000 below the tip and prunes nothing, the second
+        // reaches past the target and prunes exactly the blocks below it
+        // (1501 bodies, inside the 2000-body delete bound).
+        let (db, _dir) = chain_with_gap(4000, 0);
+        let target = 2500 * 81;
+        assert_eq!(db.prune_to_target(4000, target, 288).unwrap(), (0, 2001 * 81, false));
+        assert_eq!(db.get_prune_height().unwrap(), 0);
+        let (pruned, retained, more) = db.prune_to_target(4000, target, 288).unwrap();
+        assert_eq!((pruned, retained, more), (1501, 2500 * 81, false));
+        assert_eq!(db.get_prune_height().unwrap(), 1501);
+        // A later pass at the same tip reads nothing and prunes nothing.
+        assert_eq!(db.prune_to_target(4000, target, 288).unwrap(), (0, 2500 * 81, false));
+    }
+
+    #[test]
+    fn auto_prune_pass_stops_after_the_body_bound() {
+        let (db, _dir) = chain_with_gap(2600, 0);
+        assert_eq!(db.prune_to_target(2600, 1, 288).unwrap(), (2000, 289 * 81, true));
+        assert_eq!(db.get_prune_height().unwrap(), 2000);
+        assert_eq!(db.prune_to_target(2600, 1, 288).unwrap(), (2600 - 288 - 2000, 289 * 81, false));
+        // The manual step is bounded the same way.
+        let (db, _dir2) = chain_with_gap(2600, 0);
+        assert_eq!(db.prune_to_height(2600, 2600, 288).unwrap(), (2000, Some(1999), true));
+        assert_eq!(db.prune_to_height(2600, 2600, 288).unwrap(), (312, Some(2311), false));
+        assert_eq!(db.get_prune_height().unwrap(), 2600 - 288);
     }
 }

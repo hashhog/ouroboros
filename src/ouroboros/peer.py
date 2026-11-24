@@ -437,11 +437,9 @@ class Peer:
         # version handshake (the actual sender path consults
         # :meth:`_should_advertise_node_compact_filters`).
         self.node_compact_filters = node_compact_filters
-        # BIP-159 NODE_NETWORK_LIMITED advertisement toggle.  Set when
-        # prune mode is on (`prune > 0` in node config).  When True we
-        # OR NODE_NETWORK_LIMITED (1<<10 = 0x400) into the advertised
-        # services; mirrors Core's `init.cpp` (`nLocalServices |=
-        # NODE_NETWORK_LIMITED` when `IsPruneMode()` is true).
+        # Prune mode (`prune > 0` in node config).  When True, NODE_NETWORK
+        # is NOT advertised (Core init.cpp sets it only when !IsPruneMode());
+        # NODE_NETWORK_LIMITED (1<<10 = 0x400) is advertised either way.
         self.node_network_limited = node_network_limited
         # Optional reference to PeerManager's BanManager so that adjust_score
         # clamping at 0 can route the peer through the existing ban
@@ -771,7 +769,12 @@ class Peer:
           (BIP-324). ouroboros's v2 responder is genuinely default-on, so
           advertising the bit when transport_version >= 2 is honest.
         """
-        our_services = NODE_NETWORK | NODE_WITNESS
+        # NODE_NETWORK promises the whole chain, so a pruned node drops it
+        # (Core init.cpp: g_local_services gets NODE_NETWORK only when
+        # !IsPruneMode()); it keeps NODE_NETWORK_LIMITED (last 288 blocks).
+        our_services = NODE_WITNESS
+        if not self.node_network_limited:
+            our_services |= NODE_NETWORK
         # BIP 111 NODE_BLOOM is advertised only when peer_bloom_filters
         # is enabled (mirrors Bitcoin Core's -peerbloomfilters, default
         # false; init.cpp:1104). BIP-35 MEMPOOL servicing is gated on
@@ -1731,8 +1734,11 @@ class Peer:
         # NODE_BLOOM advertised iff peer_bloom_filters enabled (Core parity).
         # NODE_COMPACT_FILTERS advertised iff -blockfilterindex AND
         # BlockFilterIndex.is_synced() (FIX-71 / W121 BUG-5).
-        # NODE_NETWORK_LIMITED advertised iff prune mode is on (BIP-159).
-        our_services = NODE_NETWORK | NODE_WITNESS
+        # NODE_NETWORK_LIMITED advertised iff prune mode is on (BIP-159);
+        # NODE_NETWORK only when NOT pruned (Core init.cpp).
+        our_services = NODE_WITNESS
+        if not self.node_network_limited:
+            our_services |= NODE_NETWORK
         if self.peer_bloom_filters:
             our_services |= NODE_BLOOM
         if self._should_advertise_node_compact_filters():

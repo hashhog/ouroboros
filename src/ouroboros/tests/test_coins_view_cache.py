@@ -906,8 +906,9 @@ class TestG28PruningIntegration(unittest.TestCase):
         if not db_rs_path.exists():
             self.skipTest("db.rs not found")
         src = db_rs_path.read_text()
-        # Find prune_blocks_range
-        prune_section = src[src.find('fn prune_blocks_range'):]
+        # Find the range delete (prune_blocks_range delegates to the bounded
+        # form, which holds the body since fix-ouroboros-prune-noop).
+        prune_section = src[src.find('fn prune_blocks_range_bounded'):]
         prune_body = prune_section[:prune_section.find('\n    }') + 100]
         self.assertIn('BLOCKS_CF', prune_body,
                       "prune must reference BLOCKS_CF")

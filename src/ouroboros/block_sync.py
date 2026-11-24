@@ -4438,6 +4438,14 @@ class BlockSync:
                         )
                     except Exception:
                         info = None
+                    if info is None:
+                        # Pruned body: the block index still holds the
+                        # header (Core reads CBlockIndex, never the body).
+                        # Without this a pruned node answered None for the
+                        # retarget period's first block, 2015 below the tip,
+                        # and rejected every valid retarget header as
+                        # bad-diffbits, banning the peer that sent it.
+                        info = self._index_header_info(target_height)
                     if info is None and target_height == anchor_h:
                         # The anchor's own hash is known by pointer, so a
                         # by-hash read is still pointer-addressed.
@@ -4489,6 +4497,27 @@ class BlockSync:
             return info
 
         return ancestor_at
+
+    def _index_header_info(self, height: int):
+        """``_HdrInfo`` for the active-chain block at *height* from the block
+        index (the header survives a pruned body), or None.  The header is
+        hash-checked against the height index's hash by
+        ``get_index_header_bytes``."""
+        try:
+            block_hash = self.db.get_block_hash_by_height(height)
+            if not isinstance(block_hash, (bytes, bytearray)) or len(block_hash) != 32:
+                return None
+            raw = self.db.get_index_header_bytes(bytes(block_hash))
+        except Exception:
+            return None
+        if not isinstance(raw, (bytes, bytearray)) or len(raw) != 80:
+            return None
+        return _HdrInfo(
+            height,
+            int.from_bytes(raw[72:76], "little"),
+            int.from_bytes(raw[68:72], "little"),
+            bytes(raw[4:36]),
+        )
 
     def _snapshot_base_height(self) -> int:
         """Height of the assumeUTXO snapshot this datadir was bootstrapped
@@ -7045,11 +7074,18 @@ class BlockSync:
         # archive node (default) all undo is present, so refusing an over-deep
         # bridge would strand us on the lower-work minority chain = Class-A
         # consensus divergence.  When pruning is enabled the cap protects
-        # against bridging a reorg past the retained undo window.
-        if self.pruning_enabled and len(bridge_hashes) > MAX_REORG_DEPTH:
+        # against bridging a reorg past the retained undo window.  Undo data
+        # is needed only for the blocks being DISCONNECTED (active tip down
+        # to the fork point), so the cap is on that depth; the bridge (the
+        # blocks to connect) is necessarily longer than it, and capping the
+        # bridge refused even a 288-deep reorg, which a pruned node can do.
+        disconnect_depth = (
+            active_height - ancestor_height if active_height >= 0 else 0
+        )
+        if self.pruning_enabled and disconnect_depth > MAX_REORG_DEPTH:
             logger.warning(
                 f"fork bridge {fork_tip_hash.hex()[:16]}... too deep for a "
-                f"pruned node ({len(bridge_hashes)} > {MAX_REORG_DEPTH} "
+                f"pruned node (disconnect {disconnect_depth} > {MAX_REORG_DEPTH} "
                 f"retained-undo window); refusing reorg"
             )
             return None

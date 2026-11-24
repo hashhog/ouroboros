@@ -71,17 +71,23 @@ class TestAdvertisedServiceFlags(unittest.TestCase):
         self.assertTrue(services & NODE_NETWORK, "NODE_NETWORK missing")
         self.assertTrue(services & NODE_WITNESS, "NODE_WITNESS missing")
 
-    def test_prune_flag_does_not_change_advertised_set(self):
-        """Whether or not the prune-derived flag is set, 0x409 is advertised.
+    def test_prune_flag_drops_node_network(self):
+        """A full node advertises 0x409; a pruned node drops NODE_NETWORK and
+        advertises 0x408 (Core init.cpp: NODE_NETWORK only when
+        !IsPruneMode(); NODE_NETWORK_LIMITED unconditional).
 
-        (Core would drop NODE_NETWORK when actually pruning, but ouroboros's
-        node_network_limited flag historically only toggled the LIMITED bit;
-        the fix makes LIMITED unconditional so both inputs yield 0x409.)
+        This used to assert 0x409 for both: prune mode never reached the
+        peer layer, and pruning deleted nothing, so the lie was harmless.
+        Once -prune deletes old blocks a pruned node advertising
+        NODE_NETWORK would be picked as a full-history IBD source and
+        answer notfound (fix-ouroboros-prune-noop).
         """
         peer_off = Peer("10.0.0.1", 8333, "mainnet", node_network_limited=False)
         peer_on = Peer("10.0.0.2", 8333, "mainnet", node_network_limited=True)
         self.assertEqual(peer_off._assemble_our_services(), FULL_NODE_SERVICES)
-        self.assertEqual(peer_on._assemble_our_services(), FULL_NODE_SERVICES)
+        self.assertEqual(
+            peer_on._assemble_our_services(), FULL_NODE_SERVICES & ~NODE_NETWORK
+        )
 
     def test_no_bloom_or_compact_filters_by_default(self):
         """Default node does not advertise NODE_BLOOM / NODE_COMPACT_FILTERS."""

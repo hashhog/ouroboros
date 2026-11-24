@@ -263,10 +263,14 @@ impl HeaderValidator {
         let mut timestamps = Vec::with_capacity(count as usize);
 
         for h in start_height..=height {
-            let block = self.db.get_block_by_height(h)?
+            // The block index's header, not the body: below a pruned node's
+            // keep window the body is gone (Core reads nTime from
+            // CBlockIndex), and a reorg's first connect looks 10 blocks
+            // below its fork point.
+            let header = self.db.get_header_by_height(h)?
                 .ok_or_else(|| HeaderValidationError::BlockNotFound(format!("Block at height {}", h)))?;
 
-            timestamps.push(block.inner().header.time);
+            timestamps.push(header.time);
         }
 
         // Sort timestamps and return median
@@ -396,8 +400,10 @@ impl HeaderValidator {
             Ok(Some(h)) if &h == anchor_hash => {}
             _ => return None,
         }
-        let block = self.db.get_block_by_height(height).ok()??;
-        let hdr = block.inner().header;
+        // From the block index, not the body: on a pruned node the period's
+        // first block (anchor - 2015) has no body, and Core reads it from
+        // CBlockIndex.  A body-only read here rejected a valid retarget block.
+        let hdr = self.db.get_header_by_height(height).ok()??;
         Some(BlockIndexInfo {
             height,
             bits: hdr.bits.to_consensus(),
@@ -624,6 +630,52 @@ mod tests {
         // Sorted: same order, median is the 6th element (0-indexed) of 11 elements
         let expected_median = 1231006505 + 6 * 600;
         assert_eq!(median_time, expected_median);
+    }
+
+    /// fix-ouroboros-prune-noop: a pruned node resolves the retarget
+    /// period's first block (anchor - 2015 on mainnet) from the block index.
+    /// `ancestor_at` read the BODY, so once that body was pruned it answered
+    /// None and a valid retarget block failed validate_difficulty.
+    #[test]
+    fn test_ancestor_at_resolves_a_pruned_ancestor_from_the_index() {
+        let (db, _temp_dir) = create_test_db();
+        let validator = HeaderValidator::new(db.clone(), Network::Bitcoin);
+        let mut prev = BlockHash::all_zeros();
+        let mut hashes = Vec::new();
+        for height in 0..4u32 {
+            let header = create_test_header(prev, 1231006505 + height * 600, 0x1d00ffff, height);
+            let block = common::BlockWrapper::new(bitcoin::Block {
+                header: *header.inner(),
+                txdata: vec![],
+            });
+            db.store_block(&block).unwrap();
+            let hash = block.block_hash().to_byte_array();
+            let raw: [u8; 80] = bitcoin::consensus::serialize(header.inner()).try_into().unwrap();
+            db.store_raw_header(&hash, &raw, 0).unwrap();
+            let metadata = common::BlockMetadata::new(height, [0u8; 32], header.inner().time);
+            db.store_block_metadata(height, &hash, &metadata).unwrap();
+            prev = block.block_hash();
+            hashes.push(hash);
+        }
+        let anchor = hashes[3];
+        let before = validator.ancestor_at(1, 3, &anchor).expect("unpruned ancestor");
+        let mtp_before = validator.get_median_time_past(3).unwrap();
+
+        db.prune_blocks_range(0, 2).unwrap();
+        assert!(db.get_block_by_height(1).unwrap().is_none(), "body 1 must be pruned");
+
+        let after = validator
+            .ancestor_at(1, 3, &anchor)
+            .expect("a pruned ancestor still resolves from the block index");
+        assert_eq!(
+            (after.height, after.bits, after.timestamp),
+            (before.height, before.bits, before.timestamp)
+        );
+        // The MTP window (a reorg's first connect reaches 10 below its fork
+        // point) reads the same index headers.
+        assert_eq!(validator.get_median_time_past(3).unwrap(), mtp_before);
+        // Still poison-immune: a wrong anchor resolves nothing.
+        assert!(validator.ancestor_at(1, 3, &hashes[2]).is_none());
     }
 
     #[test]

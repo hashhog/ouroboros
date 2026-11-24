@@ -357,11 +357,17 @@ DIFFBITS_WALKBACK_INCOMPLETE = "walkback-incomplete"
 class _AncestorTimestamp:
     """Header-metadata stand-in for an ancestor whose body is not stored."""
 
-    __slots__ = ("timestamp", "bits")
+    __slots__ = ("timestamp", "bits", "prev_blockhash")
 
-    def __init__(self, timestamp: int, bits: int | None = None) -> None:
+    def __init__(
+        self,
+        timestamp: int,
+        bits: int | None = None,
+        prev_blockhash: bytes | None = None,
+    ) -> None:
         self.timestamp = timestamp
         self.bits = bits
+        self.prev_blockhash = prev_blockhash
 
 
 class MissingAncestorHeaderError(RuntimeError):
@@ -1770,6 +1776,44 @@ class BlockValidator:
 
         return True
 
+    def _index_header_block(self, block_hash: bytes):
+        """Header-only ``_AncestorTimestamp`` (timestamp + bits) for
+        *block_hash* from the block index, or None.  Core's
+        ``CBlockIndex::GetBlockHeader()``: answers whether or not the body is
+        still stored, which is what a pruned node needs for the retarget
+        rule's ancestors."""
+        fn = getattr(self.db, "get_index_header_bytes", None)
+        if fn is None:
+            return None
+        try:
+            raw = fn(bytes(block_hash))
+        except Exception as e:
+            if is_system_error(e):
+                raise
+            return None
+        if not isinstance(raw, (bytes, bytearray)) or len(raw) != 80:
+            return None
+        return _AncestorTimestamp(
+            timestamp=int.from_bytes(raw[68:72], "little"),
+            bits=int.from_bytes(raw[72:76], "little"),
+            prev_blockhash=bytes(raw[4:36]),
+        )
+
+    def _index_header_at_height(self, height: int):
+        """``_index_header_block`` for the active-chain block at *height*."""
+        fn = getattr(self.db, "get_block_hash_by_height", None)
+        if fn is None:
+            return None
+        try:
+            block_hash = fn(height)
+        except Exception as e:
+            if is_system_error(e):
+                raise
+            return None
+        if not isinstance(block_hash, (bytes, bytearray)) or len(block_hash) != 32:
+            return None
+        return self._index_header_block(bytes(block_hash))
+
     def _active_ancestor_header(self, height: int):
         """Active-chain ancestor at *height* for the retarget rule.
 
@@ -1786,6 +1830,13 @@ class BlockValidator:
         blk = self.db.get_block_by_height(height)
         if blk is not None:
             return blk
+        # A pruned body: the block index still holds the full header (bits
+        # included), as Core's CBlockIndex does.  Without this a pruned node
+        # got the bits-less stub below and BIP94 (testnet4) treated the
+        # period's first block as unresolved.
+        hdr = self._index_header_at_height(height)
+        if hdr is not None:
+            return hdr
         fn = getattr(self.db, "get_block_timestamp_by_height", None)
         if fn is None:
             return None
@@ -1887,8 +1938,16 @@ class BlockValidator:
                         pindex = ancestor_at(walk_height - 1)
                     else:
                         # Core walks ``pindex = pindex->pprev`` (pow.cpp:33);
-                        # the by-hash read is the same pointer hop.
-                        pindex = self._lookup_header_block(pindex.prev_blockhash)
+                        # the by-hash read is the same pointer hop.  On a
+                        # pruned node the ancestor's body may be gone; its
+                        # header is still in the block index.
+                        prev_hash = pindex.prev_blockhash
+                        pindex = (
+                            self._lookup_header_block(prev_hash)
+                            if prev_hash is not None else None
+                        )
+                        if pindex is None and prev_hash is not None:
+                            pindex = self._index_header_block(prev_hash)
                     walk_height -= 1
                 if pindex:
                     return pindex.bits, DIFFBITS_OK
