@@ -46,7 +46,7 @@ ouroboros --help
 
 There are no Cargo features to choose between. Two behaviours are picked at run time, not at build time:
 
-- `OUROBOROS_NATIVE_SCRIPT=1` sends script verification through the Rust port of Core's interpreter in `ferrous-utils/sync/src/validate/interpreter.rs` instead of the Python one in `src/ouroboros/script.py`. If the installed extension lacks it, the node refuses to start rather than falling back to Python. See [running.md](running.md#environment-variables).
+- Script verification goes through the Rust port of Core's interpreter in `ferrous-utils/sync/src/validate/interpreter.rs` by default. `OUROBOROS_NATIVE_SCRIPT=0` sends it through the Python one in `src/ouroboros/script.py` instead. If the installed extension lacks the Rust interpreter, the node refuses to start rather than falling back to Python. See [running.md](running.md#environment-variables).
 - `OUROBOROS_DISABLE_RUST_VALIDATE=1` makes block-level checks run in Python instead of the Rust fast path.
 
 ## Reproducibility

@@ -701,7 +701,7 @@ class BitcoinNode:
             script_threads = init_script_check_threads(par_n)
             logger.info(
                 "script verification threads: %d (--par=%s; native pool "
-                "only when OUROBOROS_NATIVE_SCRIPT=1, else GIL-serial)",
+                "by default, GIL-serial with OUROBOROS_NATIVE_SCRIPT=0)",
                 script_threads, par_n,
             )
 

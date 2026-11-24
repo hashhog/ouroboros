@@ -13,8 +13,8 @@ ouroboros is a Python application on an asyncio event loop. Storage, cryptograph
    +---- validation (Python) ----+
                 |                 \
       Rust extension `sync`        script interpreter
-      (RocksDB, block checks,      (Python by default,
-       header sync, crypto)         Rust with OUROBOROS_NATIVE_SCRIPT=1)
+      (RocksDB, block checks,      (Rust by default,
+       header sync, crypto)         Python with OUROBOROS_NATIVE_SCRIPT=0)
 ```
 
 ## Startup

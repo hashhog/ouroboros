@@ -15,9 +15,9 @@
 //! every decision, every error code and every stack result matches Core.
 //!
 //! It is exposed to Python (see `lib.rs`: `ScriptTx`, `script_verify`,
-//! `script_eval`, `script_sighash_legacy`) and selected by the ouroboros node
-//! only when `OUROBOROS_NATIVE_SCRIPT=1`; the pure-Python
-//! `ouroboros.script.ScriptInterpreter` stays the default and the oracle.
+//! `script_eval`, `script_sighash_legacy`) and is the ouroboros node's default
+//! script interpreter; `OUROBOROS_NATIVE_SCRIPT=0` selects the pure-Python
+//! `ouroboros.script.ScriptInterpreter`, which stays the oracle.
 
 use bitcoin_hashes::{hash160, ripemd160, sha1, sha256, sha256d, Hash as _, HashEngine as _};
 use secp256k1::{ecdsa, schnorr, Message, Parity, PublicKey, Scalar, Secp256k1, XOnlyPublicKey};

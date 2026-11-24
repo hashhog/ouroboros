@@ -2423,8 +2423,9 @@ fn read_snapshot_metadata(path: String, network: String) -> PyResult<PySnapshotM
 // ---------------------------------------------------------------------------
 // Native script interpreter (validate::interpreter) — Python bindings.
 //
-// `ouroboros.script.ScriptInterpreter` routes here when
-// OUROBOROS_NATIVE_SCRIPT=1. The contract with the Python side:
+// `ouroboros.script.ScriptInterpreter` routes here by default
+// (OUROBOROS_NATIVE_SCRIPT=0 selects the Python interpreter instead). The
+// contract with the Python side:
 //   * `ScriptTx(tx_bytes, spent_amounts, spent_script_pubkeys)` is built ONCE
 //     per transaction (the Python side caches it on the Transaction object)
 //     from the extended transport encoding `ouroboros.script._native_tx_bytes`
@@ -2783,7 +2784,7 @@ fn sync(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(pyo3::wrap_pyfunction!(arm_utxo_stats_walk_gate, m)?)?;
     m.add_function(pyo3::wrap_pyfunction!(utxo_stats_walk_phase, m)?)?;
     m.add_function(pyo3::wrap_pyfunction!(release_utxo_stats_walk_gate, m)?)?;
-    // Native script interpreter (OUROBOROS_NATIVE_SCRIPT=1)
+    // Native script interpreter (the default; OUROBOROS_NATIVE_SCRIPT=0 opts out)
     m.add_class::<PyScriptTx>()?;
     m.add_function(pyo3::wrap_pyfunction!(script_native_abi, m)?)?;
     m.add_function(pyo3::wrap_pyfunction!(script_verify, m)?)?;
