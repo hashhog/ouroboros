@@ -47,7 +47,7 @@ The Rust layer batches lookups: `get_utxo_batch()` fetches every input of a tran
 
 The Python interpreter is the default and the reference. `tests/native_script_differential.py` runs both interpreters on the same inputs and reports any difference. Only the Rust interpreter runs in parallel threads (`--par`), because the Python one holds the GIL.
 
-Below the last checkpoint (mainnet height 850,000) script checks are skipped during sync unless `--noassumevalid` is given. The same switch applies to blocks arriving over P2P and through `submitblock`.
+Script checks are skipped during sync only where Bitcoin Core skips them: for an ancestor of the assumevalid block (mainnet height 938,343) when the best header has at least the minimum chain work and is more than two weeks of work past the block (`src/ouroboros/assumevalid.py`, `BlockSync._assumevalid_skip`). Height alone does not count, and blocks from `submitblock` or a fork reorg always have their scripts checked. `--noassumevalid` checks every script, on P2P and `submitblock` alike.
 
 ## P2P and sync
 

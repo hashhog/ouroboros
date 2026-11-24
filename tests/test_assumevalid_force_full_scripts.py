@@ -167,14 +167,23 @@ def _run(force_check_scripts: bool):
         )
 
 
-def test_pre_flag_assume_valid_accepts_invalid_script_below_checkpoint():
-    """Without the flag, the invalid-script spend is silently ACCEPTED (the bug)."""
+def test_default_rejects_invalid_script_below_old_checkpoint_cut():
+    """Without the flag, the invalid-script spend is REJECTED.
+
+    This used to assert acceptance: the validator skipped scripts for any
+    block at or below the last checkpoint (mainnet 850000) by height alone.
+    Core skips only for an ancestor of the assumevalid block on a best header
+    with enough work, which this crafted block is not, so its scripts run.
+    Only a caller that has made Core's checks (assumed_valid=True) skips.
+    """
     ok, err = _run(force_check_scripts=False)
-    assert ok, (
-        "pre-flag (assume-valid) MUST accept below-checkpoint block without "
-        f"running scripts; got reject: {err!r}"
+    assert not ok, (
+        "a block at a low height that nobody vouched for as an assumevalid "
+        "ancestor MUST have its scripts checked; got accept"
     )
-    assert err == ""
+    assert "Invalid signature for input 0" in err, (
+        f"expected a script/sig rejection from the interpreter, got: {err!r}"
+    )
 
 
 def test_post_flag_full_scripts_rejects_invalid_script_below_checkpoint():
@@ -186,9 +195,11 @@ def test_post_flag_full_scripts_rejects_invalid_script_below_checkpoint():
     )
 
 
-def test_interpreter_actually_invoked_only_with_flag():
-    """Direct proof the script interpreter is invoked ONLY when the flag is set."""
-    # Pre-flag: _verify_input_signature must NOT be called (scripts skipped).
+def test_interpreter_skipped_only_on_caller_assumevalid_verdict():
+    """Direct proof of when the script interpreter runs: by default and with
+    the flag; it is skipped only when the caller passes assumed_valid=True
+    and the flag is off.  (Replaces a test that asserted the height-only skip:
+    the interpreter used NOT to run by default below the checkpoint.)"""
     v, db = _make_validator()
     block = _build_block()
     common = dict(
@@ -207,10 +218,21 @@ def test_interpreter_actually_invoked_only_with_flag():
                 v.tx_validator, "_verify_input_signature", wraps=v.tx_validator._verify_input_signature
             ) as spy:
         v.validate_block(block, force_check_scripts=False, **common)
-        assert spy.call_count == 0, "assume-valid must NOT invoke the script interpreter"
+        assert spy.call_count >= 1, (
+            "default (no assumevalid verdict) must invoke the script interpreter"
+        )
 
+        spy.reset_mock()
         v.validate_block(block, force_check_scripts=True, **common)
         assert spy.call_count >= 1, "flag must invoke the script interpreter per-input"
+
+        spy.reset_mock()
+        v.validate_block(block, force_check_scripts=False, assumed_valid=True, **common)
+        assert spy.call_count == 0, "assumed_valid=True must skip the script interpreter"
+
+        spy.reset_mock()
+        v.validate_block(block, force_check_scripts=True, assumed_valid=True, **common)
+        assert spy.call_count >= 1, "the flag must override an assumed_valid verdict"
 
 
 def test_blocksync_threads_force_full_scripts_flag():
@@ -228,5 +250,7 @@ def test_blocksync_threads_force_full_scripts_flag():
     assert "force_check_scripts=self.force_full_scripts" in src, (
         "drain path must forward force_full_scripts into validate_block"
     )
-    # And it must suppress the Rust fast-path skip when the flag is set.
-    assert "and not self.force_full_scripts" in src
+    # And it must suppress the Rust fast-path skip when the flag is set: the
+    # assumevalid decision is only consulted when the flag is off.
+    assert "if not self.force_full_scripts:" in src
+    assert "self._assumevalid_skip(" in src

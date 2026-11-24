@@ -55,7 +55,7 @@ On mainnet, `start` asks for confirmation if `sync` has not finished, unless `--
 | `--cfilter N` | none | `1` is the same as `--blockfilterindex`, `0` turns it off. |
 | `--coinstatsindex` / `--nocoinstatsindex` | off | Keep per-height UTXO statistics, so `gettxoutsetinfo` can answer for past heights. |
 | `--txospenderindex` / `--notxospenderindex` | off | Index which transaction spent each output, for `gettxspendingprevout` on confirmed spends. |
-| `--assumevalid 0` | not set | Check every script, including blocks at or below the last checkpoint (mainnet 850,000). Any other value keeps the default; a block hash is not accepted as an assumevalid point. |
+| `--assumevalid 0` | not set | Check every script, including ancestors of the assumevalid block (mainnet 938,343). Any other value keeps the default; a block hash is not accepted as an assumevalid point. |
 | `--noassumevalid` | off | Same as `--assumevalid 0`. |
 | `--par N` | `0` | Script-check threads: `0` is one per core (up to 15 extra), `1` is serial, a negative number leaves that many cores free. Core's `-par=N` spelling also works. No effect with `OUROBOROS_NATIVE_SCRIPT=0` (Python interpreter). |
 | `--daemon` | off | Detach from the terminal after startup. Console logging goes off unless `--printtoconsole` is given. |

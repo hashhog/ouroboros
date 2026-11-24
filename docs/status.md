@@ -72,7 +72,7 @@ The same comparison works on mainnet with a fully synced Bitcoin Core. To check 
 3. When ouroboros reaches height 958,794, call `gettxoutsetinfo` on it and compare.
 4. `reconsiderblock` the same block on Core afterwards.
 
-`--noassumevalid` matters: without it, scripts are not checked below height 850,000. A full pass this way takes a long time, because most of ouroboros' validation runs in Python.
+`--noassumevalid` matters: without it, scripts are not checked for ancestors of the assumevalid block (height 938,343). A full pass this way takes a long time, because most of ouroboros' validation runs in Python.
 
 The README's result was produced in pieces: the chain was cut into 48 ranges, each range was synced with scripts checked on a datadir loaded from a UTXO snapshot of the range's starting height (`ouroboros import-utxo`, with `HASHHOG_UNSAFE_SNAPSHOT_HEIGHT` for heights that are not built-in assumeUTXO points), and the UTXO hash at the end of each range was compared with Core's at that height. Core's `dumptxoutset` with `rollback=<height>` writes such a snapshot and prints its hash as `txoutset_hash`. `import-utxo` prints the hash it computes from the same file, so the two can be compared directly.
 

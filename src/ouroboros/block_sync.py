@@ -265,6 +265,7 @@ from ouroboros.p2p_messages import (
     InvMessage,
     NetworkMessage,
 )
+from ouroboros import assumevalid
 from ouroboros.config import MIN_BLOCKS_TO_KEEP
 from ouroboros.peer import Peer
 from ouroboros.tx_request import TxRequestTracker
@@ -1084,6 +1085,9 @@ class BlockSync:
         # once true, the anti-DoS work gate is skipped for that peer's headers
         # so the REDOWNLOAD pass can actually commit them.
         self._lowwork_validated: set[str] = set()
+        # Best-header evidence for assumevalid from a PRESYNC walk that passed
+        # through the assumevalid block (see _record_av_presync_proof).
+        self._av_presync_proof: dict | None = None
         # Hard bound on one presync walk.  Core bounds the equivalent state via
         # the commitment budget in HeadersSyncState; this is the same idea in
         # one number — a peer that has served this many valid-PoW headers
@@ -3468,14 +3472,23 @@ class BlockSync:
                 if hasattr(self.peer_manager, "network")
                 else "mainnet"
             )
-            skip_scripts = False
-            if (cross_check or route_only) and rust_available and not self.force_full_scripts:
+            # Core's assumevalid conditions, not height alone (see
+            # _assumevalid_skip).  ``assumed_valid`` is handed to the Python
+            # validator too, so a Rust fallback keeps the same verdict.
+            assumed_valid = False
+            if not self.force_full_scripts:
                 try:
-                    skip_scripts = _sync_module.can_skip_scripts_for_block(
-                        network, new_height, next_hash
+                    assumed_valid, _av_reason = self._assumevalid_skip(
+                        next_hash, new_height
                     )
-                except Exception:
-                    skip_scripts = False
+                except Exception as _av_e:
+                    assumed_valid, _av_reason = False, f"error: {_av_e}"
+                self._note_assumevalid_decision(
+                    new_height, assumed_valid, _av_reason
+                )
+            skip_scripts = bool(
+                assumed_valid and (cross_check or route_only) and rust_available
+            )
             # -assumevalid=0: never route to the Rust fast path (its interpreter
             # is decorative — it does not run scripts).  Forcing skip_scripts
             # False here keeps every block on the Python validator branch below,
@@ -3529,6 +3542,7 @@ class BlockSync:
                             block,
                             known_height=new_height,
                             force_check_scripts=self.force_full_scripts,
+                            assumed_valid=assumed_valid,
                         ),
                         where=f"validate_block h={new_height}",
                     )
@@ -5082,6 +5096,186 @@ class BlockSync:
             return 0
         return (2 ** 256) // (target + 1)
 
+    def _network_name(self) -> str:
+        return (
+            self.peer_manager.network
+            if hasattr(self.peer_manager, "network")
+            else "mainnet"
+        )
+
+    def _queue_end_chainwork(self, tip_cw: int) -> int:
+        """Chainwork of the last header in the validated-header queue.
+
+        Cached on that header's hash: a hash fixes its whole ancestry, so its
+        chainwork does not change as blocks below it connect.
+        """
+        queue = self._validated_headers
+        last_hash = queue[-1][0]
+        cached = getattr(self, "_av_queue_end_cw", None)
+        if cached is not None and cached[0] == last_hash:
+            return cached[1]
+        memo: dict[int, int] = {}
+        total = tip_cw
+        for _h, hdr in queue:
+            b = int(hdr.bits)
+            w = memo.get(b)
+            if w is None:
+                w = memo[b] = self._bits_to_work(b)
+            total += w
+        self._av_queue_end_cw = (last_hash, total)
+        return total
+
+    def _assumevalid_skip(self, block_hash: bytes, height: int) -> tuple[bool, str]:
+        """Core's assumevalid decision for the block the drain is connecting.
+
+        Returns ``(skip_scripts, reason)``.  Mirrors ConnectBlock
+        (validation.cpp): skip only if the block is an ancestor of the
+        assumevalid block and of the best header, the assumevalid block is in
+        the headers, the best header has nMinimumChainWork, and the best
+        header is more than two weeks of work past the block.  The reasons
+        are Core's ``script_check_reason`` strings.
+
+        ouroboros holds a bounded header window (the validated-header queue)
+        instead of Core's full header index, so two pieces of evidence stand
+        in for a lookup Core can always make:
+
+        * ancestry: the block's header chain (the tip-anchored queue,
+          continuity-checked as it was built) reaches the assumevalid block
+          or one of its pinned ancestors (``assumevalid.MAINNET_ANCESTOR_PINS``)
+          at or above the block's height;
+        * best header: either the queue's last header, or the chain a
+          low-work PRESYNC walk proved (``_av_presync_proof``), which is
+          only recorded when that walk passed every pin and the assumevalid
+          block itself.
+
+        Any condition that cannot be shown counts as failed: the block's
+        scripts are checked.
+        """
+        if getattr(self, "force_full_scripts", False):
+            return False, "assumevalid=0 (always verify)"
+        params = assumevalid.params_for(self._network_name())
+        if params is None:
+            return False, "no assumevalid block for this network"
+        if height > params.height:
+            return False, "block height above assumevalid height"
+
+        queue = self._validated_headers
+        tip_hash, tip_height = self.db.get_best_block()
+        if (
+            not queue
+            or queue[0][0] != block_hash
+            or height != int(tip_height) + 1
+            or queue[0][1].prev_blockhash != tip_hash
+        ):
+            return False, "block not in best header chain"
+
+        pin = assumevalid.pin_at_or_above(params, height)
+        if pin is None:  # unreachable: height <= params.height
+            return False, "block not in assumevalid chain"
+        pin_height, pin_hash = pin
+        idx = pin_height - height
+        if idx >= len(queue):
+            return False, "assumevalid chain not yet in headers"
+        if queue[idx][0] != pin_hash:
+            return False, "block not in assumevalid chain"
+
+        tip_cw = int(self.db.get_chainwork_by_height(int(tip_height)) or 0)
+        if tip_cw > 0:
+            # Same correction the G8 gate applies for a datadir whose
+            # post-snapshot chainwork was stored from 0 (0 when not needed).
+            try:
+                tip_cw += int(self._snapshot_chainwork_offset())
+            except Exception:
+                pass
+        if tip_cw <= 0:
+            return False, "no chainwork for the active tip"
+        block_cw = tip_cw + self._bits_to_work(int(queue[0][1].bits))
+
+        # Best-header candidates: (chainwork, its own block proof, has the
+        # assumevalid block on its chain).
+        candidates: list[tuple[int, int, bool]] = []
+        av_idx = params.height - height
+        queue_has_av = av_idx < len(queue) and queue[av_idx][0] == params.block_hash
+        candidates.append((
+            self._queue_end_chainwork(tip_cw),
+            self._bits_to_work(int(queue[-1][1].bits)),
+            queue_has_av,
+        ))
+        proof = getattr(self, "_av_presync_proof", None)
+        if proof is not None and self._presync_proof_descends_from(
+            proof, height, pin_height
+        ):
+            candidates.append((proof["work"], self._bits_to_work(proof["bits"]), True))
+        if not any(c[2] for c in candidates):
+            return False, "assumevalid hash not in headers"
+        # Core's m_best_header: the most-work header we hold.  Every candidate
+        # descends from this block, so the ancestor test is already met.
+        best_cw, best_proof, _ = max(candidates)
+        min_work = int(
+            _sync_module.get_minimum_chain_work(self._network_name()), 16
+        ) if _has_sync_module else 0
+        if min_work <= 0:
+            return False, "no nMinimumChainWork for this network"
+        if best_cw < min_work:
+            return False, "best header chainwork below minimumchainwork"
+        if assumevalid.proof_equivalent_time(
+            best_cw, block_cw, best_proof
+        ) <= assumevalid.TWO_WEEKS_IN_SECONDS:
+            return False, "block too recent relative to best header"
+        return True, "assumevalid"
+
+    def _record_av_presync_proof(self, state: dict) -> None:
+        """Keep a PRESYNC walk that crossed nMinimumChainWork as best-header
+        evidence for _assumevalid_skip, but only if it walked through the
+        assumevalid block and matched every pin on the way.  A walk that
+        swapped in another chain anywhere along it proves nothing here.
+        """
+        if not (state.get("av_seen") and state.get("av_pins_ok")):
+            return
+        proof = {
+            "work": int(state["work"]),
+            "bits": int(state["bits"]),
+            "height": int(state["height"]),
+            "start_height": int(state["start_height"]),
+            "start_hash": bytes(state["start_hash"]),
+        }
+        old = getattr(self, "_av_presync_proof", None)
+        if old is None or proof["work"] >= old["work"]:
+            self._av_presync_proof = proof
+
+    def _presync_proof_descends_from(
+        self, proof: dict, height: int, pin_height: int
+    ) -> bool:
+        """True if the PRESYNC-proven chain descends from the block at
+        *height* (queue slot 0, an ancestor of the pin at *pin_height*).
+
+        The walk matched every pin above its start, so a pin above the start
+        is on the walked chain.  Otherwise the walk's start header must be on
+        this block's own header chain (the queue).
+        """
+        start_h = proof["start_height"]
+        if pin_height > start_h:
+            return True
+        idx = start_h - height
+        queue = self._validated_headers
+        return 0 <= idx < len(queue) and queue[idx][0] == proof["start_hash"]
+
+    def _note_assumevalid_decision(
+        self, height: int, skip: bool, reason: str
+    ) -> None:
+        """Log each change of the assumevalid verdict once, so a sync that
+        stops skipping (or starts) says why."""
+        last = getattr(self, "_av_last_reason", None)
+        if last == reason:
+            return
+        self._av_last_reason = reason
+        logger.info(
+            "assumevalid at height %d: %s (%s)",
+            height,
+            "skipping script checks" if skip else "checking scripts",
+            reason,
+        )
+
     def _snapshot_chainwork_offset(self) -> int:
         """Cached assumeUTXO chainwork correction offset for the G8 gate.
 
@@ -5282,6 +5476,13 @@ class BlockSync:
             "min_work": int(min_work),
             "asked_at": 0.0,
             "started": time.time(),
+            # assumevalid evidence (see _assumevalid_skip): where the walk
+            # began, and whether it has matched every assumevalid pin it
+            # passed and reached the assumevalid block itself.
+            "start_height": int(resume_height),
+            "start_hash": bytes(resume_hash),
+            "av_pins_ok": True,
+            "av_seen": False,
         }
         logger.warning(
             "low-work headers PRESYNC opened on %s: chain work %#x < "
@@ -5320,6 +5521,8 @@ class BlockSync:
             return
 
         network = getattr(self.peer_manager, "network", "mainnet")
+        av_params = assumevalid.params_for(network)
+        av_pins = av_params.pins if av_params is not None else {}
         work = state["work"]
         prev = state["last_hash"]
         height = state["height"]
@@ -5380,6 +5583,12 @@ class BlockSync:
                     self._lowwork_presync.pop(key, None)
                     return
             work += self._bits_to_work(next_bits)
+            pin_hash = av_pins.get(next_height)
+            if pin_hash is not None:
+                if bytes(next_hash) != pin_hash:
+                    state["av_pins_ok"] = False
+                elif next_height == av_params.height:
+                    state["av_seen"] = True
             prev = next_hash
             height = next_height
             bits = next_bits
@@ -5414,6 +5623,7 @@ class BlockSync:
             self._lowwork_presync.pop(key, None)
             self._lowwork_validated.add(key)
             self._reset_unconnecting_headers(peer)
+            self._record_av_presync_proof(state)
             logger.warning(
                 "low-work headers PRESYNC SATISFIED on %s after %d headers: "
                 "work %#x >= nMinimumChainWork %#x — redownloading from our "
