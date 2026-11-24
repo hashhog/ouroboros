@@ -49,9 +49,9 @@ v2transport=1
 # ------------------------------------------------------------------------------
 # Script verification threads (Bitcoin Core -par).
 # 0 = auto (one per core, extra workers capped at 15), 1 = serial,
-# <0 = leave that many cores free. Only the native interpreter
-# (OUROBOROS_NATIVE_SCRIPT=1) parallelises; the Python interpreter
-# holds the GIL so this is a no-op there.
+# <0 = leave that many cores free. Runs the native (Rust) interpreter's
+# check pool, the default; with OUROBOROS_NATIVE_SCRIPT=0 the Python
+# interpreter holds the GIL so this is a no-op there.
 # par=0
 
 # Enable debug logging (0=off, 1=on)

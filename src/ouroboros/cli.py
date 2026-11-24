@@ -553,8 +553,8 @@ def sync(ctx, reset, limit):
     help=(
         "Script verification threads (Bitcoin Core -par). 0 = auto (one per "
         "core, extra workers capped at 15), 1 = serial, <0 = leave that many "
-        "cores free. Default: 0. Only the native interpreter "
-        "(OUROBOROS_NATIVE_SCRIPT=1) actually parallelises — the Python "
+        "cores free. Default: 0. Runs the native (Rust) interpreter's "
+        "check pool, the default; with OUROBOROS_NATIVE_SCRIPT=0 the Python "
         "interpreter holds the GIL, so --par is a no-op there."
     ),
 )

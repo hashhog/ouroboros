@@ -30,28 +30,41 @@ _log = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 # Native (Rust) script interpreter switch
 #
-# ``OUROBOROS_NATIVE_SCRIPT=1`` routes ``ScriptInterpreter.verify`` and the
-# legacy sighash through the byte-exact Core port in
-# ferrous-utils/sync/src/validate/interpreter.rs (exposed by the ``sync``
-# extension as ``ScriptTx`` / ``script_verify`` / ``script_sighash_legacy``).
-# The default is the pure-Python interpreter below, which stays intact as the
-# fallback and as the oracle for the Python-vs-native differential
-# (``tests/native_script_differential.py``). ``--par`` is a no-op on this
-# path (GIL). What it would take to make native the default, and what still
-# blocks it, is ``docs/NATIVE-SCRIPT-DEFAULT.md``.
+# By default ``ScriptInterpreter.verify`` and the legacy sighash run the
+# byte-exact Core port in ferrous-utils/sync/src/validate/interpreter.rs
+# (exposed by the ``sync`` extension as ``ScriptTx`` / ``script_verify`` /
+# ``script_sighash_legacy``), and block validation drains its deferred script
+# checks through the Rust check-queue pool (``sync.script_verify_parallel``),
+# so ``--par`` takes effect.  ``OUROBOROS_NATIVE_SCRIPT=0`` (or ``false`` /
+# ``no`` / ``off``) forces the pure-Python interpreter below, which stays
+# intact as the fallback and as the oracle for the Python-vs-native
+# differential (``tests/native_script_differential.py``); ``--par`` is a no-op
+# there (GIL).  See ``docs/NATIVE-SCRIPT-DEFAULT.md``.
 #
-# FAIL-CLOSED: when the operator asks for native and the extension does not
-# provide it (stale wheel, ABI drift), import fails loudly instead of quietly
-# running Python — a green run that silently measured the wrong interpreter
-# is worse than no run.
+# FAIL-CLOSED: when native is in effect (the default) and the extension does
+# not provide it (stale wheel, ABI drift), import fails loudly instead of
+# quietly running Python -- a green run that silently measured the wrong
+# interpreter is worse than no run.
 # ---------------------------------------------------------------------------
 
 _NATIVE_SCRIPT_ENV = "OUROBOROS_NATIVE_SCRIPT"
 _NATIVE_SCRIPT_ABI = 1
 
 
-def _env_truthy(value: str) -> bool:
-    return value.strip().lower() in ("1", "true", "yes", "on")
+_NATIVE_SCRIPT_OFF = ("0", "false", "no", "off")
+
+
+def _native_script_requested(value: "str | None") -> bool:
+    """``OUROBOROS_NATIVE_SCRIPT`` -> use the native interpreter?
+
+    Unset or empty means native (the default); ``0`` / ``false`` / ``no`` /
+    ``off`` (any case, surrounding spaces ignored) force the Python
+    interpreter.  Any other value keeps native, so a typo cannot silently
+    drop to the slow path.
+    """
+    if value is None:
+        return True
+    return value.strip().lower() not in _NATIVE_SCRIPT_OFF
 
 
 def _load_native_script():
@@ -60,8 +73,9 @@ def _load_native_script():
         import sync as _sync  # noqa: WPS433 (ferrous-utils extension)
     except ImportError as e:  # pragma: no cover - environment failure
         raise RuntimeError(
-            f"{_NATIVE_SCRIPT_ENV} is set but the ferrous-utils `sync` "
-            f"extension is not importable: {e}"
+            "the native script interpreter is in effect (the default) but "
+            f"the ferrous-utils `sync` extension is not importable: {e}; "
+            f"set {_NATIVE_SCRIPT_ENV}=0 to use the Python interpreter"
         ) from e
     abi_fn = getattr(_sync, "script_native_abi", None)
     missing = [
@@ -70,29 +84,31 @@ def _load_native_script():
     ]
     if abi_fn is None or missing:
         raise RuntimeError(
-            f"{_NATIVE_SCRIPT_ENV} is set but the installed `sync` extension "
-            f"({getattr(_sync, '__file__', '?')}) has no native script "
-            f"interpreter (missing: {missing or ['script_native_abi']}); "
-            "rebuild ferrous-utils/sync (maturin build --release) and "
-            "reinstall the wheel"
+            "the native script interpreter is in effect (the default) but the "
+            f"installed `sync` extension ({getattr(_sync, '__file__', '?')}) "
+            "has no native script interpreter (missing: "
+            f"{missing or ['script_native_abi']}); rebuild ferrous-utils/sync "
+            "(maturin build --release) and reinstall the wheel, or set "
+            f"{_NATIVE_SCRIPT_ENV}=0 to use the Python interpreter"
         )
     abi = abi_fn()
     if abi != _NATIVE_SCRIPT_ABI:
         raise RuntimeError(
-            f"{_NATIVE_SCRIPT_ENV} is set but the `sync` native script ABI is "
-            f"{abi}, this code expects {_NATIVE_SCRIPT_ABI}"
+            f"the `sync` native script ABI is {abi}, this code expects "
+            f"{_NATIVE_SCRIPT_ABI}; rebuild ferrous-utils/sync, or set "
+            f"{_NATIVE_SCRIPT_ENV}=0 to use the Python interpreter"
         )
     return _sync
 
 
-_NATIVE_SCRIPT_REQUESTED = _env_truthy(os.environ.get(_NATIVE_SCRIPT_ENV, ""))
+_NATIVE_SCRIPT_REQUESTED = _native_script_requested(os.environ.get(_NATIVE_SCRIPT_ENV))
 _native_sync = _load_native_script() if _NATIVE_SCRIPT_REQUESTED else None
 #: True when ``ScriptInterpreter.verify`` runs the Rust port.
 NATIVE_SCRIPT_ENABLED = _native_sync is not None
 if NATIVE_SCRIPT_ENABLED:
     _log.info(
         "native script interpreter ENABLED (%s=%s, sync=%s)",
-        _NATIVE_SCRIPT_ENV, os.environ.get(_NATIVE_SCRIPT_ENV),
+        _NATIVE_SCRIPT_ENV, os.environ.get(_NATIVE_SCRIPT_ENV, "<unset: default>"),
         getattr(_native_sync, "__file__", "?"),
     )
 
@@ -101,7 +117,7 @@ def _native_sync_module():
     """The ``sync`` module with the native script API, loaded on demand.
 
     Used by the differential harness to reach the native interpreter even
-    when the switch is off (the node itself only consults
+    when the Python interpreter is forced (the node itself only consults
     ``NATIVE_SCRIPT_ENABLED``).
     """
     global _native_sync

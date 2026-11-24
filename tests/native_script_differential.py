@@ -22,8 +22,10 @@ input, which is what lets the native path replace the Python one.
 It also times the real-transaction sources on both sides (--bench-repeat)
 so the speedup is measured on real inputs, not synthetic ones.
 
-Run from the ouroboros repo root with OUROBOROS_NATIVE_SCRIPT unset (the
-harness refuses otherwise — the Python side must be the pure oracle):
+Run from the ouroboros repo root. The native interpreter is the node's
+default, so the harness forces the Python one (OUROBOROS_NATIVE_SCRIPT=0)
+when the variable is unset, and refuses to run when it asks for native —
+the Python side must be the pure oracle:
 
     .venv/bin/python3 tests/native_script_differential.py
     .venv/bin/python3 tests/native_script_differential.py --negative-control
@@ -51,9 +53,14 @@ for p in (str(REPO / "src"), str(PHASEB)):
     if p not in sys.path:
         sys.path.insert(0, p)
 
-if os.environ.get("OUROBOROS_NATIVE_SCRIPT", "").strip():
-    sys.exit("refusing to run with OUROBOROS_NATIVE_SCRIPT set: the Python side "
-             "must be the pure oracle (its sighash would route to native)")
+_native_env = os.environ.get("OUROBOROS_NATIVE_SCRIPT", "").strip()
+if not _native_env:
+    # Unset/empty now means native (the default): opt out explicitly.
+    os.environ["OUROBOROS_NATIVE_SCRIPT"] = "0"
+elif _native_env.lower() not in ("0", "false", "no", "off"):
+    sys.exit(f"refusing to run with OUROBOROS_NATIVE_SCRIPT={_native_env!r}: "
+             "the Python side must be the pure oracle (its sighash would route "
+             "to native); unset it or set it to 0")
 
 import ouroboros.script as oscript  # noqa: E402
 from ouroboros.script import ScriptInterpreter  # noqa: E402

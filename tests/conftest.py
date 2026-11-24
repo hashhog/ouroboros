@@ -1,8 +1,18 @@
 """Shared test fixtures for Ouroboros integration tests."""
 
+import os
 import sys
 import types
 from pathlib import Path
+
+# The native (Rust) script interpreter is the default and fail-closed: with
+# it in effect, importing ouroboros.script refuses a `sync` that has no
+# native script ABI, which the stub below does not have.  Force the Python
+# interpreter for the suite before any ouroboros import (child processes
+# inherit it).  An explicit OUROBOROS_NATIVE_SCRIPT from the caller wins.
+# The default itself is pinned in a clean interpreter by
+# tests/test_perf_fix_native_script_default.py.
+os.environ.setdefault("OUROBOROS_NATIVE_SCRIPT", "0")
 
 # ---------------------------------------------------------------------------
 # Mock the Rust `sync` extension module so pure-Python components can be

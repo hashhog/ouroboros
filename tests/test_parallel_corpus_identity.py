@@ -265,16 +265,22 @@ class TestCorpusDecisionIdentity:
 
 
 class TestNativeDefaultBlockers:
-    def test_native_is_still_opt_in(self):
+    def test_native_is_the_default_with_opt_out(self):
         src = (REPO / "src" / "ouroboros" / "script.py").read_text()
-        assert '_env_truthy(os.environ.get(_NATIVE_SCRIPT_ENV, ""))' in src, (
-            "native default flipped without updating docs/NATIVE-SCRIPT-DEFAULT.md "
+        assert (
+            "_NATIVE_SCRIPT_REQUESTED = "
+            "_native_script_requested(os.environ.get(_NATIVE_SCRIPT_ENV))"
+        ) in src, (
+            "native default changed without updating docs/NATIVE-SCRIPT-DEFAULT.md "
             "and this control"
         )
-        from ouroboros.script import NATIVE_SCRIPT_ENABLED
+        from ouroboros.script import NATIVE_SCRIPT_ENABLED, _native_script_requested
 
-        # Pytest installs the stub before import; auto-enable must not have
-        # silently turned native on against the stub.
+        assert _native_script_requested(None) is True
+        assert _native_script_requested("") is True
+        assert _native_script_requested("0") is False
+        # conftest.py opts out before import (the stub has no native ABI);
+        # the default must not have turned native on against the stub.
         assert NATIVE_SCRIPT_ENABLED is False
 
     def test_par_help_names_native_requirement(self):
@@ -282,7 +288,7 @@ class TestNativeDefaultBlockers:
         from ouroboros.cli import rewrite_core_par_flags
 
         src = inspect.getsource(cli_mod)
-        assert "OUROBOROS_NATIVE_SCRIPT=1" in src
+        assert "OUROBOROS_NATIVE_SCRIPT=0" in src
         assert "GIL" in src
         assert rewrite_core_par_flags(["start", "-par=4"]) == ["start", "--par", "4"]
 

@@ -57,7 +57,7 @@ On mainnet, `start` asks for confirmation if `sync` has not finished, unless `--
 | `--txospenderindex` / `--notxospenderindex` | off | Index which transaction spent each output, for `gettxspendingprevout` on confirmed spends. |
 | `--assumevalid 0` | not set | Check every script, including blocks at or below the last checkpoint (mainnet 850,000). Any other value keeps the default; a block hash is not accepted as an assumevalid point. |
 | `--noassumevalid` | off | Same as `--assumevalid 0`. |
-| `--par N` | `0` | Script-check threads: `0` is one per core (up to 15 extra), `1` is serial, a negative number leaves that many cores free. Core's `-par=N` spelling also works. Only has an effect with `OUROBOROS_NATIVE_SCRIPT=1`. |
+| `--par N` | `0` | Script-check threads: `0` is one per core (up to 15 extra), `1` is serial, a negative number leaves that many cores free. Core's `-par=N` spelling also works. No effect with `OUROBOROS_NATIVE_SCRIPT=0` (Python interpreter). |
 | `--daemon` | off | Detach from the terminal after startup. Console logging goes off unless `--printtoconsole` is given. |
 | `--pid FILE` | `<datadir>/ouroboros.pid` | PID file, removed on clean shutdown. |
 | `--rpc-tls-cert FILE`, `--rpc-tls-key FILE` | none | Serve RPC over HTTPS. Give both or neither. |
@@ -99,8 +99,8 @@ v2transport=1
 |---|---|
 | `OUROBOROS_DATADIR` | Overrides `--data-dir`. |
 | `OUROBOROS_<KEY>` | Overrides a config-file key (see above). |
-| `OUROBOROS_NATIVE_SCRIPT=1` | Verify scripts with the Rust interpreter instead of the Python one. The node refuses to start if the installed extension has no native interpreter. Off by default; the Python interpreter is the reference. |
-| `OUROBOROS_PAR`, `OUROBOROS_SCRIPT_THREADS` | Script-check threads, ahead of `--par`. Native interpreter only. |
+| `OUROBOROS_NATIVE_SCRIPT=0` | Verify scripts with the Python interpreter instead of the Rust one (also `false`, `no`, `off`). Scripts run in the Rust interpreter by default, and the node refuses to start if the installed extension has no native interpreter. The Python interpreter is the differential oracle (`tests/native_script_differential.py`). |
+| `OUROBOROS_PAR`, `OUROBOROS_SCRIPT_THREADS` | Script-check threads, ahead of `--par`. Native interpreter only (the default). |
 | `OUROBOROS_DISABLE_RUST_VALIDATE=1` | Run block-level checks in Python instead of Rust. |
 | `OUROBOROS_UTXO_PREFETCH_THREADS` | Threads that prefetch a block's inputs from RocksDB (default 16; `0` turns it off). |
 | `OUROBOROS_PSBT_V2=1` | Accept version 2 PSBTs (BIP-370) at the RPC layer. Off by default, as in Core. |
@@ -137,7 +137,7 @@ Everything is flat in the datadir, with no per-network subdirectory:
 
 ## Resources
 
-On mainnet, plan for at least the disk space of an unpruned Bitcoin Core node, plus headroom for RocksDB compaction, and a few GB of RAM. Initial block download is much slower than Core's because most validation runs in Python; `OUROBOROS_NATIVE_SCRIPT=1` speeds up script checks.
+On mainnet, plan for at least the disk space of an unpruned Bitcoin Core node, plus headroom for RocksDB compaction, and a few GB of RAM. Initial block download is much slower than Core's because most validation runs in Python. Script checks run in the Rust interpreter by default; `OUROBOROS_NATIVE_SCRIPT=0` moves them to the much slower Python one.
 
 ## Logging and monitoring
 

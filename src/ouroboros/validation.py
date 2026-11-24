@@ -2805,7 +2805,8 @@ class TransactionValidator:
         logger.info(
             "script interpreter: %s",
             f"native (Rust), {resolve_script_check_threads()} check thread(s)"
-            if NATIVE_SCRIPT_ENABLED else "python (serial; GIL, --par is a no-op)",
+            if NATIVE_SCRIPT_ENABLED
+            else "python (OUROBOROS_NATIVE_SCRIPT=0; serial, GIL, --par is a no-op)",
         )
         # Snapshot manager is consulted by the BIP-68 stopgap path
         # (check_sequence_locks) to detect inputs whose prev block is
