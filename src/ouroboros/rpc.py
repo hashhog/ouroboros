@@ -2979,7 +2979,9 @@ class RPCServer:
             network = self.node.config.get('network', network)
 
         pruner = getattr(self.node, "pruner", None)
-        pruned = pruner is not None and pruner.prune_height > 0
+        # Core: obj.pushKV("pruned", IsPruneMode()) — prune mode, not
+        # "something has been pruned".
+        pruned = pruner is not None
 
         # Get softfork/deployment info — use height-keyed cache to avoid
         # calling Rust FFI (get_all_deployments_info) on every request.
@@ -3126,7 +3128,11 @@ class RPCServer:
         }
 
         if pruner is not None:
-            info.update(pruner.get_prune_info())
+            # Core's prune fields only (pruneheight / automatic_pruning /
+            # prune_target_size).  This used to merge get_prune_info(), whose
+            # get_prune_stats() call the chain DB does not have: every
+            # getblockchaininfo on a pruned node raised.
+            info.update(pruner.core_info())
 
         # Add warnings if available
         warnings = []
@@ -4713,6 +4719,9 @@ class RPCServer:
             local_services = self.node.local_services
         elif pm and hasattr(pm, 'local_services'):
             local_services = pm.local_services
+        if getattr(self.node, "pruner", None) is not None:
+            # Core: NODE_NETWORK only when !IsPruneMode() (init.cpp).
+            local_services &= ~1
 
         local_services_hex = f"{local_services:016x}"
 
@@ -10187,13 +10196,14 @@ class RPCServer:
         # enforce the cap when pruning is enabled, where it protects
         # against reorging past the retained undo window (a conservative
         # refusal in lieu of Core's physical missing-undo fatal abort).
+        # Undo is needed only to DISCONNECT, so only that depth is capped:
+        # a 288-deep reorg connects at least 289 blocks, and capping the
+        # connect side too refused it.
         # ----------------------------------------------------------
         disconnect_depth = current_height - common_ancestor_height
         connect_depth = len(chain_to_connect)
         _pruning_on = getattr(self.node, "pruner", None) is not None
-        if _pruning_on and (
-            disconnect_depth > MAX_REORG_DEPTH or connect_depth > MAX_REORG_DEPTH
-        ):
+        if _pruning_on and disconnect_depth > MAX_REORG_DEPTH:
             logger.warning(
                 "submitblock reorg: depth cap exceeded on pruned node — "
                 "disconnect=%d connect=%d retained-undo-window=%d",
@@ -11400,16 +11410,15 @@ class RPCServer:
 
     async def rpc_pruneblockchain(self, height: int) -> int:
         """
-        Prune block data up to the given height.
+        Prune block data up to the given height (Core rpc/blockchain.cpp
+        ``pruneblockchain``).
 
-        Instructs the node to delete old block files (blk*.dat and rev*.dat)
-        up to the specified height.  Block headers and metadata are preserved.
-
-        The actual prune height may be less than requested to maintain the
-        minimum reorg safety margin (288 blocks).
+        Deletes the bodies and undo data of active-chain blocks up to
+        *height*.  Block headers and metadata are preserved.  The last
+        288 blocks below the tip are always kept.
 
         Returns:
-            The height of the last block that was pruned.
+            The height of the highest pruned block, or -1 if none.
         """
         # Core UniValue::getInt fires BEFORE the prune-mode gate, so a
         # string height is -3 even on an unpruned node (r5 probe).
@@ -11420,17 +11429,66 @@ class RPCServer:
                 error={
                     "code": -1,
                     "message": "Cannot prune blocks because node is not "
-                    "in prune mode. Start with -prune=<target_size_mb>.",
+                    "in prune mode.",
                 },
                 id=None,
             )
 
+        def _err(code: int, message: str):
+            return JSONRPCResponse(error={"code": code, "message": message}, id=None)
+
+        if height < 0:
+            return _err(-8, "Negative block height.")
+
         _, best_height = self.node.db.get_best_block()
 
-        # Use the file-based pruner
-        actual_height = pruner.prune_to_height(height, best_height)
+        # Core: a value above 1e9 is a block TIME, resolved to the earliest
+        # block whose time is at least (value - TIMESTAMP_WINDOW).
+        if height > 1_000_000_000:
+            resolved = await asyncio.to_thread(
+                self._earliest_height_at_time, height - 7200, best_height
+            )
+            if resolved is None:
+                return _err(
+                    -8, "Could not find block with at least the specified timestamp."
+                )
+            height = resolved
+
+        if best_height < pruner.prune_after_height:
+            return _err(-1, "Blockchain is too short for pruning.")
+        if height > best_height:
+            return _err(-8, "Blockchain is shorter than the attempted prune height.")
+
+        # Bounded steps, each under the chain lock (no connect or disconnect
+        # while data goes) and off the event loop; the lock is released
+        # between steps, so pruning an archive datadir never wedges the chain.
+        node = self.node
+        while True:
+            async with chain_lock(node if node is not None else self):
+                _, tip_now = self.node.db.get_best_block()
+                actual_height, more = await asyncio.to_thread(
+                    pruner.prune_to_height_step, height, tip_now
+                )
+            if not more:
+                break
+            await asyncio.sleep(0)
         logger.info(f"RPC pruneblockchain: pruned up to height {actual_height}")
         return actual_height
+
+    def _earliest_height_at_time(self, min_time: int, tip_height: int) -> int | None:
+        """Core ``CChain::FindEarliestAtLeast(min_time, 0)``: the lowest
+        active-chain height whose max block time so far (GetBlockTimeMax)
+        is >= *min_time*.  None when no block qualifies."""
+        db = self.node.db
+        running_max = 0
+        for h in range(0, tip_height + 1):
+            ts = db.get_block_timestamp_by_height(h)
+            if ts is None:
+                return None
+            running_max = max(running_max, int(ts))
+            if running_max >= min_time:
+                return h
+        return None
 
     @holds_chain_lock
     async def rpc_invalidateblock(self, blockhash: str) -> None:
@@ -11507,6 +11565,19 @@ class RPCServer:
             raise RpcError(RPC_INVALID_ADDRESS_OR_KEY, "Block not found")
         if is_active and target_h == 0:
             raise HTTPException(status_code=400, detail="Cannot invalidate genesis block")
+        # Pruned node: disconnecting needs each block's body + undo, and the
+        # new tip's body is read to connect the next block.  Below the prune
+        # height neither is stored, so refuse before touching the chainstate
+        # (Core's DisconnectTip fails on the missing data; it never strands
+        # the tip on a block it cannot build on).
+        _pruner = getattr(self.node, "pruner", None)
+        if is_active and _pruner is not None and target_h - 1 < _pruner.prune_height:
+            raise RpcError(
+                -20,  # RPC_DATABASE_ERROR
+                "Block data not available (pruned data): cannot disconnect "
+                f"to height {target_h - 1}, below the prune height "
+                f"{_pruner.prune_height}",
+            )
 
         # Capture the blocks Core's InvalidateBlock will DisconnectTip (the
         # target and everything above it on the active chain): their hashes

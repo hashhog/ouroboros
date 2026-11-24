@@ -6060,6 +6060,42 @@ impl PyBlockchainDB {
         })
     }
 
+    /// Automatic pruning to a disk target (Core ``FindFilesToPrune``):
+    /// delete the bodies + undo of active-chain blocks below the window of
+    /// recent blocks that fits in ``target_bytes``, never touching the last
+    /// ``keep_blocks`` blocks below the tip.  Returns
+    /// ``(heights_pruned, bytes_retained, more)``; ``more`` means the
+    /// bounded step stopped with prunable blocks left.  Releases the GIL.
+    fn prune_to_target(
+        &self,
+        py: Python<'_>,
+        tip_height: u32,
+        target_bytes: u64,
+        keep_blocks: u32,
+    ) -> PyResult<(u32, u64, bool)> {
+        py.allow_threads(|| self.db.prune_to_target(tip_height, target_bytes, keep_blocks))
+            .map_err(|e| {
+                PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(format!("Prune error: {}", e))
+            })
+    }
+
+    /// Manual pruning (``pruneblockchain``): prune up to ``target_height``,
+    /// keeping the last ``keep_blocks`` blocks below the tip.  Returns
+    /// ``(heights_pruned, highest_pruned_height_or_None, more)``; one bounded
+    /// step.  Releases the GIL.
+    fn prune_to_height(
+        &self,
+        py: Python<'_>,
+        target_height: u32,
+        tip_height: u32,
+        keep_blocks: u32,
+    ) -> PyResult<(u32, Option<u32>, bool)> {
+        py.allow_threads(|| self.db.prune_to_height(target_height, tip_height, keep_blocks))
+            .map_err(|e| {
+                PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(format!("Prune error: {}", e))
+            })
+    }
+
     /// Delete raw block data at a single height. Returns True if data was deleted.
     fn prune_block_at_height(&self, height: u32) -> PyResult<bool> {
         self.db.prune_block_at_height(height).map_err(|e| {

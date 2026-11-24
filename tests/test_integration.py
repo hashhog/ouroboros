@@ -1816,13 +1816,14 @@ class TestBlockPruner:
     def test_prune_to_target(self):
         from ouroboros.pruning import BlockPruner
 
-        # 500 blocks × 1 200 000 B ≈ 600 MB total; effective target = 550 MB
-        # (BlockPruner enforces 550 MB minimum).  600 > 550 → pruning occurs.
+        # 500 blocks × 1 200 000 B ≈ 600 MB total; effective target = 550 MiB
+        # (BlockPruner enforces Core's 550 MiB minimum).  600 MB > 576.7 MB
+        # → pruning occurs.
         store = _MockBlockStore(500, block_size=1_200_000)
         pruner = BlockPruner(db=store, target_size_mb=550, keep_blocks=288)
         files_pruned, bytes_freed = pruner.prune_blocks(current_height=499)
         assert bytes_freed > 0
-        assert store.calculate_current_usage() <= 550_000_000
+        assert store.calculate_current_usage() <= 550 * 1024 * 1024
 
     def test_is_pruned(self):
         from ouroboros.pruning import BlockPruner

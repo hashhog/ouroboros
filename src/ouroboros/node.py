@@ -28,6 +28,7 @@ from ouroboros.metrics import (
     update_mempool_metrics,
 )
 from ouroboros.p2p import DEFAULT_MAX_OUTBOUND_FULL_RELAY, PeerManager
+from ouroboros.chainlock import chain_lock
 from ouroboros.pruning import BlockPruner
 from ouroboros.rpc import RPCServer
 from ouroboros.snapshot import SnapshotManager, read_snapshot_metadata
@@ -363,9 +364,10 @@ class BitcoinNode:
                     db=self.db,
                     target_size_mb=prune_mb,
                     keep_blocks=keep,
+                    network=self.network,
                 )
                 logger.info(
-                    f"Block pruning enabled (target {prune_mb} MB, "
+                    f"Block pruning enabled (target {prune_mb} MiB, "
                     f"keep {self.pruner.keep_blocks} blocks)"
                 )
 
@@ -661,6 +663,8 @@ class BitcoinNode:
                 listen=bool(listen_enabled),
                 peer_bloom_filters=peer_bloom_filters,
                 node_compact_filters=self._compact_filters_advertised,
+                # A pruned node must not advertise NODE_NETWORK (BIP-159).
+                node_network_limited=(self.pruner is not None),
                 connect_addrs=connect_addrs,
                 dns_seed=dns_seed_enabled,
                 bind=bind_hosts or None,
@@ -1526,28 +1530,53 @@ class BitcoinNode:
                         except Exception as exp_err:
                             logger.debug(f"Mempool/orphan expiry error: {exp_err}")
 
-                # Run block pruning if enabled
+                # Run block pruning if enabled.  A failure is logged at
+                # ERROR with its traceback: before this, the pass called a
+                # method the chain DB does not have and the AttributeError
+                # was logged at DEBUG, so -prune deleted nothing, silently.
                 if self.pruner is not None:
                     try:
-                        # prune_to_target returns (files_pruned, bytes_freed).
-                        # Previously this code did `if removed > 0` on the
-                        # tuple, which raises TypeError on every trigger and
-                        # was silently swallowed by the surrounding except —
-                        # so auto-pruning never actually fired in production.
-                        # See _pruning-cross-impl-audit-2026-05-05.md (Bug 3).
-                        removed_files, bytes_freed = self.pruner.prune_to_target(
-                            best_height
-                        )
-                        if removed_files > 0:
-                            logger.info(
-                                f"Pruned {removed_files} old block file(s) "
-                                f"({bytes_freed / 1_000_000:.1f} MB freed)"
-                            )
+                        await self._auto_prune()
                     except Exception as prune_err:
-                        logger.debug(f"Pruning error: {prune_err}")
+                        logger.error(
+                            "Block pruning FAILED; this pass stopped "
+                            f"(target {self.pruner.target_size} bytes): "
+                            f"{prune_err!r}",
+                            exc_info=True,
+                        )
 
         except Exception as e:
             logger.error(f"Error in periodic tasks: {e}", exc_info=True)
+
+    # Most bounded prune steps one periodic tick runs (each holds the chain
+    # lock for at most ~1 s; the lock is released between steps).
+    _PRUNE_STEPS_PER_TICK = 30
+
+    async def _auto_prune(self) -> tuple[int, int]:
+        """One automatic prune pass (Core ``FindFilesToPrune`` on flush).
+
+        Each bounded step runs under the chain lock, so no block connects or
+        disconnects while the window is measured and the old data deleted,
+        and off the event loop.  The lock is released between steps, so a
+        first prune of an archive datadir never stalls block connection.
+        The tip is read under the lock.  Returns ``(blocks_pruned,
+        bytes_retained)`` summed over the steps; errors propagate to the
+        caller, which logs them loudly.
+        """
+        pruner = self.pruner
+        if pruner is None:
+            return 0, 0
+        total, retained = 0, 0
+        for _ in range(self._PRUNE_STEPS_PER_TICK):
+            async with chain_lock(self):
+                refresh = getattr(self.db, "refresh_tip_cache", None)
+                _, tip_height = refresh() if callable(refresh) else self.db.get_best_block()
+                pruned, retained = await asyncio.to_thread(pruner.prune_blocks, tip_height)
+            total += pruned
+            if not getattr(pruner, "pending", False):
+                break
+            await asyncio.sleep(0)
+        return total, retained
 
     def _heal_snapshot_base_index(self) -> None:
         """Persist a missing snapshot-base block index on a bootstrapped datadir.

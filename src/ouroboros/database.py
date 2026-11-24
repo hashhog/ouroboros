@@ -1631,6 +1631,38 @@ class BlockchainDatabase:
         """Delete raw block data at *height*. Returns True if removed."""
         return self._db.prune_block_at_height(height)
 
+    def prune_block_data_to_target(
+        self, tip_height: int, target_bytes: int, keep_blocks: int
+    ) -> tuple[int, int, bool]:
+        """One bounded automatic prune step (Core ``FindFilesToPrune``):
+        delete the bodies and undo data of active-chain blocks below the
+        window of recent blocks that fits in *target_bytes*, never the last
+        *keep_blocks* blocks below the tip.  Returns ``(blocks_pruned,
+        bytes_retained, more)``; ``more`` means the step stopped at its bound
+        with prunable blocks left.
+
+        Callers hold the chain lock for the step (no connect or disconnect
+        may run while the window is measured and the old data deleted) and
+        release it between steps."""
+        pruned, retained, more = self._db.prune_to_target(
+            int(tip_height), int(target_bytes), int(keep_blocks)
+        )
+        self._header_cache.clear()
+        return int(pruned), int(retained), bool(more)
+
+    def prune_block_data_to_height(
+        self, target_height: int, tip_height: int, keep_blocks: int
+    ) -> tuple[int, int | None, bool]:
+        """One bounded manual prune step (``pruneblockchain``) toward
+        *target_height*, capped to keep the last *keep_blocks* blocks below
+        the tip.  Returns ``(blocks_pruned, highest_pruned_height or None,
+        more)``.  Same locking contract as ``prune_block_data_to_target``."""
+        pruned, highest, more = self._db.prune_to_height(
+            int(target_height), int(tip_height), int(keep_blocks)
+        )
+        self._header_cache.clear()
+        return int(pruned), (None if highest is None else int(highest)), bool(more)
+
     def get_prune_height(self) -> int:
         """Lowest height whose block body is still available (0 = never pruned)."""
         return self._db.get_prune_height()

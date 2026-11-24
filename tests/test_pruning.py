@@ -93,9 +93,10 @@ class TestBlockPruner:
         assert pruner.keep_blocks == 288
 
     def test_min_target_size_enforced(self, block_store):
-        """Pruner enforces minimum target size of 550 MB."""
+        """Pruner enforces minimum target size of 550 MiB (Core: -prune=N is
+        N * 1024 * 1024 bytes, MIN_DISK_SPACE_FOR_BLOCK_FILES = 550 MiB)."""
         pruner = BlockPruner(block_store, target_size_mb=100, keep_blocks=288)
-        assert pruner.target_size == 550 * 1_000_000
+        assert pruner.target_size == 550 * 1024 * 1024
 
     def test_prune_height_empty_store(self, pruner):
         """Prune height is 0 for empty store."""
@@ -154,7 +155,7 @@ class TestBlockPruner:
         assert "target_size" in info
         assert "keep_blocks" in info
         assert info["keep_blocks"] == 288
-        assert info["target_size"] == 550 * 1_000_000
+        assert info["target_size"] == 550 * 1024 * 1024
 
 
 @pytest.mark.skipif(not HAS_SYNC, reason="sync module not available")
