@@ -31,9 +31,11 @@ not under test are stubbed):
   skips) whose one non-coinbase tx spends a P2PK UTXO with a real
   secp256k1 signature that has ONE BYTE FLIPPED.
 
-    * default (assumevalid unset)         -> accepted  (scripts skipped: CONTROL,
-                                             proves the test reaches the skip
-                                             decision and no earlier gate fires)
+    * default (assumevalid unset)         -> REJECTED  (the block is not an
+                                             ancestor of the assumevalid block,
+                                             so Core checks its scripts; this
+                                             was once accepted by height alone)
+    * default + intact signature          -> accepted  (CONTROL)
     * assumevalid=0 + flipped signature   -> REJECTED "Invalid signature for input 0"
     * assumevalid=0 + intact signature    -> accepted  (CONTROL: the interpreter
                                              runs and the reject above is the
@@ -68,8 +70,9 @@ from ouroboros.validation import BlockValidator, assumevalid_disabled  # noqa: E
 
 BELOW_CHECKPOINT_HEIGHT = 1000  # << mainnet last checkpoint (850000)
 
-# The checkpoint heuristic really does skip scripts at this height (and only
-# there): the test below is meaningless unless this holds.
+# The old height-only rule really does say "skip" at this height (and only
+# there): the default-assumevalid pin below is meaningless unless this holds,
+# since it shows the validator no longer follows that rule.
 assert sync.can_skip_scripts_for_block("mainnet", BELOW_CHECKPOINT_HEIGHT, b"\x00" * 32) is True
 assert sync.can_skip_scripts_for_block("mainnet", 900000, b"\x00" * 32) is False
 
@@ -276,17 +279,31 @@ def _submit(*, assumevalid_zero: bool, flip_signature_byte: bool, skip_scripts: 
 
 
 # ---------------------------------------------------------------------------
-# CONTROL: default assumevalid — the block is accepted because scripts are
-# skipped below the checkpoint.  Proves the fixture reaches the skip decision
-# (no earlier structural gate fires) — without this the REJECT below could be
-# anything.
+# PIN: default assumevalid — a submitted block at a low height is NOT on the
+# assumevalid chain, so its scripts are checked and the flipped-byte signature
+# is REJECTED.  This used to be a control asserting the opposite (accepted,
+# interpreter never ran): the validator skipped scripts for any block at or
+# below the last checkpoint (mainnet 850000) by height alone.  Core skips
+# only for an ancestor of the assumevalid block (validation.cpp ConnectBlock),
+# so a crafted block — or a fork block the P2P side-branch engine reorgs in
+# through this same accept_block — is fully checked.  The intact-signature
+# control below shows the reject is the flipped byte.
 # ---------------------------------------------------------------------------
-def test_control_default_assumevalid_skips_scripts_and_accepts_bad_signature():
+def test_default_assumevalid_checks_scripts_of_block_off_the_assumevalid_chain():
     accepted, err, sig_calls, db = _submit(assumevalid_zero=False, flip_signature_byte=True)
-    assert accepted, (
-        f"default assumevalid must skip scripts below the checkpoint; got reject: {err!r}"
+    assert not accepted, (
+        "default assumevalid MUST check scripts of a block that is not an "
+        "ancestor of the assumevalid block, whatever its height; got accept"
     )
-    assert sig_calls == 0, "assume-valid skip must NOT invoke the script interpreter"
+    assert "Invalid signature for input 0" in err, f"expected the interpreter's reject, got {err!r}"
+    assert sig_calls >= 1, "the script interpreter must actually run"
+    db.connect_block_from_bytes.assert_not_called()
+
+
+def test_control_default_assumevalid_accepts_good_signature():
+    accepted, err, sig_calls, db = _submit(assumevalid_zero=False, flip_signature_byte=False)
+    assert accepted, f"intact signature must pass full verification; got reject: {err!r}"
+    assert sig_calls >= 1
     db.connect_block_from_bytes.assert_called_once()
 
 

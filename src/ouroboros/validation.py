@@ -756,9 +756,9 @@ def assumevalid_disabled(raw_value) -> bool:
     ``ConnectBlock`` sets ``script_check_reason = "assumevalid=0 (always
     verify)"`` and ``fScriptChecks`` is true for EVERY block on EVERY
     acceptance path — P2P and ``submitblock`` alike (validation.cpp:2345-2347,
-    :2494).  Any other value (unset / default / a hash) keeps the skip
-    heuristic.  Hash-pinned assumevalid is not implemented here; the default
-    checkpoint set governs the cut.
+    :2494).  Any other value (unset / default / a hash) keeps Core's default
+    assumevalid block (``ouroboros.assumevalid``).  A user-supplied assumevalid
+    hash is not implemented here.
     """
     if raw_value is None:
         return False
@@ -822,14 +822,14 @@ class BlockValidator:
         self.db = db
         self.network = network
         # Node-wide ``-assumevalid=0`` switch (Core parity, see
-        # ``assumevalid_disabled``).  When True, ``validate_block`` never
-        # consults the checkpoint script-skip heuristic and ALWAYS runs full
-        # per-input script verification, on every path that reaches this
-        # validator (submitblock / submitblockbatch / generatetoaddress via
+        # ``assumevalid_disabled``).  When True, ``validate_block`` ignores
+        # an ``assumed_valid=True`` caller and ALWAYS runs full per-input
+        # script verification, on every path that reaches this validator
+        # (submitblock / submitblockbatch / generatetoaddress via
         # rpc.accept_block, the P2P drain, the pure-Python reorg fallback).
-        # Set by ``Node.start`` from the operator's config; default False
-        # preserves production skip-below-checkpoint behaviour for every
-        # other constructor (unit tests, the differential shim).
+        # Set by ``Node.start`` from the operator's config.  With it False,
+        # scripts are still checked unless the caller passes
+        # ``assumed_valid=True`` (only the IBD drain does).
         self.force_full_scripts = False
         self.tx_validator = TransactionValidator(db, network, snapshot_manager=snapshot_manager)
         # Snapshot manager is consulted when prev_block lookup misses --
@@ -1115,6 +1115,7 @@ class BlockValidator:
         skip_pow: bool = False,
         force_check_scripts: bool = False,
         current_time: int = 0,
+        assumed_valid: bool = False,
     ) -> tuple[bool, str]:
         """Fully validate *block* (header, merkle root, weight, scripts); returns ``(ok, error_message)``.
 
@@ -1132,13 +1133,17 @@ class BlockValidator:
         an already-PoW-checked block passes ``fCheckPOW=false``).  Default
         False preserves the current production behaviour (PoW always checked).
 
-        *force_check_scripts*: when True, override the assume-valid /
-        checkpoint script-skip heuristic and ALWAYS run full script
-        verification regardless of height.  Default False preserves the current
-        production behaviour (script skip governed by
-        ``sync.can_skip_scripts_for_block``).  Used by the differential
+        *force_check_scripts*: when True, ALWAYS run full script verification,
+        even when *assumed_valid* is True.  Used by the differential
         validate-only checkblock harness so a dead script-gate cannot mask a
         consensus divergence below the assume-valid cut.
+
+        *assumed_valid*: the caller's verdict that this block meets Core's
+        assumevalid conditions (an ancestor of the assumevalid block and of a
+        best header with at least nMinimumChainWork, more than two weeks of
+        work below it; see ``ouroboros.assumevalid``).  Only then are script
+        checks skipped.  Default False: scripts are checked, whatever the
+        height.  Ignored under -assumevalid=0 (``force_full_scripts``).
 
         *current_time*: when > 0, use this Unix timestamp as the "now" the
         time-too-new gate compares against, instead of the wall-clock
@@ -1399,10 +1404,17 @@ class BlockValidator:
             if tx.is_coinbase:
                 return False, "bad-cb-multiple"
 
-        # Determine if script validation can be skipped (assume-valid).
-        # During IBD, blocks below the last checkpoint have their PoW and
-        # merkle root already verified above — script verification is the
-        # dominant cost and can be safely skipped.
+        # Determine if script validation can be skipped (assumevalid).
+        #
+        # Only the caller can know whether this block is an ancestor of the
+        # assumevalid block and of a best header with enough work (Core
+        # ConnectBlock, validation.cpp; see ouroboros.assumevalid).  Height
+        # alone is not evidence: this used to skip every block at or below
+        # the last checkpoint (mainnet 850000), so a fork block reorged in
+        # through submitblock or the P2P side-branch engine connected with
+        # its scripts unchecked.  Scripts are therefore checked unless the
+        # caller passes assumed_valid=True after making Core's checks
+        # (BlockSync._assumevalid_skip, the IBD drain).
         skip_scripts = False
         if force_check_scripts or getattr(self, "force_full_scripts", False):
             # Differential validate-only harness (force_check_scripts) or the
@@ -1414,18 +1426,12 @@ class BlockValidator:
             # submitblock path (rpc.accept_block -> validate_block) skipped
             # scripts below the checkpoint even with --assumevalid 0.
             skip_scripts = False
-        elif _has_sync_module:
-            try:
-                block_hash_bytes = block.hash if isinstance(block.hash, bytes) else bytes.fromhex(block.hash)
-                skip_scripts = _sync_module.can_skip_scripts_for_block(
-                    self.network, expected_height, block_hash_bytes
+        elif assumed_valid:
+            skip_scripts = True
+            if expected_height % 10000 == 0:
+                logger.info(
+                    f"Assume-valid: skipping script verification at height {expected_height}"
                 )
-                if skip_scripts and expected_height % 10000 == 0:
-                    logger.info(
-                        f"Assume-valid: skipping script verification at height {expected_height}"
-                    )
-            except Exception:
-                skip_scripts = False
 
         # 9. Validate all transactions.
         # Build a temporary view of outputs created by earlier txs in this

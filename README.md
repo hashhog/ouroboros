@@ -48,7 +48,7 @@ The first `curl` prints the regtest genesis state (`"chain":"regtest","blocks":0
 | regtest | `--network regtest` | 18444 | 18443 |
 | signet | `--network signet` (not tested) | 38333 | 38332 |
 
-The suggested ports are Bitcoin Core's. Data goes directly into `--data-dir` (default `~/.ouroboros`), with no per-network subdirectory, so give each network its own datadir. Blocks, the block index and the UTXO set live in one RocksDB database there. For mainnet, plan for at least the disk of an unpruned Bitcoin Core node and a few GB of RAM. By default scripts are not checked for blocks at or below the last checkpoint (mainnet height 850,000); `--noassumevalid` checks every script. A from-genesis mainnet sync is slow, because most validation runs in Python.
+The suggested ports are Bitcoin Core's. Data goes directly into `--data-dir` (default `~/.ouroboros`), with no per-network subdirectory, so give each network its own datadir. Blocks, the block index and the UTXO set live in one RocksDB database there. For mainnet, plan for at least the disk of an unpruned Bitcoin Core node and a few GB of RAM. By default, as in Bitcoin Core, scripts are not checked for ancestors of the assumevalid block (mainnet height 938,343); `--noassumevalid` checks every script. A from-genesis mainnet sync is slow, because most validation runs in Python.
 
 `start` syncs the chain and serves RPC. Every flag, the config file, environment variables and the datadir layout are in [docs/running.md](docs/running.md).
 
