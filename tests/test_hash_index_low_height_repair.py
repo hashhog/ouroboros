@@ -118,13 +118,16 @@ def test_getheaders_locator_at_50_starts_at_51(reopened):
     )
 
 
-def test_second_open_changes_nothing(reopened):
+def test_second_open_changes_nothing(tmp_path):
     """Idempotent: a repaired datadir opens to the same rows."""
     from ouroboros.database import BlockchainDatabase
 
-    bdb, _before, path = reopened
-    rows = {h: tuple(bdb._db.get_block_index_entry(HASHES[h])) for h in range(TIP + 1)}
-    _close(bdb)
+    path = str(tmp_path / "db")
+    _gapped_datadir(path)
+    first = BlockchainDatabase(path)
+    rows = {h: tuple(first._db.get_block_index_entry(HASHES[h])) for h in range(TIP + 1)}
+    _close(first)
+    first = None
     again = BlockchainDatabase(path)
     for h in range(TIP + 1):
         assert tuple(again._db.get_block_index_entry(HASHES[h])) == rows[h], f"height {h}"
