@@ -540,7 +540,7 @@ impl BlockchainDB {
             ),
         }
 
-        // Write the hash-index rows heights 0..107 of an assumeUTXO datadir
+        // Write the hash-index rows heights 0..107 of the mainnet datadir
         // never got.  Bounded (HASH_INDEX_REPAIR_MAX_HEIGHTS point reads),
         // idempotent, never fatal.
         match this.repair_missing_hash_index_rows(HASH_INDEX_REPAIR_MAX_HEIGHTS, true) {

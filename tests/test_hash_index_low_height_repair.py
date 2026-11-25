@@ -157,3 +157,43 @@ def test_rows_with_no_header_or_body_are_not_invented(tmp_path):
     assert (r["repaired"], r["no_source"]) == (0, 10), r
     assert all(bdb.get_block_height_by_hash(HASHES[h]) is None for h in range(10))
     assert bdb.get_block_height_by_hash(HASHES[10]) == 10
+
+
+def _bare_backfilled(path: str):
+    from ouroboros.database import BlockchainDatabase
+    from ouroboros.header_backfill import backfill_metadata
+
+    bdb = BlockchainDatabase(path)
+    backfill_metadata(bdb, HEADERS, start_height=0, anchor_hash=HASHES[TIP],
+                      network="regtest", base_chainwork=0)
+    bdb._db.update_best_block(HASHES[TIP], TIP)
+    return bdb
+
+
+def test_header_that_does_not_hash_to_the_key_is_refused(tmp_path):
+    """A HEADERS_CF row for height 5 whose bytes do not hash to the active
+    hash (wrong nonce) must not become a hash-index row."""
+    bdb = _bare_backfilled(str(tmp_path / "db"))
+    bdb._db.delete_hash_index_row_for_test(HASHES[5])
+    bdb._db.store_raw_header(HASHES[5], HEADERS[5][:76] + b"\xff\xff\xff\xff", 0)
+    r = bdb._db.repair_missing_hash_index_rows()
+    assert (r["repaired"], r["refused"]) == (0, 1), r
+    assert bdb.get_block_height_by_hash(HASHES[5]) is None
+
+
+def test_header_that_does_not_link_to_the_height_below_is_refused(tmp_path):
+    """The header at height 5 hashes to its key, but the active-chain hash at
+    height 4 is not its parent (height row 4 is overwritten with another
+    hash): the row is not written."""
+    bdb = _bare_backfilled(str(tmp_path / "db"))
+    bdb.store_block_metadata_persistent(4, b"\x44" * 32, 1, 1)
+    bdb._db.delete_hash_index_row_for_test(HASHES[5])
+    bdb._db.store_raw_header(HASHES[5], HEADERS[5], 0)
+    r = bdb._db.repair_missing_hash_index_rows()
+    assert (r["repaired"], r["refused"]) == (0, 1), r
+    assert bdb.get_block_height_by_hash(HASHES[5]) is None
+    # Control: with the parent restored the same header is accepted.
+    bdb.store_block_metadata_persistent(4, HASHES[4], 1, 1)
+    r = bdb._db.repair_missing_hash_index_rows()
+    assert r["repaired"] == 1, r
+    assert bdb.get_block_height_by_hash(HASHES[5]) == 5
