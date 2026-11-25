@@ -128,3 +128,29 @@ def test_second_open_changes_nothing(reopened):
     again = BlockchainDatabase(path)
     for h in range(TIP + 1):
         assert tuple(again._db.get_block_index_entry(HASHES[h])) == rows[h], f"height {h}"
+
+
+def test_repair_reports_counts_and_a_second_run_writes_nothing(reopened):
+    bdb, _before, _ = reopened
+    r = bdb._db.repair_missing_hash_index_rows()
+    assert r["repaired"] == 0 and r["no_source"] == 0 and r["refused"] == 0, r
+    assert r["scanned"] == TIP + 1 and r["present"] == TIP + 1, r
+
+
+def test_rows_with_no_header_or_body_are_not_invented(tmp_path):
+    """Negative control: the bare #52 shape (heights and hashes, no body, no
+    header anywhere) with hash rows missing stays missing; the repair counts
+    them as no_source and writes nothing."""
+    from ouroboros.database import BlockchainDatabase
+    from ouroboros.header_backfill import backfill_metadata
+
+    bdb = BlockchainDatabase(str(tmp_path / "db"))
+    backfill_metadata(bdb, HEADERS, start_height=0, anchor_hash=HASHES[TIP],
+                      network="regtest", base_chainwork=0)
+    bdb._db.update_best_block(HASHES[TIP], TIP)
+    for h in range(10):
+        bdb._db.delete_hash_index_row_for_test(HASHES[h])
+    r = bdb._db.repair_missing_hash_index_rows()
+    assert (r["repaired"], r["no_source"]) == (0, 10), r
+    assert all(bdb.get_block_height_by_hash(HASHES[h]) is None for h in range(10))
+    assert bdb.get_block_height_by_hash(HASHES[10]) == 10

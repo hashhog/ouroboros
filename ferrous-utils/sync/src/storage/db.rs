@@ -118,6 +118,27 @@ pub struct IndexHeaderFillStep {
     pub peer_run: Vec<(u32, [u8; 32])>,
 }
 
+/// Counts from `BlockchainDB::repair_missing_hash_index_rows`.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct HashIndexRepair {
+    /// Heights visited (each has a height row).
+    pub scanned: u64,
+    /// Heights whose hash-index row already existed.
+    pub present: u64,
+    /// Rows written (or, without `write`, that would be written).
+    pub repaired: u64,
+    /// No local header or body for the hash: left missing.
+    pub no_source: u64,
+    /// A stored header/body that does not verify, or whose parent is not the
+    /// block one height below: left missing.
+    pub refused: u64,
+}
+
+/// Heights `repair_missing_hash_index_rows` visits at open: the gap this
+/// repairs is 0..107 on mainnet; one point read each, so a healthy datadir
+/// pays ~4k reads once per open.
+pub const HASH_INDEX_REPAIR_MAX_HEIGHTS: u32 = 4096;
+
 /// What a local store holds for a header-less hash-index entry.
 enum LocalIndexHeader {
     /// A verified header: `(header, nTx, from_body)`.
@@ -519,6 +540,21 @@ impl BlockchainDB {
             ),
         }
 
+        // Write the hash-index rows heights 0..107 of an assumeUTXO datadir
+        // never got.  Bounded (HASH_INDEX_REPAIR_MAX_HEIGHTS point reads),
+        // idempotent, never fatal.
+        match this.repair_missing_hash_index_rows(HASH_INDEX_REPAIR_MAX_HEIGHTS, true) {
+            Ok(r) if r.repaired > 0 || r.no_source > 0 || r.refused > 0 => log::warn!(
+                "hash-index low-height repair: scanned={} present={} repaired={} \
+                 no_source={} refused={}",
+                r.scanned, r.present, r.repaired, r.no_source, r.refused
+            ),
+            Ok(_) => {}
+            Err(e) => log::error!(
+                "hash-index low-height repair failed: {} — will retry next open", e
+            ),
+        }
+
         Ok(this)
     }
 
@@ -769,6 +805,82 @@ impl BlockchainDB {
         let mut p = [0u8; 32];
         p.copy_from_slice(prev);
         Ok(matches!(self.get_block_metadata_by_hash(&p)?, Some(m) if m.height + 1 == height))
+    }
+
+    /// Write the hash-index row of every low active-chain height that has a
+    /// height row but no hash row (the pre-5f78633 IBD stub left heights
+    /// 0..107 of the mainnet datadir like that; the #52 backfill only fills
+    /// above them).  Core: every `CBlockIndex` is in `m_block_index`.
+    ///
+    /// Visits heights `0..max_heights` (stopping at the first height with no
+    /// height row).  For a height whose hash row is missing, the row is
+    /// written only when a local header verifies (`local_index_header`: it
+    /// hashes to the key, and a body must parse and match its merkle root)
+    /// and its parent is the active-chain hash one height below.  Chainwork,
+    /// time and status come from the height row, unchanged, with
+    /// BLOCK_HAVE_DATA added when the body is in BLOCKS_CF (the status
+    /// `connect_block_from_bytes` writes); the header and nTx come from the
+    /// verified source.  Existing hash rows are never touched, so the pass is
+    /// idempotent; rows are written in one atomic batch.  Never deletes.
+    pub fn repair_missing_hash_index_rows(
+        &self,
+        max_heights: u32,
+        write: bool,
+    ) -> Result<HashIndexRepair> {
+        let index_cf = self.db.cf_handle(BLOCK_INDEX_BY_HASH_CF)
+            .ok_or_else(|| DbError::ColumnFamilyNotFound(BLOCK_INDEX_BY_HASH_CF.to_string()))?;
+        let blocks_cf = self.db.cf_handle(BLOCKS_CF)
+            .ok_or_else(|| DbError::ColumnFamilyNotFound(BLOCKS_CF.to_string()))?;
+        let mut out = HashIndexRepair::default();
+        let mut batch = WriteBatch::default();
+        let mut scratch = IndexHeaderFillStep::default();
+        let mut prev: Option<[u8; 32]> = None;
+        for h in 0..max_heights {
+            let hash = match self.get_block_hash_by_height(h)? {
+                Some(x) => x,
+                None => break,
+            };
+            out.scanned += 1;
+            let parent = prev.replace(hash);
+            if self.db.get_pinned_cf(index_cf, hash)?.is_some() {
+                out.present += 1;
+                continue;
+            }
+            let Some(mut md) = self.get_block_metadata(h)? else {
+                out.refused += 1;
+                continue;
+            };
+            let (header, n_tx) = match self.local_index_header(&hash, &mut scratch)? {
+                LocalIndexHeader::Found(header, n_tx, _) => (header, n_tx),
+                LocalIndexHeader::Refused => {
+                    out.refused += 1;
+                    continue;
+                }
+                LocalIndexHeader::NoSource => {
+                    out.no_source += 1;
+                    continue;
+                }
+            };
+            let links = match parent {
+                None => header[4..36].iter().all(|&b| b == 0),
+                Some(p) => header[4..36] == p[..],
+            };
+            if !links {
+                out.refused += 1;
+                continue;
+            }
+            if self.db.get_pinned_cf(blocks_cf, hash)?.is_some() {
+                md.status.set_has_data();
+            }
+            let md_bytes = md.to_bytes()
+                .map_err(|e| DbError::Serialization(SerializeError::Encode(format!("{}", e))))?;
+            batch.put_cf(index_cf, hash, v2_value(&md_bytes, &header, n_tx));
+            out.repaired += 1;
+        }
+        if write && out.repaired > 0 {
+            self.db.write(batch)?;
+        }
+        Ok(out)
     }
 
     /// TEST SUPPORT: delete one hash-index row, leaving the height row, the

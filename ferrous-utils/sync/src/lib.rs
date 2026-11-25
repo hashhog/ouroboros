@@ -3415,6 +3415,31 @@ impl PyBlockchainDB {
         }
     }
 
+    /// Write the hash-index rows of low heights that have a height row but
+    /// no hash row (``BlockchainDB::repair_missing_hash_index_rows``; the
+    /// open already runs it).  Returns ``{scanned, present, repaired,
+    /// no_source, refused}``; with ``write=False`` nothing is written.
+    #[pyo3(signature = (max_heights=4096, write=true))]
+    fn repair_missing_hash_index_rows(
+        &self,
+        py: Python<'_>,
+        max_heights: u32,
+        write: bool,
+    ) -> PyResult<std::collections::HashMap<String, u64>> {
+        let r = py
+            .allow_threads(|| self.db.repair_missing_hash_index_rows(max_heights, write))
+            .map_err(|e| {
+                PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(format!("Database error: {}", e))
+            })?;
+        Ok(std::collections::HashMap::from([
+            ("scanned".to_string(), r.scanned),
+            ("present".to_string(), r.present),
+            ("repaired".to_string(), r.repaired),
+            ("no_source".to_string(), r.no_source),
+            ("refused".to_string(), r.refused),
+        ]))
+    }
+
     /// TEST SUPPORT: delete the hash-index row of ``block_hash`` (see
     /// ``BlockchainDB::delete_hash_index_row_for_test``).
     fn delete_hash_index_row_for_test(&self, block_hash: &[u8]) -> PyResult<()> {
