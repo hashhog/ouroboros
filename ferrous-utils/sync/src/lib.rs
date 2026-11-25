@@ -3415,6 +3415,21 @@ impl PyBlockchainDB {
         }
     }
 
+    /// TEST SUPPORT: delete the hash-index row of ``block_hash`` (see
+    /// ``BlockchainDB::delete_hash_index_row_for_test``).
+    fn delete_hash_index_row_for_test(&self, block_hash: &[u8]) -> PyResult<()> {
+        if block_hash.len() != 32 {
+            return Err(PyErr::new::<pyo3::exceptions::PyValueError, _>(
+                "Block hash must be 32 bytes"
+            ));
+        }
+        let mut h = [0u8; 32];
+        h.copy_from_slice(block_hash);
+        self.db.delete_hash_index_row_for_test(&h).map_err(|e| {
+            PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(format!("Database error: {}", e))
+        })
+    }
+
     /// ``(total, v2, legacy)`` entry counts of the hash index (full scan).
     fn block_index_summary(&self) -> PyResult<(u64, u64, u64)> {
         self.db.block_index_summary().map_err(|e| {

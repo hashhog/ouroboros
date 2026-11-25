@@ -771,6 +771,17 @@ impl BlockchainDB {
         Ok(matches!(self.get_block_metadata_by_hash(&p)?, Some(m) if m.height + 1 == height))
     }
 
+    /// TEST SUPPORT: delete one hash-index row, leaving the height row, the
+    /// body and everything else.  Production never deletes index rows; this
+    /// builds the datadir shape the pre-5f78633 IBD stub left (height rows,
+    /// no hash rows) for tests of `repair_missing_hash_index_rows`.
+    pub fn delete_hash_index_row_for_test(&self, hash: &[u8; 32]) -> Result<()> {
+        let cf = self.db.cf_handle(BLOCK_INDEX_BY_HASH_CF)
+            .ok_or_else(|| DbError::ColumnFamilyNotFound(BLOCK_INDEX_BY_HASH_CF.to_string()))?;
+        self.db.delete_cf(cf, hash)?;
+        Ok(())
+    }
+
     /// Resume points of the online header fill: `(height, key, key_pass_done)`.
     pub fn index_header_fill_cursor(&self) -> Result<(Option<u32>, Option<[u8; 32]>, bool)> {
         let meta_cf = self.db.cf_handle(META_CF)
