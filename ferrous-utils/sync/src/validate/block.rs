@@ -665,9 +665,13 @@ impl BlockValidator {
         // BIP30 is re-enabled regardless of network or BIP34 status.
         const BIP30_RECHECK_HEIGHT: u32 = 1_983_702;
 
-        // BIP30 canonical-hash tables (internal LE byte order). Stored as
-        // hex strings so we can fall back to runtime decoding without a
-        // hex_literal dep. Decoding here is one-shot and cheap.
+        // BIP30 canonical-hash tables. The literals are Core's display
+        // (big-endian) hashes — `uint256{"..."}` in chainparams.cpp /
+        // validation.cpp — so `decode_hash` reverses them into the internal
+        // little-endian order that `block_hash().as_byte_array()` and the
+        // block index carry. Without the reversal neither the IsBIP30Repeat
+        // exemption nor the BIP34 suppression could ever match, and mainnet
+        // blocks 91842 / 91880 were rejected as Bip30DuplicateTxid.
         const BIP30_REPEAT_HASH_91842: &str =
             "00000000000a4d0a398161ffc163c503763b1f4360639393e0e4c8e300e0caec";
         const BIP30_REPEAT_HASH_91880: &str =
@@ -681,6 +685,7 @@ impl BlockValidator {
             let bytes = hex::decode(s).expect("compile-time hex constant decodes");
             let mut out = [0u8; 32];
             out.copy_from_slice(&bytes);
+            out.reverse(); // display order -> internal order
             out
         }
 
@@ -715,18 +720,21 @@ impl BlockValidator {
             _ => None,
         };
 
+        // Strictly above: Core reads `pindex->pprev->GetAncestor(BIP34Height)`,
+        // which is null for the block AT BIP34Height, so BIP30 is still
+        // enforced there.
         let suppress_by_bip34 = if height < BIP30_RECHECK_HEIGHT
-            && height >= bip34_height
+            && height > bip34_height
         {
             match bip34_canonical_hash {
                 Some(expected) => {
                     // Look up the block on the canonical chain at the BIP34
                     // height; only suppress when it matches the canonical
                     // hash. (Core: `pindexBIP34height->GetBlockHash() == BIP34Hash`.)
-                    match self.db.get_block_by_height(bip34_height) {
-                        Ok(Some(bw)) => {
-                            *bw.block_hash().as_byte_array() == expected
-                        }
+                    // The index row's hash, not the body: once the compare
+                    // can match it runs for every block in the window.
+                    match self.db.get_block_hash_by_height(bip34_height) {
+                        Ok(Some(hash)) => hash == expected,
                         // DB miss → conservatively keep enforcing BIP30.
                         _ => false,
                     }

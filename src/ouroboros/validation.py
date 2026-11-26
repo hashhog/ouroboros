@@ -1355,17 +1355,19 @@ class BlockValidator:
             bip34_height = bip34_dep.height if bip34_dep is not None else 227_931
             bip34_canon_hash = BIP34_HASHES.get(self.network, bytes(32))
             # We can skip BIP30 only when:
-            #   (a) we are at or above the BIP34 activation height, AND
+            #   (a) we are ABOVE the BIP34 activation height — Core reads
+            #       pindex->pprev->GetAncestor(BIP34Height), which is null for
+            #       the block AT that height, so BIP30 is still enforced there;
             #   (b) the block stored at BIP34Height has the canonical hash.
             # Condition (b) is approximated here by checking whether our
-            # ancestor's hash record matches — the database callback
-            # db.get_block_hash_at_height provides this lookup.
+            # ancestor's hash record matches — db.get_block_hash_by_height
+            # (internal byte order) provides this lookup.
             # If the DB cannot supply the hash, we conservatively keep BIP30.
-            if expected_height >= bip34_height:
+            if expected_height > bip34_height:
                 ancestor_hash: bytes | None = None
-                if hasattr(self.db, "get_block_hash_at_height"):
+                if hasattr(self.db, "get_block_hash_by_height"):
                     try:
-                        ancestor_hash = self.db.get_block_hash_at_height(bip34_height)
+                        ancestor_hash = self.db.get_block_hash_by_height(bip34_height)
                     except Exception:
                         ancestor_hash = None
                 # Only suppress BIP30 when the canonical hash is non-zero AND
