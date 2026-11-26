@@ -1105,9 +1105,14 @@ fn check_signature_encoding(sig: &[u8], flags: u32) -> ScriptResult<()> {
         && !is_valid_signature_encoding(sig)
     {
         return Err(ScriptError::SigDer);
-    } else if (flags & SCRIPT_VERIFY_LOW_S) != 0 {
+    }
+    // Core: `else if (LOW_S && !IsLowDERSignature(...))` — the arm is taken
+    // only when the signature is high-S, so a low-S signature still reaches
+    // the STRICTENC hashtype check below.
+    if (flags & SCRIPT_VERIFY_LOW_S) != 0 {
         is_low_der_signature(sig)?;
-    } else if (flags & SCRIPT_VERIFY_STRICTENC) != 0 && !is_defined_hashtype_signature(sig) {
+    }
+    if (flags & SCRIPT_VERIFY_STRICTENC) != 0 && !is_defined_hashtype_signature(sig) {
         return Err(ScriptError::SigHashtype);
     }
     Ok(())
