@@ -1985,3 +1985,171 @@ mod tests {
     }
 }
 
+
+/// BIP30 exception and BIP34-suppression hashes (verify-neon-ouroboros-findings
+/// #7).  Core compares `pindex->GetBlockHash()` against `uint256{"<display
+/// hex>"}`, whose bytes are the REVERSED display string; these tests feed the
+/// real mainnet blocks (fetched from Core v31.1 with `getblock <hash> 0` and
+/// `getblockheader <hash> false`) so the comparison is checked against the
+/// hash the validator actually computes, not against another copy of the
+/// constant.
+#[cfg(test)]
+mod bip30_repeat_tests {
+    use super::*;
+    use bitcoin::hashes::Hash as _;
+    use tempdir::TempDir;
+
+    /// Mainnet block 91842 (00000000000a4d0a…e0caec), one transaction.
+    const BLOCK_91842: &str = "0100000020114beba985ecbf1351bf5f4d5495105dc2ca94f5bdbcac921e0a00000000009985d82954e10f2233a08905dc7b490eb444660c8759e324c7dfa3d28779d2d5f34ee04c56720e1b021838e10101000000010000000000000000000000000000000000000000000000000000000000000000ffffffff060456720e1b00ffffffff0100f2052a010000004341046896ecfc449cb8560594eb7f413f199deb9b4e5d947a142e7dc7d2de0b811b8e204833ea2a2fd9d4c7b153a8ca7661d0a0b7fc981df1f42f55d64b26b3da1e9cac00000000";
+    /// Mainnet block 91880 (00000000000743f1…7cd721), two transactions.
+    const BLOCK_91880: &str = "01000000f3f32d77f94d5e971e202afa4a633056b2b14dda3f4abf569609040000000000e90f74856c0ed42ab7eea359487079e3f76e4076f91250fab8431f6241f56b2f8380e04c56720e1b1c467e890201000000010000000000000000000000000000000000000000000000000000000000000000ffffffff060456720e1b00ffffffff0100f2052a01000000434104124b212f5416598a92ccec88819105179dcb2550d571842601492718273fe0f2179a9695096bff94cd99dcccdea7cd9bd943bfca8fea649cac963411979a33e9ac000000000100000001e347459d80c56ae0bc0bfdd3dbc252c2019114419ac945deb11954a19746e2ca010000008b48304502204b26cc103a2c92295c217848b8425a8d9612d1d2e98133f5b5a5268a108069ab022100f449acb15a3cfc83657a66cd49e5d8fc6c46b2a52ed899f94f4e4da9ad8ca93a0141046554f9d515c996b209e48ae07bec74b424cab1fc1e658c1e87d0169628a6ae45abcbc1c7fb5f14f0f6e8aa3b3fd386735fc76eef8c447c044abdcafba95e8b7affffffff02c0475269000000001976a9142dd5dd5d96006ff246bfc169b8bfcf6f76935d2088ac4018b5a1000000001976a914d7895813489a508c334e881546e919b1cbd80b0888ac00000000";
+    /// Mainnet block 227931 header (000000000000024b…0808b8) — Core's BIP34Hash.
+    const HEADER_227931: &str = "02000000d629b6d62e07d09960f1c093dbfea0fa1b049c5b8d4c83b35102000000000000bad87c7cd313c982787729637b1ff4651df74ee34803fe84af74b667f010a2b501fd4f516e81021a160a0594";
+
+    fn fresh_db() -> (TempDir, Arc<BlockchainDB>) {
+        let dir = TempDir::new("bip30_repeat_test").unwrap();
+        let db = Arc::new(BlockchainDB::open(dir.path().to_str().unwrap()).unwrap());
+        (dir, db)
+    }
+
+    fn block(hex_str: &str) -> Block {
+        bitcoin::consensus::deserialize(&hex::decode(hex_str).unwrap()).unwrap()
+    }
+
+    /// Leave every output of `block`'s coinbase unspent in the UTXO set: on
+    /// mainnet the coinbase of 91842 (91880) is byte-identical to the still
+    /// unspent coinbase of 91812 (91722), so this is the real chainstate.
+    fn seed_duplicate_coinbase(db: &Arc<BlockchainDB>, block: &Block) {
+        let cb = &block.txdata[0];
+        let txid = cb.compute_txid();
+        for (vout, out) in cb.output.iter().enumerate() {
+            let op = OutPoint { txid, vout: vout as u32 };
+            let utxo = UTXO::new(
+                OutPointWrapper::new(op),
+                out.value.to_sat(),
+                out.script_pubkey.clone(),
+                Some(91_000),
+                true,
+            );
+            db.add_utxo(&op, &utxo).unwrap();
+        }
+    }
+
+    fn assert_display_hash(block: &Block, display: &str) {
+        assert_eq!(block.block_hash().to_string(), display, "fixture is the real block");
+    }
+
+    #[test]
+    fn test_bip30_repeat_block_91842_is_exempt() {
+        let (_d, db) = fresh_db();
+        let b = block(BLOCK_91842);
+        assert_display_hash(&b, "00000000000a4d0a398161ffc163c503763b1f4360639393e0e4c8e300e0caec");
+        seed_duplicate_coinbase(&db, &b);
+        let v = BlockValidator::new(db, Network::Bitcoin);
+        // Core IsBIP30Repeat: (91842, this hash) is exempt — ConnectBlock skips BIP30.
+        assert!(v.check_bip30(&b, 91_842).is_ok(), "mainnet 91842 is IsBIP30Repeat");
+    }
+
+    #[test]
+    fn test_bip30_repeat_block_91880_is_exempt() {
+        let (_d, db) = fresh_db();
+        let b = block(BLOCK_91880);
+        assert_display_hash(&b, "00000000000743f190a18c5577a3c2d2a1f610ae9601ac046a38084ccb7cd721");
+        seed_duplicate_coinbase(&db, &b);
+        let v = BlockValidator::new(db, Network::Bitcoin);
+        assert!(v.check_bip30(&b, 91_880).is_ok(), "mainnet 91880 is IsBIP30Repeat");
+    }
+
+    /// Controls: the exemption is keyed on (height, hash). A different block
+    /// at 91842, or the real block at another height, is still checked.
+    #[test]
+    fn test_bip30_repeat_exemption_needs_height_and_hash() {
+        let (_d, db) = fresh_db();
+        let b = block(BLOCK_91842);
+        seed_duplicate_coinbase(&db, &b);
+        let v = BlockValidator::new(db, Network::Bitcoin);
+
+        let mut fork = b.clone();
+        fork.header.nonce ^= 1; // different hash, same txs
+        assert!(matches!(
+            v.check_bip30(&fork, 91_842),
+            Err(BlockValidationError::Bip30DuplicateTxid)
+        ));
+        assert!(matches!(
+            v.check_bip30(&b, 91_843),
+            Err(BlockValidationError::Bip30DuplicateTxid)
+        ));
+        // Not mainnet: no exemption at all.
+        let (_d2, db2) = fresh_db();
+        seed_duplicate_coinbase(&db2, &b);
+        let tn = BlockValidator::new(db2, Network::Testnet);
+        assert!(matches!(
+            tn.check_bip30(&b, 91_842),
+            Err(BlockValidationError::Bip30DuplicateTxid)
+        ));
+    }
+
+    /// Put the real 227931 header on the active chain (BLOCK_INDEX_CF) and a
+    /// body for it in BLOCKS_CF, so both the hash lookup and the body lookup
+    /// resolve to Core's BIP34Hash.
+    fn seed_bip34_block(db: &Arc<BlockchainDB>) {
+        let header: bitcoin::block::Header =
+            bitcoin::consensus::deserialize(&hex::decode(HEADER_227931).unwrap()).unwrap();
+        assert_eq!(
+            header.block_hash().to_string(),
+            "000000000000024b89b42a942fe0d9fea3bb44ab7bd1b19115dd6a759c0808b8"
+        );
+        let body = Block { header, txdata: block(BLOCK_91842).txdata };
+        let bw = BlockWrapper::new(body);
+        db.store_block(&bw).unwrap();
+        let md = BlockMetadata::new(227_931, [1u8; 32], header.time);
+        db.store_block_metadata(227_931, header.block_hash().as_byte_array(), &md).unwrap();
+    }
+
+    /// Core: fEnforceBIP30 = !(pindex->pprev->GetAncestor(BIP34Height) &&
+    /// that ancestor's hash == BIP34Hash), so once 227931 is Core's block,
+    /// blocks above it (below BIP34_IMPLIES_BIP30_LIMIT) are not checked.
+    #[test]
+    fn test_bip34_hash_suppresses_bip30_above_bip34_height() {
+        let (_d, db) = fresh_db();
+        seed_bip34_block(&db);
+        let b = block(BLOCK_91842); // any block whose coinbase outputs exist
+        seed_duplicate_coinbase(&db, &b);
+        let v = BlockValidator::new(db, Network::Bitcoin);
+        assert!(
+            v.check_bip30(&b, 227_932).is_ok(),
+            "BIP30 is not enforced above a canonical BIP34 block"
+        );
+        // At BIP34Height itself, pprev->GetAncestor(BIP34Height) is null, so
+        // Core still enforces BIP30 there (strict >).
+        assert!(matches!(
+            v.check_bip30(&b, 227_931),
+            Err(BlockValidationError::Bip30DuplicateTxid)
+        ));
+        // At and above BIP34_IMPLIES_BIP30_LIMIT BIP30 is enforced again.
+        assert!(matches!(
+            v.check_bip30(&b, 1_983_702),
+            Err(BlockValidationError::Bip30DuplicateTxid)
+        ));
+    }
+
+    /// Control: a non-canonical block at 227931 never suppresses BIP30.
+    #[test]
+    fn test_bip34_suppression_needs_the_canonical_hash() {
+        let (_d, db) = fresh_db();
+        let mut header: bitcoin::block::Header =
+            bitcoin::consensus::deserialize(&hex::decode(HEADER_227931).unwrap()).unwrap();
+        header.nonce ^= 1;
+        let body = Block { header, txdata: block(BLOCK_91842).txdata };
+        db.store_block(&BlockWrapper::new(body)).unwrap();
+        let md = BlockMetadata::new(227_931, [1u8; 32], header.time);
+        db.store_block_metadata(227_931, header.block_hash().as_byte_array(), &md).unwrap();
+        let b = block(BLOCK_91842);
+        seed_duplicate_coinbase(&db, &b);
+        let v = BlockValidator::new(db, Network::Bitcoin);
+        assert!(matches!(
+            v.check_bip30(&b, 227_932),
+            Err(BlockValidationError::Bip30DuplicateTxid)
+        ));
+    }
+}
