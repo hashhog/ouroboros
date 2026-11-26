@@ -169,23 +169,36 @@ pub fn compute_merkle_root(txids: &[[u8; 32]]) -> [u8; 32] {
 /// # Returns
 /// Target as U256
 pub fn bits_to_target(bits: u32) -> U256 {
-    let exponent = (bits >> 24) as u8;
-    let mantissa = bits & 0x007fffff;
-
-    if exponent <= 3 {
-        // For small exponents, shift mantissa right
-        U256::from(mantissa) >> (8 * (3 - exponent))
-    } else {
-        // For larger exponents, shift mantissa left
-        U256::from(mantissa) << (8 * (exponent - 3))
-    }
+    set_compact(bits).0
 }
 
 /// Decode compact "bits" with Core's sign and overflow flags:
 /// `(target, negative, overflow)`, as `arith_uint256::SetCompact`
 /// (bitcoin-core/src/arith_uint256.cpp).
+///
+/// * `negative`: the sign bit (0x00800000) is set on a non-zero mantissa.
+/// * `overflow`: the target does not fit in 256 bits.
+///
+/// The value is Core's: the mantissa is shifted as a 256-bit integer, so
+/// bits shifted past bit 255 are dropped (0x23000001 decodes to 0).
 pub fn set_compact(bits: u32) -> (U256, bool, bool) {
-    (bits_to_target(bits), false, false)
+    let size = bits >> 24;
+    let mut word = bits & 0x007f_ffff;
+    let target = if size <= 3 {
+        word >>= 8 * (3 - size);
+        U256::from(word)
+    } else {
+        let shift = 8 * (size - 3);
+        if shift >= 256 {
+            U256::zero()
+        } else {
+            U256::from(word) << shift
+        }
+    };
+    let negative = word != 0 && (bits & 0x0080_0000) != 0;
+    let overflow = word != 0
+        && (size > 34 || (word > 0xff && size > 33) || (word > 0xffff && size > 32));
+    (target, negative, overflow)
 }
 
 /// Convert target (U256) to compact "bits" representation

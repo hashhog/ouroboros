@@ -49,15 +49,35 @@ pub fn bits_to_target(bits: u32) -> U256 {
 /// Core `CheckProofOfWorkImpl` (bitcoin-core/src/pow.cpp): does `hash`
 /// (internal byte order, as double-SHA256 returns it) meet the target that
 /// `bits` encodes, for a chain whose proof-of-work limit is `pow_limit`?
+///
+/// A negative, zero, overflowing or above-`pow_limit` target fails before
+/// the hash is looked at (Core `DeriveTarget`), whatever the hash is.
 pub fn check_proof_of_work(hash: &[u8; 32], bits: u32, pow_limit: U256) -> bool {
-    let _ = pow_limit;
-    U256::from_little_endian(hash) <= bits_to_target(bits)
+    match derive_target(bits, pow_limit) {
+        Some(target) => U256::from_little_endian(hash) <= target,
+        None => false,
+    }
+}
+
+/// Core `DeriveTarget` (bitcoin-core/src/pow.cpp): the target `bits` encodes,
+/// or `None` when it is negative, zero, overflows, or exceeds `pow_limit`.
+pub fn derive_target(bits: u32, pow_limit: U256) -> Option<U256> {
+    let (target, negative, overflow) = common::crypto::set_compact(bits);
+    if negative || target.is_zero() || overflow || target > pow_limit {
+        return None;
+    }
+    Some(target)
 }
 
 /// Core `GetBitsProof` (bitcoin-core/src/chain.cpp): the work a block with
-/// these `bits` adds to its chain.
+/// these `bits` adds to its chain.  Negative, overflowing and zero targets
+/// add nothing.  As in Core there is no powLimit test here.
 pub fn get_bits_proof(bits: u32) -> U256 {
-    calculate_work(bits_to_target(bits))
+    let (target, negative, overflow) = common::crypto::set_compact(bits);
+    if negative || overflow || target.is_zero() {
+        return U256::zero();
+    }
+    calculate_work(target)
 }
 
 /// Calculate the next difficulty target for a 2016-block interval
