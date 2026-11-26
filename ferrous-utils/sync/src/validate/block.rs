@@ -2141,6 +2141,31 @@ mod bip30_repeat_tests {
         ));
     }
 
+    /// Core's check reads only the ancestor's hash (`GetBlockHash()`), never
+    /// the block body. A node holding the 227931 height-index row without the
+    /// body (pruned, or header rows written by header sync) must suppress
+    /// BIP30 the same way; reading the body here used to keep enforcing it.
+    #[test]
+    fn test_bip34_suppression_needs_only_the_index_row() {
+        let (_d, db) = fresh_db();
+        let header: bitcoin::block::Header =
+            bitcoin::consensus::deserialize(&hex::decode(HEADER_227931).unwrap()).unwrap();
+        let md = BlockMetadata::new(227_931, [1u8; 32], header.time);
+        db.store_block_metadata(227_931, header.block_hash().as_byte_array(), &md).unwrap();
+        assert!(db.get_block_by_height(227_931).unwrap().is_none(), "no body stored");
+        let b = block(BLOCK_91842);
+        seed_duplicate_coinbase(&db, &b);
+        let v = BlockValidator::new(db, Network::Bitcoin);
+        assert!(
+            v.check_bip30(&b, 227_932).is_ok(),
+            "the index row's canonical hash is enough to suppress BIP30"
+        );
+        assert!(matches!(
+            v.check_bip30(&b, 227_931),
+            Err(BlockValidationError::Bip30DuplicateTxid)
+        ));
+    }
+
     /// Control: a non-canonical block at 227931 never suppresses BIP30.
     #[test]
     fn test_bip34_suppression_needs_the_canonical_hash() {
