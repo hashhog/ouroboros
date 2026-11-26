@@ -181,6 +181,13 @@ pub fn bits_to_target(bits: u32) -> U256 {
     }
 }
 
+/// Decode compact "bits" with Core's sign and overflow flags:
+/// `(target, negative, overflow)`, as `arith_uint256::SetCompact`
+/// (bitcoin-core/src/arith_uint256.cpp).
+pub fn set_compact(bits: u32) -> (U256, bool, bool) {
+    (bits_to_target(bits), false, false)
+}
+
 /// Convert target (U256) to compact "bits" representation
 ///
 /// # Arguments

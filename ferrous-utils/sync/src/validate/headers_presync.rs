@@ -30,7 +30,7 @@ use std::hash::Hasher;
 use crate::chain_params::{
     headers_presync_commitment_period, headers_redownload_buffer_size, minimum_chain_work,
 };
-use crate::validate::pow::{bits_to_target, calculate_work};
+use crate::validate::pow::get_bits_proof;
 use crate::validate::difficulty::permitted_difficulty_transition;
 
 /// Maximum headers per protocol message (Bitcoin P2P limit)
@@ -378,8 +378,8 @@ impl HeadersSyncState {
             }
 
             // 3. Accumulate work
-            let target = bits_to_target(header_bits);
-            let work = calculate_work(target);
+            // Core headerssync.cpp: += GetBlockProof(CBlockIndex(header)).
+            let work = get_bits_proof(header_bits);
             self.presync_work = self.presync_work.saturating_add(work);
 
             // 4. Store commitment if at commitment point
@@ -521,8 +521,8 @@ impl HeadersSyncState {
             }
 
             // 3. Accumulate work
-            let target = bits_to_target(header_bits);
-            let work = calculate_work(target);
+            // Core headerssync.cpp: += GetBlockProof(CBlockIndex(header)).
+            let work = get_bits_proof(header_bits);
             self.redownload_work = self.redownload_work.saturating_add(work);
 
             // Check if we've reached minimum work (can release all remaining)

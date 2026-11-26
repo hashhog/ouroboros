@@ -97,6 +97,20 @@ pub fn get_consensus_params(network: Network) -> ConsensusParams {
     }
 }
 
+/// Core `consensus.powLimit` as the full 256-bit value
+/// (bitcoin-core/src/kernel/chainparams.cpp).  This is NOT the expansion of
+/// `pow_limit_bits`: mainnet's limit is 0x00000000ffff..ff, while 0x1d00ffff
+/// expands to 0x00000000ffff0000..00.
+pub fn pow_limit(network: Network) -> U256 {
+    let hex = match network {
+        Network::Regtest => "7fffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+        Network::Signet => "00000377ae000000000000000000000000000000000000000000000000000000",
+        // Bitcoin, Testnet (testnet3), Testnet4 and any future variant.
+        _ => "00000000ffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+    };
+    U256::from_str_radix(hex, 16).expect("valid powLimit hex")
+}
+
 /// Genesis block hash (internal byte order) and timestamp for each network
 pub fn genesis_block_hash(network: Network) -> [u8; 32] {
     match network {

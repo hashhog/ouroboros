@@ -46,6 +46,20 @@ pub fn bits_to_target(bits: u32) -> U256 {
     bits_to_target(bits)
 }
 
+/// Core `CheckProofOfWorkImpl` (bitcoin-core/src/pow.cpp): does `hash`
+/// (internal byte order, as double-SHA256 returns it) meet the target that
+/// `bits` encodes, for a chain whose proof-of-work limit is `pow_limit`?
+pub fn check_proof_of_work(hash: &[u8; 32], bits: u32, pow_limit: U256) -> bool {
+    let _ = pow_limit;
+    U256::from_little_endian(hash) <= bits_to_target(bits)
+}
+
+/// Core `GetBitsProof` (bitcoin-core/src/chain.cpp): the work a block with
+/// these `bits` adds to its chain.
+pub fn get_bits_proof(bits: u32) -> U256 {
+    calculate_work(bits_to_target(bits))
+}
+
 /// Calculate the next difficulty target for a 2016-block interval
 ///
 /// Implements Bitcoin's difficulty adjustment algorithm:
