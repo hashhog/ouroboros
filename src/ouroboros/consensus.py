@@ -187,19 +187,22 @@ BURIED_DEPLOYMENTS = {
 #
 # Ref: Bitcoin Core kernel/chainparams.cpp
 BIP34_HASHES: dict[str, bytes] = {
-    # mainnet: block 227931 hash (big-endian display form, stored as bytes)
+    # mainnet: block 227931 hash.  The literal is the display (big-endian)
+    # hash; [::-1] gives the internal byte order that block hashes and
+    # get_block_hash_by_height() carry (same convention as
+    # BIP30_REPEAT_EXCEPTIONS below).  Without it the compare never matched.
     # Ref: kernel/chainparams.cpp:90
     "mainnet": bytes.fromhex(
         "000000000000024b89b42a942fe0d9fea3bb44ab7bd1b19115dd6a759c0808b8"
-    ),
+    )[::-1],
     # testnet3: block 21111 hash
     # Ref: kernel/chainparams.cpp:213
     "testnet": bytes.fromhex(
         "0000000023b3a96d3484e5abb3755c413e7d41500f8e2a5c3f0dd01299cd8ef8"
-    ),
+    )[::-1],
     "testnet3": bytes.fromhex(
         "0000000023b3a96d3484e5abb3755c413e7d41500f8e2a5c3f0dd01299cd8ef8"
-    ),
+    )[::-1],
     # testnet4 / signet / regtest: BIP34Hash = uint256{} (all zeros).
     # The zero hash will never match a real block hash, so
     # fEnforceBIP30 stays True on these networks — BIP30 is always enforced.

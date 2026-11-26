@@ -39,9 +39,11 @@ from ouroboros.validation import _encode_bip34_height
 # Helpers
 # ---------------------------------------------------------------------------
 
+# Internal byte order, as get_block_hash_by_height() returns it (the display
+# literal reversed, the same convention as the repeat hashes below).
 _MAINNET_BIP34_HASH = bytes.fromhex(
     "000000000000024b89b42a942fe0d9fea3bb44ab7bd1b19115dd6a759c0808b8"
-)
+)[::-1]
 _MAINNET_BIP34_HEIGHT = 227_931
 _BIP30_RECHECK_HEIGHT = 1_983_702
 
@@ -108,7 +110,7 @@ def _make_validator(
     Build a BlockValidator with a mocked database.
 
     utxo_exists  — if True, get_utxo() returns a non-None value (UTXO exists).
-    bip34_ancestor_hash — what get_block_hash_at_height() returns for the
+    bip34_ancestor_hash — what get_block_hash_by_height() returns for the
                           BIP34 activation height lookup.  None means the DB
                           does not support that method.
     """
@@ -119,11 +121,14 @@ def _make_validator(
     db.get_best_block.return_value = (bytes(32), 0)
     db.get_median_time_past.return_value = 0
 
+    # get_block_hash_by_height is the method BlockchainDatabase really has;
+    # the validator used to ask for get_block_hash_at_height, which only this
+    # MagicMock answered.
     if bip34_ancestor_hash is not None:
-        db.get_block_hash_at_height.return_value = bip34_ancestor_hash
+        db.get_block_hash_by_height.return_value = bip34_ancestor_hash
     else:
         # Simulate a DB that doesn't have the method.
-        del db.get_block_hash_at_height
+        del db.get_block_hash_by_height
 
     validator = BlockValidator(db, network=network)
     return validator
@@ -264,7 +269,7 @@ class TestBip34SuppressesBip30CanonicalChainOnly:
         assert "bad-txns-BIP30" in err
 
     def test_bip30_enforced_when_db_has_no_hash_lookup(self):
-        """If DB lacks get_block_hash_at_height, BIP30 is conservatively enforced."""
+        """If DB lacks get_block_hash_by_height, BIP30 is conservatively enforced."""
         validator = _make_validator(
             network="mainnet",
             utxo_exists=True,
@@ -768,15 +773,15 @@ class TestConsensusConstantsCorrectness:
 
     def test_mainnet_bip34_hash_starts_with_zeros(self):
         """Mainnet BIP34Hash starts with many zeros (real block hash)."""
-        h = BIP34_HASHES["mainnet"].hex()
-        # 000000000000024b...
+        # Stored in internal order; the display form is 000000000000024b...
+        h = BIP34_HASHES["mainnet"][::-1].hex()
         assert h.startswith("00000000000002"), f"Unexpected hash: {h}"
 
     def test_testnet3_bip34_hash(self):
         """testnet3 BIP34Hash matches Core kernel/chainparams.cpp:213."""
         expected = bytes.fromhex(
             "0000000023b3a96d3484e5abb3755c413e7d41500f8e2a5c3f0dd01299cd8ef8"
-        )
+        )[::-1]  # internal byte order
         assert BIP34_HASHES.get("testnet3") == expected
 
     def test_repeat_block_91842_hash_prefix(self):
