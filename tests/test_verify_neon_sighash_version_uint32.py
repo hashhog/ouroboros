@@ -12,7 +12,8 @@ not be signed: struct.error.  Core signs it.
 PR #175 fixed the verifier (script.py).  This covers the signers:
 segwit_v0.bip143_sighash, Wallet._bip143_sighash, and the sighash closures
 of signrawtransactionwithkey / walletprocesspsbt /
-signrawtransactionwithwallet in rpc.py.  The RPC tests check that the
+signrawtransactionwithwallet in rpc.py.  The RPC tests (legacy, BIP143 and
+BIP341 key-path closures of signrawtransactionwithkey) check that the
 signature ouroboros produces is valid under the (already uint32) verifier,
 so a signature over a wrongly-serialized preimage fails too.
 """
@@ -95,6 +96,20 @@ def test_wallet_bip143_sighash_version_uint32(version):
 WIF = "KwDiBf89QgGbjEhKnhXJuH7LrciVrZi3qYjgd9M7rFU73sVHnoWn"
 P2WPKH_SPK = b"\x00\x14" + H160
 P2PKH_SPK = SCRIPT_CODE
+
+
+def _p2tr_keypath_spk() -> bytes:
+    """BIP86-style output key for PUB (no script tree): Q = P + H_TapTweak(P)G."""
+    from coincurve import PublicKey
+
+    assert PUB[0] == 0x02  # even y, so P is the x-only lift of PUB[1:]
+    tag = hashlib.sha256(b"TapTweak").digest()
+    tweak = hashlib.sha256(tag + tag + PUB[1:]).digest()
+    q = PublicKey(PUB).add(tweak).format(compressed=True)
+    return b"\x51\x20" + q[1:]
+
+
+P2TR_SPK = _p2tr_keypath_spk()
 AMOUNT_BTC = 0.002
 AMOUNT_SAT = 200_000
 UNSIGNED_TAIL = (  # 1 input (aa..aa:0, empty scriptSig), 1 output, locktime 0
@@ -150,8 +165,9 @@ def _verifies(signed_hex: str, spk: bytes) -> bool:
 
 
 @pytest.mark.parametrize("version", VERSIONS, ids=IDS)
-@pytest.mark.parametrize("kind,spk", [("p2wpkh", P2WPKH_SPK), ("p2pkh", P2PKH_SPK)],
-                         ids=["p2wpkh", "p2pkh"])
+@pytest.mark.parametrize("kind,spk",
+                         [("p2wpkh", P2WPKH_SPK), ("p2pkh", P2PKH_SPK), ("p2tr", P2TR_SPK)],
+                         ids=["p2wpkh", "p2pkh", "p2tr"])
 def test_signrawtransactionwithkey_signs_any_version(kind, spk, version):
     resp = _sign_with_key(version, spk)
     assert resp.get("error") is None, resp
@@ -168,8 +184,8 @@ _SIGNED_PACK = re.compile(r"""struct\.pack\(\s*["']<i["']\s*,\s*tx\.version\s*\)
 @pytest.mark.parametrize("module", ["rpc.py", "wallet.py", "segwit_v0.py"])
 def test_no_signed_tx_version_pack_in_signers(module):
     """walletprocesspsbt and signrawtransactionwithwallet build their legacy
-    and taproot preimages in local closures; pin that none of the signers
-    packs a transaction version as signed int32."""
+    and taproot preimages in local closures that need a loaded wallet; pin
+    that none of the signers packs a transaction version as signed int32."""
     text = (SRC / module).read_text()
     hits = [text.count("\n", 0, m.start()) + 1 for m in _SIGNED_PACK.finditer(text)]
     assert hits == [], f"{module}: signed nVersion pack at lines {hits}"
