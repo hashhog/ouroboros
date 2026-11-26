@@ -15804,7 +15804,7 @@ class RPCServer:
             base = sh_type & 0x1F
             acp = (sh_type & 0x80) != 0
             data = bytearray()
-            data.extend(struct.pack("<i", tx.version))
+            data.extend(struct.pack("<I", tx.version & 0xFFFFFFFF))
             inputs = [(idx, tx.inputs[idx])] if acp else list(enumerate(tx.inputs))
             data.extend(enc_varint(len(inputs)))
             for i, ti in inputs:
@@ -15855,7 +15855,7 @@ class RPCServer:
             data = bytearray()
             data.append(0x00)  # epoch
             data.append(sh_type)
-            data.extend(struct.pack("<i", tx.version))
+            data.extend(struct.pack("<I", tx.version & 0xFFFFFFFF))
             data.extend(struct.pack("<I", tx.locktime))
             if not acp:
                 prevouts = bytearray()
@@ -19050,7 +19050,7 @@ class RPCServer:
             data = bytearray()
             data.append(0x00)  # epoch
             data.append(sh_type if sh_type != 0 else 0x00)
-            data.extend(struct.pack("<i", tx.version))
+            data.extend(struct.pack("<I", tx.version & 0xFFFFFFFF))
             data.extend(struct.pack("<I", tx.locktime))
             if not acp:
                 prevouts = bytearray()
@@ -19319,7 +19319,7 @@ class RPCServer:
                                 base = sh_type & 0x1F
                                 acp = (sh_type & 0x80) != 0
                                 data = bytearray()
-                                data.extend(struct.pack("<i", tx.version))
+                                data.extend(struct.pack("<I", tx.version & 0xFFFFFFFF))
                                 inputs = [(idx, tx.inputs[idx])] if acp else list(enumerate(tx.inputs))
                                 data.extend(_encode_varint(len(inputs)))
                                 for i, ti in inputs:
@@ -21255,7 +21255,7 @@ class RPCServer:
             data = bytearray()
             data.append(0x00)  # epoch
             data.append(sh_type if sh_type != 0 else 0x00)
-            data.extend(struct.pack("<i", tx.version))
+            data.extend(struct.pack("<I", tx.version & 0xFFFFFFFF))
             data.extend(struct.pack("<I", tx.locktime))
             if not acp:
                 prevouts = bytearray()

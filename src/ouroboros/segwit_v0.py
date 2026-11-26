@@ -129,7 +129,7 @@ def bip143_sighash(
 
     inp = tx.inputs[input_index]
     pre = bytearray()
-    pre += struct.pack("<i", tx.version)
+    pre += struct.pack("<I", tx.version & 0xFFFFFFFF)
     pre += hash_prevouts
     pre += hash_sequence
     pre += inp.prev_txid + struct.pack("<I", inp.prev_vout)

@@ -3818,7 +3818,7 @@ class Wallet:
         hash_outputs = _dsha256(outputs)
 
         inp = tx.inputs[input_index]
-        preimage = struct.pack("<i", tx.version)
+        preimage = struct.pack("<I", tx.version & 0xFFFFFFFF)
         preimage += hash_prevouts
         preimage += hash_sequence
         preimage += inp.prev_txid + struct.pack("<I", inp.prev_vout)
