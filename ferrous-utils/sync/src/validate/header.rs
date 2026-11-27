@@ -8,12 +8,12 @@ use thiserror::Error;
 use crate::storage::{BlockchainDB, DbError};
 use crate::chain_params::{
     get_checkpoints, get_last_checkpoint, verify_checkpoint, is_below_last_checkpoint,
-    minimum_chain_work, Checkpoint,
+    minimum_chain_work, pow_limit, Checkpoint,
 };
 use common::BlockHeaderWrapper;
 use primitive_types::U256;
 
-use super::pow::{bits_to_target, validate_pow};
+use super::pow::check_proof_of_work;
 use super::difficulty::{self, BlockIndexInfo};
 use crate::chain_params::get_consensus_params;
 use bitcoin::hashes::Hash as _;
@@ -201,9 +201,11 @@ impl HeaderValidator {
         //    (validation.cpp:4088-4089).
         self.validate_difficulty(inner, prev_inner, prev_height)?;
 
-        // 5. Check proof of work (most expensive check last)
-        let target = bits_to_target(inner.bits.to_consensus());
-        if !validate_pow(header, target) {
+        // 5. Check proof of work (most expensive check last).
+        //    Core CheckBlockHeader -> CheckProofOfWork "high-hash"
+        //    (validation.cpp, pow.cpp CheckProofOfWorkImpl).
+        let hash = common::crypto::double_sha256(&header.to_bytes());
+        if !check_proof_of_work(&hash, inner.bits.to_consensus(), pow_limit(self.network)) {
             return Err(HeaderValidationError::InvalidPow);
         }
 

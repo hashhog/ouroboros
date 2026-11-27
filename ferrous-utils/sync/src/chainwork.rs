@@ -6,6 +6,8 @@
 
 use primitive_types::U256;
 
+use crate::validate::pow::get_bits_proof;
+#[cfg(test)]
 use crate::validate::pow::{bits_to_target, calculate_work};
 
 /// Convert chainwork U256 to 32-byte big-endian (Bitcoin Core format)
@@ -24,8 +26,7 @@ pub fn bytes_to_chainwork(bytes: &[u8; 32]) -> U256 {
 /// Work uses Bitcoin Core formula: (~target / (target + 1)) + 1
 pub fn compute_chainwork(prev_chainwork: &[u8; 32], bits: u32) -> [u8; 32] {
     let prev = bytes_to_chainwork(prev_chainwork);
-    let target = bits_to_target(bits);
-    let work = calculate_work(target);
+    let work = get_bits_proof(bits);
     let new_chainwork = prev + work;
     chainwork_to_bytes(new_chainwork)
 }
