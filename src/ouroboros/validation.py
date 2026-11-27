@@ -2572,7 +2572,12 @@ class BlockValidator:
     def _validate_signet_solution(
         self, block: Block, height: int
     ) -> tuple[bool, str]:
-        """Validate the signet block signature (BIP 325)."""
+        """Validate the signet block signature (BIP 325).
+
+        Mirrors Core ``CheckSignetBlockSolution`` / ``SignetTxs::Create``
+        (``src/signet.cpp``): every failure, a solution that does not parse
+        included, is the block reject ``bad-signet-blksig`` (``CheckBlock``).
+        """
         if self.network != "signet":
             return True, ""
 
@@ -2580,45 +2585,42 @@ class BlockValidator:
         if height == 0:
             return True, ""
 
+        if not block.transactions:
+            return False, "bad-signet-blksig"
         coinbase = block.transactions[0]
 
-        # 1. Find the witness commitment output
-        commitment_script = None
-        for out in reversed(coinbase.outputs):
-            spk = out.script_pubkey
-            if (
-                len(spk) >= 38
-                and spk[0] == 0x6A          # OP_RETURN
-                and spk[1] == 0x24          # push 36 bytes
-                and spk[2:6] == self._WITNESS_COMMITMENT_MAGIC
-            ):
-                commitment_script = spk
-                break
+        # 1. GetWitnessCommitmentIndex: the LAST commitment-pattern output.
+        #    Core requires one (no witness commitment -> nullopt -> reject).
+        cidx = self._signet_commitment_index(coinbase)
+        if cidx is None:
+            return False, "bad-signet-blksig"
 
-        if commitment_script is None:
-            # No witness commitment — check if the challenge is trivially
-            # satisfiable (e.g. OP_TRUE).  Otherwise fail.
-            return False, "Signet: no witness commitment in coinbase"
-
-        # 2. Extract signet commitment from the witness commitment script.
-        #    The commitment script may contain extra pushes after the
-        #    38-byte witness commitment.  We look for a push starting
-        #    with SIGNET_HEADER (0xecc7daa2).
-        signet_solution = self._extract_signet_commitment(commitment_script)
-        if signet_solution is None:
-            # Empty solution — only valid if challenge is trivially true.
-            signet_solution = b""
-
-        # 3. Parse scriptSig and witness from the solution.
-        solution_script_sig, solution_witness = (
-            self._parse_signet_solution(signet_solution)
+        # 2. FetchAndClearCommitmentSection: take the solution from the first
+        #    header+data push and re-serialise the script with that push cut
+        #    to the bare header.  No such push: empty solution (supports an
+        #    OP_TRUE challenge) and the script is left untouched.
+        found, signet_solution, cleared_script = (
+            self._fetch_and_clear_signet_commitment(
+                coinbase.outputs[cidx].script_pubkey
+            )
         )
 
-        # 4. Compute the modified merkle root.
-        #    Replace the actual coinbase with a version whose witness
-        #    commitment has the signet commitment stripped (replaced with
-        #    SIGNET_HEADER + no data).
-        modified_merkle = self._compute_signet_merkle_root(block)
+        # 3. Parse scriptSig and witness stack exactly as Core's SpanReader
+        #    does; any parse error or leftover byte is a reject.
+        solution_script_sig, solution_witness = b"", []
+        if found:
+            try:
+                solution_script_sig, solution_witness = (
+                    self._parse_signet_solution(signet_solution)
+                )
+            except ValueError:
+                return False, "bad-signet-blksig"
+
+        # 4. Modified merkle root: the coinbase with only output ``cidx``
+        #    replaced, hashed without witness (Core cb.GetHash()).
+        modified_merkle = self._compute_signet_merkle_root(
+            block, cidx, cleared_script
+        )
 
         # 5. Build virtual transactions.
         #    to_spend: input is null, scriptSig = OP_0 <72-byte block_data>,
@@ -2650,121 +2652,185 @@ class BlockValidator:
                 amount=0,
             )
         except Exception as e:
-            return False, f"Signet: script verification error: {e}"
+            # Gate 6: a system fault is never a block verdict; mapping it to
+            # bad-signet-blksig would mark a valid block invalid.
+            if is_system_error(e):
+                raise
+            logger.debug("Signet: script verification error: %s", e)
+            return False, "bad-signet-blksig"
 
         if not ok:
-            return False, "Signet: block signature verification failed"
+            return False, "bad-signet-blksig"
         return True, ""
 
+    def _signet_commitment_index(self, coinbase: Transaction) -> int | None:
+        """Core ``GetWitnessCommitmentIndex``: the last matching output."""
+        cidx = None
+        for i, out in enumerate(coinbase.outputs):
+            spk = out.script_pubkey
+            if (
+                len(spk) >= 38
+                and spk[0] == 0x6A          # OP_RETURN
+                and spk[1] == 0x24          # push 36 bytes
+                and spk[2:6] == self._WITNESS_COMMITMENT_MAGIC
+            ):
+                cidx = i
+        return cidx
+
     @staticmethod
-    def _extract_signet_commitment(commitment_script: bytes) -> bytes | None:
-        """Extract signet data from the witness commitment scriptPubKey."""
-        # The commitment script starts with OP_RETURN (0x6a), then various
-        # push opcodes.  Walk through the pushes looking for SIGNET_HEADER.
-        i = 1  # skip OP_RETURN
-        while i < len(commitment_script):
-            op = commitment_script[i]
+    def _signet_script_ops(script: bytes):
+        """Yield ``(opcode, pushdata)`` like Core ``GetScriptOp``; stop
+        (without raising) where an op cannot be read in full."""
+        i = 0
+        n = len(script)
+        while i < n:
+            op = script[i]
             i += 1
-            # Determine push length
-            if 0x01 <= op <= 0x4B:
-                push_len = op
-            elif op == 0x4C:  # OP_PUSHDATA1
-                if i >= len(commitment_script):
-                    break
-                push_len = commitment_script[i]
-                i += 1
-            elif op == 0x4D:  # OP_PUSHDATA2
-                if i + 1 >= len(commitment_script):
-                    break
-                push_len = int.from_bytes(
-                    commitment_script[i:i + 2], "little"
-                )
-                i += 2
-            elif op == 0x4E:  # OP_PUSHDATA4
-                if i + 3 >= len(commitment_script):
-                    break
-                push_len = int.from_bytes(
-                    commitment_script[i:i + 4], "little"
-                )
-                i += 4
+            data = b""
+            if op <= 0x4E:  # OP_0 .. OP_PUSHDATA4
+                if op < 0x4C:
+                    size = op
+                elif op == 0x4C:
+                    if n - i < 1:
+                        return
+                    size = script[i]
+                    i += 1
+                elif op == 0x4D:
+                    if n - i < 2:
+                        return
+                    size = int.from_bytes(script[i:i + 2], "little")
+                    i += 2
+                else:
+                    if n - i < 4:
+                        return
+                    size = int.from_bytes(script[i:i + 4], "little")
+                    i += 4
+                if n - i < size:
+                    return
+                data = script[i:i + size]
+                i += size
+            yield op, data
+
+    @staticmethod
+    def _signet_push(data: bytes) -> bytes:
+        """Core ``CScript << std::vector<uint8_t>`` (``AppendDataSize``):
+        the minimal length prefix, never an OP_N small-integer opcode."""
+        size = len(data)
+        if size < 0x4C:
+            prefix = bytes([size])
+        elif size <= 0xFF:
+            prefix = bytes([0x4C, size])
+        elif size <= 0xFFFF:
+            prefix = b"\x4d" + size.to_bytes(2, "little")
+        else:
+            prefix = b"\x4e" + size.to_bytes(4, "little")
+        return prefix + data
+
+    @classmethod
+    def _fetch_and_clear_signet_commitment(
+        cls, commitment_script: bytes
+    ) -> tuple[bool, bytes, bytes]:
+        """Core ``FetchAndClearCommitmentSection`` (``signet.cpp``).
+
+        Returns ``(found, solution, cleared_script)``.  Only a push that
+        carries SIGNET_HEADER *and* more data counts; the first one gives
+        the solution and is cut to the bare header.  Every push is
+        re-serialised with its minimal prefix and every other opcode is
+        copied, up to where ``GetOp`` fails.  With no such push the script
+        is returned unchanged.
+        """
+        replacement = bytearray()
+        found = False
+        solution = b""
+        for op, data in cls._signet_script_ops(commitment_script):
+            if data:
+                if (
+                    not found
+                    and len(data) > len(SIGNET_HEADER)
+                    and data[:len(SIGNET_HEADER)] == SIGNET_HEADER
+                ):
+                    solution = data[len(SIGNET_HEADER):]
+                    data = data[:len(SIGNET_HEADER)]
+                    found = True
+                replacement += cls._signet_push(data)
             else:
-                # Not a push opcode — skip
-                continue
+                replacement.append(op)
+        if not found:
+            return False, b"", commitment_script
+        return True, solution, bytes(replacement)
 
-            data = commitment_script[i:i + push_len]
-            i += push_len
-
-            if len(data) >= 4 and data[:4] == SIGNET_HEADER:
-                return data[4:]  # everything after the header
-
-        return None
+    @classmethod
+    def _extract_signet_commitment(cls, commitment_script: bytes) -> bytes | None:
+        """The signet solution in a commitment script, or None if none."""
+        found, solution, _ = cls._fetch_and_clear_signet_commitment(
+            commitment_script
+        )
+        return solution if found else None
 
     @staticmethod
     def _parse_signet_solution(
         solution: bytes,
     ) -> tuple[bytes, list[bytes]]:
-        """Parse scriptSig and witness stack from a signet solution."""
-        if not solution:
-            return b"", []
+        """Parse scriptSig and witness stack from a signet solution.
 
+        Core: ``v >> scriptSig; v >> scriptWitness.stack; if (!v.empty())
+        return nullopt;`` -- a CompactSize-prefixed scriptSig, then a
+        CompactSize-counted stack (required) of CompactSize-prefixed items,
+        each fully present, and nothing after.  Raises ValueError otherwise.
+        """
         offset = 0
 
-        # Read scriptSig (compact-size prefixed)
-        sig_len, consumed = _read_compact_size(solution, offset)
-        offset += consumed
-        script_sig = solution[offset:offset + sig_len]
-        offset += sig_len
-
-        # Read witness stack
-        witness: list[bytes] = []
-        if offset < len(solution):
-            n_items, consumed = _read_compact_size(solution, offset)
+        def read_bytes() -> bytes:
+            nonlocal offset
+            size, consumed = _read_compact_size(solution, offset)
             offset += consumed
-            for _ in range(n_items):
-                if offset >= len(solution):
-                    break
-                item_len, consumed = _read_compact_size(solution, offset)
-                offset += consumed
-                witness.append(solution[offset:offset + item_len])
-                offset += item_len
+            if len(solution) - offset < size:
+                raise ValueError("signet solution: item overruns the data")
+            item = solution[offset:offset + size]
+            offset += size
+            return item
 
+        script_sig = read_bytes()
+        n_items, consumed = _read_compact_size(solution, offset)
+        offset += consumed
+        witness = [read_bytes() for _ in range(n_items)]
+        if offset != len(solution):
+            raise ValueError("signet solution: extraneous data")
         return script_sig, witness
 
-    def _compute_signet_merkle_root(self, block: Block) -> bytes:
-        """Compute the modified merkle root for signet signing."""
+    def _compute_signet_merkle_root(
+        self,
+        block: Block,
+        cidx: int | None = None,
+        cleared_script: bytes | None = None,
+    ) -> bytes:
+        """Compute the modified merkle root for signet signing (Core
+        ``ComputeModifiedMerkleRoot``): the coinbase with the witness
+        commitment output ``cidx`` replaced by its cleared script, hashed
+        without witness, followed by the other transactions' txids."""
         coinbase = block.transactions[0]
+        if cidx is None:
+            cidx = self._signet_commitment_index(coinbase)
+        if cidx is not None and cleared_script is None:
+            _, _, cleared_script = self._fetch_and_clear_signet_commitment(
+                coinbase.outputs[cidx].script_pubkey
+            )
 
-        # Build the modified coinbase witness commitment output:
-        # keep the original 38-byte commitment, replace the signet push
-        # with header-only.
-        modified_outputs = []
-        for out in coinbase.outputs:
-            spk = out.script_pubkey
-            if (
-                len(spk) >= 38
-                and spk[0] == 0x6A
-                and spk[1] == 0x24
-                and spk[2:6] == self._WITNESS_COMMITMENT_MAGIC
-            ):
-                # Rebuild: keep first 38 bytes (OP_RETURN + commitment),
-                # then add a 4-byte push of SIGNET_HEADER with no data.
-                new_spk = spk[:38] + bytes([4]) + SIGNET_HEADER
-                modified_outputs.append(
-                    TxOut(value=out.value, script_pubkey=new_spk)
-                )
-            else:
-                modified_outputs.append(out)
+        modified_outputs = list(coinbase.outputs)
+        if cidx is not None:
+            out = coinbase.outputs[cidx]
+            modified_outputs[cidx] = TxOut(
+                value=out.value, script_pubkey=cleared_script
+            )
 
-        # Build a modified coinbase Transaction
         modified_cb = Transaction(
             version=coinbase.version,
             inputs=coinbase.inputs,
             outputs=modified_outputs,
             locktime=coinbase.locktime,
-            txid=b"",  # will be recomputed
-            is_coinbase=True,
+            txid=b"",
         )
-        # Compute its txid
+        # Non-witness serialisation: Core cb.GetHash() is the txid.
         cb_data = modified_cb.serialize()
         cb_hash = hashlib.sha256(hashlib.sha256(cb_data).digest()).digest()
 
@@ -2807,7 +2873,6 @@ class BlockValidator:
             outputs=[out],
             locktime=0,
             txid=b"",
-            is_coinbase=False,
         )
         # Compute and set txid
         tx_data = tx.serialize()
@@ -2837,7 +2902,6 @@ class BlockValidator:
             outputs=[out],
             locktime=0,
             txid=b"",
-            is_coinbase=False,
         )
         return tx
 
