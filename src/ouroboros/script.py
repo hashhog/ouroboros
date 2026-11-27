@@ -497,10 +497,12 @@ def get_standard_script_flags(
                       | SCRIPT_VERIFY_SIGPUSHONLY | SCRIPT_VERIFY_MINIMALDATA
                       | SCRIPT_VERIFY_MINIMALIF | SCRIPT_VERIFY_WITNESS_PUBKEYTYPE
                       | SCRIPT_VERIFY_DISCOURAGE_UPGRADABLE_NOPS
-                      | SCRIPT_VERIFY_CONST_SCRIPTCODE)
+                      | SCRIPT_VERIFY_CONST_SCRIPTCODE
+                      | SCRIPT_VERIFY_DISCOURAGE_UPGRADABLE_WITNESS_PROGRAM)
         if is_buried_deployment_active("taproot", height, network):
             flags |= (SCRIPT_VERIFY_DISCOURAGE_UPGRADABLE_TAPROOT_VERSION
-                      | SCRIPT_VERIFY_DISCOURAGE_OP_SUCCESS)
+                      | SCRIPT_VERIFY_DISCOURAGE_OP_SUCCESS
+                      | SCRIPT_VERIFY_DISCOURAGE_UPGRADABLE_PUBKEYTYPE)
     else:
         if height >= BIP66_ACTIVATION_HEIGHT:
             flags |= SCRIPT_VERIFY_LOW_S | SCRIPT_VERIFY_STRICTENC
@@ -509,10 +511,12 @@ def get_standard_script_flags(
                       | SCRIPT_VERIFY_SIGPUSHONLY | SCRIPT_VERIFY_MINIMALDATA
                       | SCRIPT_VERIFY_MINIMALIF | SCRIPT_VERIFY_WITNESS_PUBKEYTYPE
                       | SCRIPT_VERIFY_DISCOURAGE_UPGRADABLE_NOPS
-                      | SCRIPT_VERIFY_CONST_SCRIPTCODE)
+                      | SCRIPT_VERIFY_CONST_SCRIPTCODE
+                      | SCRIPT_VERIFY_DISCOURAGE_UPGRADABLE_WITNESS_PROGRAM)
         if height >= TAPROOT_ACTIVATION_HEIGHT:
             flags |= (SCRIPT_VERIFY_DISCOURAGE_UPGRADABLE_TAPROOT_VERSION
-                      | SCRIPT_VERIFY_DISCOURAGE_OP_SUCCESS)
+                      | SCRIPT_VERIFY_DISCOURAGE_OP_SUCCESS
+                      | SCRIPT_VERIFY_DISCOURAGE_UPGRADABLE_PUBKEYTYPE)
 
     return flags
 
