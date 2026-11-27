@@ -2078,6 +2078,13 @@ class ScriptInterpreter:
                 # (Bitcoin Core checks DERSIG/STRICTENC first)
                 # Core CheckSignatureEncoding: DER check fires when any of
                 # DERSIG | LOW_S | STRICTENC is set (interpreter.cpp:207).
+                # Core EvalChecksigPreTapscript runs FindAndDelete first, for
+                # an empty sig too (pattern OP_0).  An empty sig never reaches
+                # the sighash, so only CONST_SCRIPTCODE can observe it.
+                if not sig and not is_witness_v0 and (flags & SCRIPT_VERIFY_CONST_SCRIPTCODE):
+                    _, fad_found = self._find_and_delete_count(script[script_code_start:], sig)
+                    if fad_found > 0:
+                        raise ValueError("CONST_SCRIPTCODE: sig found in scriptCode (FindAndDelete)")
                 if sig:
                     if (flags & (SCRIPT_VERIFY_DERSIG | SCRIPT_VERIFY_LOW_S | SCRIPT_VERIFY_STRICTENC)) and not _check_der_signature(sig):
                         raise ValueError("Non-DER signature")
@@ -2220,6 +2227,11 @@ class ScriptInterpreter:
                 # Check encoding first (Bitcoin Core order).
                 # Core CheckSignatureEncoding: DER check fires when any of
                 # DERSIG | LOW_S | STRICTENC is set (interpreter.cpp:207).
+                # Empty sig: Core's FindAndDelete (pattern OP_0) runs first.
+                if not sig and not is_witness_v0 and (flags & SCRIPT_VERIFY_CONST_SCRIPTCODE):
+                    _, fad_found = self._find_and_delete_count(script[script_code_start:], sig)
+                    if fad_found > 0:
+                        raise ValueError("CONST_SCRIPTCODE: sig found in scriptCode (FindAndDelete)")
                 if sig:
                     if (flags & (SCRIPT_VERIFY_DERSIG | SCRIPT_VERIFY_LOW_S | SCRIPT_VERIFY_STRICTENC)) and not _check_der_signature(sig):
                         raise ValueError("Non-DER signature")
@@ -2558,11 +2570,11 @@ class ScriptInterpreter:
         happen to look like the needle but are embedded inside a larger push
         payload are NEVER matched.
 
+        An empty ``sig`` serialises to ``00`` (OP_0), as ``CScript() << sig``
+        does in Core, so it deletes opcode-aligned OP_0s; it is not a no-op.
+
         Reference: bitcoin-core/src/script/interpreter.cpp:229-255.
         """
-        if not sig:
-            return script, 0
-
         # Build the serialized push of the signature (needle).
         sig_len = len(sig)
         if sig_len < 0x4C:
@@ -2910,12 +2922,13 @@ class ScriptInterpreter:
         # (only for legacy, not witness v0).  Core does this per-signature and,
         # with SCRIPT_VERIFY_CONST_SCRIPTCODE, rejects if any sig is actually
         # present in scriptCode (interpreter.cpp:1142-1149).
+        # An empty sig is deleted too: its pattern ``CScript() << vchSig`` is
+        # OP_0, so every opcode-aligned OP_0 leaves the scriptCode.
         if not is_witness_v0:
             for sig in sigs:
-                if sig:
-                    script_code, fad_found = self._find_and_delete_count(script_code, sig)
-                    if fad_found > 0 and (flags & SCRIPT_VERIFY_CONST_SCRIPTCODE):
-                        raise ValueError("CONST_SCRIPTCODE: sig found in scriptCode (FindAndDelete)")
+                script_code, fad_found = self._find_and_delete_count(script_code, sig)
+                if fad_found > 0 and (flags & SCRIPT_VERIFY_CONST_SCRIPTCODE):
+                    raise ValueError("CONST_SCRIPTCODE: sig found in scriptCode (FindAndDelete)")
 
         sig_idx = 0
         key_idx = 0
