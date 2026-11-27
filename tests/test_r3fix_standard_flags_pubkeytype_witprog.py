@@ -383,6 +383,27 @@ def test_control_p2sh_v0_witness_program_accepted(interp, monkeypatch) -> None:
     assert (ok, err) == (True, ""), err
 
 
+def test_control_bare_p2a_spend_accepted(interp, monkeypatch) -> None:
+    """Control: a bare pay-to-anchor output (``OP_1 <0x4e73>``, a v1 2-byte
+    witness program) is spendable under DISCOURAGE_UPGRADABLE_WITNESS_PROGRAM;
+    Core's VerifyWitnessProgram returns true for it before the discourage
+    check (``!is_p2sh && IsPayToAnchor``).  With the flag now in the mempool
+    set, an empty-witness P2A spend must still be admitted."""
+    spk = b"\x51\x02\x4e\x73"
+    tx = Transaction(
+        txid=b"", version=2, locktime=0,
+        inputs=[TxIn(prev_txid=PREV_TXID, prev_vout=0, script_sig=b"",
+                     sequence=0xFFFFFFFE, witness=[])],
+        outputs=[TxOut(value=OUT_VALUE, script_pubkey=P2WSH_OUT)],
+    )
+    tx.txid = _dsha(tx.serialize())
+    ok, err, _, flags_seen = _admit(tx, spk, monkeypatch)
+    assert flags_seen, "the pool never ran the script check"
+    assert (ok, err) == (True, ""), err
+    # And directly, with the discourage bit forced on whatever the flag set.
+    assert _verify(tx, spk, _mempool_flags() | WITPROG) is True
+
+
 # --------------------------------------------------------------------------
 # Consensus is unchanged (both interpreters)
 # --------------------------------------------------------------------------
