@@ -1148,6 +1148,18 @@ class ScriptInterpreter:
                     return False
                 redeem_script = stack_copy[-1]
 
+                # Core interpreter.cpp VerifyScript P2SH branch: run the
+                # redeemScript and require a true top item (else EVAL_FALSE)
+                # BEFORE asking whether it is a witness program.  A witness
+                # program whose program bytes are all zero (or negative
+                # zero) is false here, so Core fails it even for an
+                # upgradable witness version that would otherwise succeed.
+                redeem_stack = self._execute_script(
+                    redeem_script, tx, input_index, redeem_script, flags,
+                    initial_stack=stack_copy[:-1])
+                if not redeem_stack or not self._cast_to_bool(redeem_stack[-1]):
+                    return False
+
                 # Check for witness program inside P2SH (P2SH-P2WPKH, P2SH-P2WSH)
                 wp_inner = _get_witness_version_and_program(redeem_script)
                 if (flags & SCRIPT_VERIFY_WITNESS) and wp_inner is not None:
@@ -1170,11 +1182,6 @@ class ScriptInterpreter:
                         is_p2sh=True,
                     )
 
-                redeem_stack = self._execute_script(
-                    redeem_script, tx, input_index, redeem_script, flags,
-                    initial_stack=stack_copy[:-1])
-                if not redeem_stack or not self._cast_to_bool(redeem_stack[-1]):
-                    return False
                 if (flags & SCRIPT_VERIFY_CLEANSTACK) and len(redeem_stack) != 1:
                     return False
                 # WITNESS_UNEXPECTED in P2SH non-witness path

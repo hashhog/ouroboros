@@ -84,8 +84,11 @@ class TestP2SHTaprootGate:
         a real Taproot spend.
         """
         interp = ScriptInterpreter()
-        # P2SH-of-V1-32B: redeem script is OP_1 <32 zero bytes>
-        redeem = bytes([0x51, 0x20]) + b"\x00" * 32
+        # P2SH-of-V1-32B: redeem script is OP_1 <32 non-zero bytes>.  The
+        # program must be non-zero: Core first runs the redeemScript and
+        # fails EVAL_FALSE when its top item (the program) is all zero,
+        # before the witness-program dispatch this test is about.
+        redeem = bytes([0x51, 0x20]) + b"\x01" * 32
         from hashlib import new as new_hash
         h160 = new_hash("ripemd160", new_hash("sha256", redeem).digest()).digest()
         spk_p2sh = b"\xa9\x14" + h160 + b"\x87"  # OP_HASH160 <h160> OP_EQUAL
@@ -109,7 +112,9 @@ class TestP2SHTaprootGate:
     def test_p2sh_wrapped_v1_32b_discourage_rejects(self) -> None:
         """With DISCOURAGE_UPGRADABLE_WITNESS_PROGRAM, P2SH-wrapped v1 is rejected."""
         interp = ScriptInterpreter()
-        redeem = bytes([0x51, 0x20]) + b"\x00" * 32
+        # Non-zero program, so the reject comes from the DISCOURAGE flag and
+        # not from EVAL_FALSE on an all-zero program.
+        redeem = bytes([0x51, 0x20]) + b"\x01" * 32
         from hashlib import new as new_hash
         h160 = new_hash("ripemd160", new_hash("sha256", redeem).digest()).digest()
         spk_p2sh = b"\xa9\x14" + h160 + b"\x87"
