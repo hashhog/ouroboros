@@ -1105,9 +1105,14 @@ fn check_signature_encoding(sig: &[u8], flags: u32) -> ScriptResult<()> {
         && !is_valid_signature_encoding(sig)
     {
         return Err(ScriptError::SigDer);
-    } else if (flags & SCRIPT_VERIFY_LOW_S) != 0 {
+    }
+    // Core: `else if (LOW_S && !IsLowDERSignature(...))` — the arm is taken
+    // only when the signature is high-S, so a low-S signature still reaches
+    // the STRICTENC hashtype check below.
+    if (flags & SCRIPT_VERIFY_LOW_S) != 0 {
         is_low_der_signature(sig)?;
-    } else if (flags & SCRIPT_VERIFY_STRICTENC) != 0 && !is_defined_hashtype_signature(sig) {
+    }
+    if (flags & SCRIPT_VERIFY_STRICTENC) != 0 && !is_defined_hashtype_signature(sig) {
         return Err(ScriptError::SigHashtype);
     }
     Ok(())
@@ -3100,5 +3105,65 @@ mod tests {
             verify_input(&ctx, 0, &[0x51, 0x51], &[], SCRIPT_VERIFY_CLEANSTACK | SCRIPT_VERIFY_P2SH | SCRIPT_VERIFY_WITNESS, 0),
             Err(ScriptError::CleanStack)
         );
+    }
+}
+
+/// verify-neon-ouroboros-findings #1: Core's `CheckSignatureEncoding`
+/// (script/interpreter.cpp) tests `LOW_S && !IsLowDERSignature`, so a low-S
+/// signature falls through to the STRICTENC hashtype check. Entering the
+/// LOW_S arm on the flag alone skipped that check for every low-S signature
+/// under the mempool's LOW_S|STRICTENC flags.
+#[cfg(test)]
+mod strictenc_hashtype_tests {
+    use super::*;
+
+    /// DER (r=1, s=1): strictly encoded and low-S. Encoding checks never
+    /// verify the signature itself.
+    fn low_s_sig(hashtype: u8) -> Vec<u8> {
+        vec![0x30, 0x06, 0x02, 0x01, 0x01, 0x02, 0x01, 0x01, hashtype]
+    }
+
+    /// DER (r=1, s=0x7fff..ff): strictly encoded, s > n/2.
+    fn high_s_sig(hashtype: u8) -> Vec<u8> {
+        let mut v = vec![0x30, 0x25, 0x02, 0x01, 0x01, 0x02, 0x20, 0x7f];
+        v.extend(std::iter::repeat(0xff).take(31));
+        v.push(hashtype);
+        v
+    }
+
+    const UNDEFINED: [u8; 8] = [0x00, 0x04, 0x21, 0x80, 0x84, 0xa1, 0xff, 0x7f];
+
+    #[test]
+    fn low_s_and_strictenc_rejects_undefined_hashtype() {
+        let flags = SCRIPT_VERIFY_LOW_S | SCRIPT_VERIFY_STRICTENC;
+        for ht in UNDEFINED {
+            assert_eq!(
+                check_signature_encoding(&low_s_sig(ht), flags),
+                Err(ScriptError::SigHashtype),
+                "hashtype {ht:#04x} under LOW_S|STRICTENC"
+            );
+        }
+    }
+
+    #[test]
+    fn strictenc_hashtype_controls() {
+        // STRICTENC alone already rejected (the arm was reached).
+        for ht in UNDEFINED {
+            assert_eq!(
+                check_signature_encoding(&low_s_sig(ht), SCRIPT_VERIFY_STRICTENC),
+                Err(ScriptError::SigHashtype)
+            );
+            // LOW_S without STRICTENC never checks the hashtype.
+            assert_eq!(check_signature_encoding(&low_s_sig(ht), SCRIPT_VERIFY_LOW_S), Ok(()));
+        }
+        let both = SCRIPT_VERIFY_LOW_S | SCRIPT_VERIFY_STRICTENC;
+        for ht in [0x01, 0x02, 0x03, 0x81, 0x82, 0x83] {
+            assert_eq!(check_signature_encoding(&low_s_sig(ht), both), Ok(()), "{ht:#04x}");
+        }
+        // A high-S signature still fails as SIG_HIGH_S, before the hashtype.
+        assert_eq!(check_signature_encoding(&high_s_sig(0x00), both), Err(ScriptError::SigHighS));
+        assert_eq!(check_signature_encoding(&high_s_sig(0x01), both), Err(ScriptError::SigHighS));
+        // Empty signature: always encoding-valid.
+        assert_eq!(check_signature_encoding(&[], both), Ok(()));
     }
 }
