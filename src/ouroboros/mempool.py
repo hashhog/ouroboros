@@ -3072,8 +3072,9 @@ class Mempool:
         # Computed as the standard-set minus the consensus-set so we only OR in
         # the policy-only delta (NULLFAIL, LOW_S, CLEANSTACK, SIGPUSHONLY,
         # MINIMALDATA, MINIMALIF, WITNESS_PUBKEYTYPE, CONST_SCRIPTCODE,
-        # DISCOURAGE_UPGRADABLE_NOPS, DISCOURAGE_UPGRADABLE_TAPROOT_VERSION,
-        # DISCOURAGE_OP_SUCCESS).
+        # DISCOURAGE_UPGRADABLE_NOPS, DISCOURAGE_UPGRADABLE_WITNESS_PROGRAM,
+        # DISCOURAGE_UPGRADABLE_TAPROOT_VERSION, DISCOURAGE_OP_SUCCESS,
+        # DISCOURAGE_UPGRADABLE_PUBKEYTYPE).
         extra_flags = 0
         if self.require_standard:
             try:
